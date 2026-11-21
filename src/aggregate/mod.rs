@@ -185,6 +185,16 @@ impl<'a> Worker<'a> {
         while i < n {
             let s = ev[i].ts_ms;
             let day = day_of(s);
+            if day != ud_day {
+                if ud_sessions != 0 {
+                    self.flush_user_day(p as u32, ud_day, ud_sessions, ud_events, ud_revenue);
+                }
+                ud_day = day;
+                ud_sessions = 0;
+                ud_events = 0;
+                ud_revenue = 0;
+                self.day_first.push((day, self.s_start.len() as u32));
+            }
             let mut prev = s;
             let mut k = i;
             let mut rev = 0u64;
@@ -221,16 +231,6 @@ impl<'a> Worker<'a> {
             cell.purchasing += (rev != 0) as i64;
             cell.revenue += rev as i64;
 
-            if day != ud_day {
-                if ud_sessions != 0 {
-                    self.flush_user_day(p as u32, ud_day, ud_sessions, ud_events, ud_revenue);
-                }
-                ud_day = day;
-                ud_sessions = 0;
-                ud_events = 0;
-                ud_revenue = 0;
-                self.day_first.push((day, self.s_start.len() as u32));
-            }
             ud_sessions += 1;
             ud_events += nev;
             ud_revenue += rev as i64;
@@ -480,5 +480,22 @@ mod tests {
         assert_eq!(c[0].campaign, 0);
         assert_eq!(c[0].cell, CampCell { sessions: 0, purchasing: 0, revenue: 0, assisted: 3 });
         assert_eq!(c[1].cell, CampCell { sessions: 3, purchasing: 3, revenue: 13, assisted: 3 });
+    }
+
+    #[test]
+    fn top_category_per_day() {
+        let d = DAY_MS;
+        // Day 5: purchase cat 0 (10). Day 6: view, then purchase cat 1 (7). Day 7: no purchase.
+        let l = mk(
+            vec![("u", vec![(5 * d, 0, 10), (6 * d, 2, 0), (6 * d + 5, 1, 7), (7 * d, 0, 0)], vec![])],
+            1,
+        );
+        let rows: Vec<UserRow> = aggregate(&l, 1).user_rows.into_iter().flatten().collect();
+        let tops: Vec<(i32, u32)> = rows.iter().map(|r| (r.day, r.top)).collect();
+        assert_eq!(tops, vec![(5, 0), (6, 1), (7, NO_CATEGORY)]);
+        // Tie on cents: smaller category index wins.
+        let l = mk(vec![("u", vec![(5 * d, 1, 4), (5 * d + 1, 0, 4)], vec![])], 1);
+        let rows: Vec<UserRow> = aggregate(&l, 1).user_rows.into_iter().flatten().collect();
+        assert_eq!(rows[0].top, 0);
     }
 }
