@@ -611,6 +611,23 @@ impl SinkArena {
         };
         (Self { bytes: offset, ..self }, rest)
     }
+
+    /// Batch-populate writable anonymous pages in 4 MiB chunks (Linux >= 5.14).
+    /// Falls back silently to demand paging on older kernels (EINVAL).
+    pub(super) fn populate_write(&self) {
+        const MADV_POPULATE_WRITE: i32 = 23;
+        const CHUNK: usize = 4 << 20;
+        let lo = (self.base as usize).next_multiple_of(4096);
+        let hi = (self.base as usize + self.bytes) & !4095;
+        let mut off = lo;
+        while off < hi {
+            let len = (hi - off).min(CHUNK);
+            if unsafe { madvise(off as *mut u8, len, MADV_POPULATE_WRITE) } != 0 {
+                break;
+            }
+            off += len;
+        }
+    }
 }
 
 /// The unallocated tail of an exclusively borrowed arena. Typed allocations

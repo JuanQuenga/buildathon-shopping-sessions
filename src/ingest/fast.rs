@@ -1153,6 +1153,9 @@ fn ingest_single_pass(
     }
     let result = parse_sinks::<false, u64, SinglePass>(ctx, plan, None, |tid| {
         let (tok, events, clicks) = slices[tid].lock().unwrap().take().unwrap();
+        tok.populate_write();
+        events.populate_write();
+        clicks.populate_write();
         let events = SinglePass {
             tok: Sinks::in_arena(plan.p1, plan.cap_ev, tok),
             b: Sinks::in_arena(plan.p2, cap_b, events),
