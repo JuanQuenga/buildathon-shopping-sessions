@@ -23,18 +23,39 @@ use crate::types::*;
 use std::io::Write;
 use std::path::Path;
 
-/// End-to-end pipeline entry point: uses the fused fast path (disk -> Parquet directly)
-/// when compact representation limits hold, falling back to the parallel memory-bounded
+#[allow(dead_code)]
+pub enum PipelineArena {
+    Fast(par::SinkArena),
+    ProtoC(crate::proto_c::arena::Arena),
+}
+
+/// End-to-end pipeline entry point: uses the packed Prototype C fast path first,
+/// then the fused u64/u128 fast path, falling back to the parallel memory-bounded
 /// generic path (`generic::run_to_output`) otherwise. `INGEST_SLOW=1` or `INGEST_DUMP`
 /// routes through `Loaded` + `aggregate::run` for differential verification.
-pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) -> Option<par::SinkArena> {
+pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) -> Option<PipelineArena> {
     let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
     let generic_forced = std::env::var("INGEST_GENERIC").map(|v| v == "1").unwrap_or(false);
+    let no_proto_c = std::env::var("INGEST_NO_PROTO_C").map(|v| v == "1").unwrap_or(false);
     let dump_path = std::env::var("INGEST_DUMP").ok();
     if !slow_forced && dump_path.is_none() {
         if !generic_forced {
+            if !no_proto_c {
+                match crate::proto_c::run_to_output(data_dir, output_dir, threads) {
+                    Ok(arena) => return Some(PipelineArena::ProtoC(arena)),
+                    Err(reason) if reason.starts_with("exact-order:") => {
+                        eprintln!("[ingest] proto-c fallback ({reason}): using exact-order slow path");
+                        let loaded = slow::load(data_dir);
+                        aggregate::run(loaded, output_dir, threads);
+                        return None;
+                    }
+                    Err(reason) => {
+                        eprintln!("[ingest] proto-c fallback ({reason}): using fast u64/u128 path");
+                    }
+                }
+            }
             if let Ok(mapping) = fast::run_to_output(data_dir, output_dir, threads) {
-                return mapping;
+                return mapping.map(PipelineArena::Fast);
             }
             eprintln!("[ingest] fast path not applicable: using parallel generic path");
         }

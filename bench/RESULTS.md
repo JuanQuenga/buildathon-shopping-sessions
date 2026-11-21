@@ -2,16 +2,17 @@
 
 ## Please submit
 
-- **Tag**: `candidate-12c` (HEAD on `main`, glibc bookworm) — **24 B `RecC` + 192 B SWCB, tighter sink slack, scratch-reused `links-parse`/`links-uf`, scratch-backed `RelocationMap`, and arena-backed `group+agg` / Parquet buffers on `candidate-12b` (`0.6896 s`) base**.
-  - **What it changes vs `candidate-12b` (`3889b4c`, `0.6896 s`)**:
-    1. **24 B `RecC<u64>` + 192 B (3-cache-line) SWCB + tighter sink capacities**: cuts click arena/traffic by 25% and trims unused partition slack.
-    2. **Scratch-reused `links-parse` / `links-uf` / zero-copy `BucketLinks` + scratch-backed `RelocationMap`**: reuses `tokens` scratch across link phases and drops heap `RelocationMap` allocations.
-    3. **Arena-backed `group+agg` / `UserCols` / `FileBuilder` / `CampStore`**: cuts `group+agg` minor faults from `9,945` (`12b`) → **`2,620`** (`−74%`; **−95% vs `11b`'s `54.6k`**!).
-  - **Measured A/B vs `candidate-12b` (`seed20-20m`, 8T on `0-3,8-11`)**:
-    - **Native interleaved (equal `630.8 MiB` THP)**: `minflt` `113,779 → 95,168` (**−18,611 faults**), `Peak RSS` `1,061 → 988 MiB` (**−73.1 MiB**), `sys` `1.054 → 0.946 s` (**−108 ms**), `wall` `0.698 → 0.688 s`, `branch-misses:u` `108.8M → 107.4M`.
-    - **Docker (`ss-test:c12c`, `20 MiB` THP)**: `Peak RSS = 875 MB` (**−79 MB vs `12b` Docker `954 MB`**), `minflt = 220,204` (`~225k` 4 KiB-equiv pages vs `~255k` in `12b`, **−30k 4 KiB pages**!), `group+agg` `2,620` faults.
-  - **Pre-submission 11-point model prediction**: **`~0.61–0.65 s`** (vs `12b` `0.6896 s` and `12b2` `0.6811 s`; −20–30k fewer 4 KiB pages at `2.22 µs/page` = −44 to −67 ms).
-  - **Verification**: 31/31 release unit tests (0 warnings), 36/36 official fixtures, 32/32 adversarial suites, `dev` + 1M seeds + `seed20-20m` (Polars + PyArrow + DuckDB), forced `INGEST_GENERIC=1`, all four 60M datasets (`seed60-60m` **2.69 GiB**, `seed60-longids` **5.85 GiB**, `seed60-5kcat` **2.93 GiB**, `seed60-90d` **2.99 GiB** — all `< 6 GiB`), and Docker `ss-test:c12c` (`--network none --read-only --user 1000:1000 --memory=8g`) exact `MATCH` on `dev` and `seed20-20m`.
+- **Tag**: `candidate-13a` (HEAD on `main`, glibc bookworm) — **Prototype C (`src/proto_c/`) narrow deferred 10/8/16-byte packed-record fast path + airtight automatic fallback to `candidate-12c` (`u64`/`u128`/`generic.rs`/`slow.rs`)**.
+  - **What it changes vs `candidate-12c` (`fc40c43`)**:
+    1. Reversible 43-bit Feistel hash splits dense base-37 IDs across `p1=512`/`p2=256` partitions → **10 B `Tok10`**, **8 B `RecB8`**, **16 B `RecC`** in a single unified arena; 1.5 MiB Blocked Bloom defers link relocation and reuses `Tok` pages for relocation, grouping, and Parquet output (`relocate = 0` faults, `group+agg = 56` faults at 4 KiB!).
+    2. Conservative automatic fallback before creating output on any compact-limit violation (long/non-prefix/mixed-case IDs, `>256` categories, `>2048` campaigns, `>1M` links, unparseable ingest, window/ingest/bucket limits, or differing equal-ingest event ties → exact-order `slow::load`).
+  - **Docker `ss-test:c13a` (`--network none --read-only --user 1000:1000 --memory=8g`, `seed20-20m`, 8T on `0-3,8-11`)**:
+    - Default THP: **`Peak RSS = 516 MiB`** (`529,380 KiB`), `minflt = 113,493`, exact `MATCH`.
+    - Pure 4 KiB (`PROTO_C_PAGE_MODE=4k`): **`Peak RSS = 518 MiB`** (`530,524 KiB`, **−436 MiB vs `12b`**), **`minflt = 132,706`** (**−122k 4 KiB pages vs `12b`**), `user = 4.333 s`, `wall = 0.999 s`, exact `MATCH`.
+  - **11-point model prediction**: **`~0.54–0.59 s`** even with current untuned `4.33 s` user CPU (`−122k` pages × `2.22 µs` = `−271 ms` offset by `+1.3 s` user CPU = `+106 ms` → net `−165 ms` vs `12b`). Follow-up `13b` (cutting `4.33 → ~2.8 s` user CPU) projects **`~0.41–0.46 s`**.
+  - **Verification**: 60/60 release unit tests (**0 warnings**), 36/36 official fixtures, 32/32 adversarial suites, `dev` + 1M seeds + `seed20-20m` (Polars + PyArrow + DuckDB), forced `INGEST_GENERIC=1`, all four 60M datasets (`seed60-60m`, `seed60-longids`, `seed60-5kcat`, `seed60-90d`, all exact `MATCH` and strictly `< 7.5 GiB` RSS), and Docker `dev` + `seed20-20m` (default & 4k) exact `MATCH`.
+
+- **Previous queued**: `candidate-12c` (`fc40c43`) — armed for 12:01 PM slot.
 
 ## Official scores
 

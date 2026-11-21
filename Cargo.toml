@@ -8,6 +8,11 @@ license = "MIT"
 name = "pipeline"
 path = "src/main.rs"
 
+[features]
+default = ["narrow", "swcb"]
+narrow = []
+swcb = []
+
 [dependencies]
 # aggregate/output agent: add your dependencies below this line.
 

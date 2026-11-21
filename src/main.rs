@@ -1,5 +1,6 @@
 mod aggregate;
 mod ingest;
+mod proto_c;
 mod types;
 
 use std::path::PathBuf;
