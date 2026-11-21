@@ -15,6 +15,102 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_ROWS: usize = 1 << 21;
 
+#[cfg(not(target_endian = "little"))]
+compile_error!("Parquet PLAIN buffers are built in native byte order; little-endian only");
+
+#[inline]
+fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: plain integer slices viewed as bytes (little-endian target asserted above).
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// user_daily rows accumulated directly as PLAIN Parquet column page bodies.
+pub struct UserCols {
+    n: usize,
+    ids: Vec<u8>,
+    day: Vec<i32>,
+    sessions: Vec<i64>,
+    events: Vec<i64>,
+    revenue: Vec<i64>,
+    defs: Vec<u8>,
+    top: Vec<u8>,
+}
+
+impl UserCols {
+    pub fn with_capacity(rows: usize) -> Self {
+        UserCols {
+            n: 0,
+            ids: Vec::with_capacity(rows * 16),
+            day: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            revenue: Vec::with_capacity(rows),
+            defs: Vec::with_capacity(rows / 8 + 1),
+            top: Vec::with_capacity(rows * 4),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    #[inline]
+    pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+        self.ids.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        self.ids.extend_from_slice(id);
+        self.day.push(day);
+        self.sessions.push(sessions as i64);
+        self.events.push(events as i64);
+        self.revenue.push(revenue);
+        if self.n % 8 == 0 {
+            self.defs.push(0);
+        }
+        if let Some(t) = top {
+            *self.defs.last_mut().unwrap() |= 1 << (self.n % 8);
+            self.top.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            self.top.extend_from_slice(t);
+        }
+        self.n += 1;
+    }
+}
+
+/// Writes one worker's column buffers as `part-{worker}.parquet`.
+pub fn write_user_cols(dir: &Path, worker: usize, c: &UserCols) -> io::Result<()> {
+    use parquet::{Column, Kind};
+    let prefix = parquet::def_levels_prefix(c.n);
+    let cols = [
+        Column {
+            name: "user_id",
+            kind: Kind::Utf8,
+            parts: vec![&c.ids],
+        },
+        Column {
+            name: "day",
+            kind: Kind::Date,
+            parts: vec![bytes_of(&c.day)],
+        },
+        Column {
+            name: "sessions",
+            kind: Kind::Int64,
+            parts: vec![bytes_of(&c.sessions)],
+        },
+        Column {
+            name: "events",
+            kind: Kind::Int64,
+            parts: vec![bytes_of(&c.events)],
+        },
+        Column {
+            name: "revenue_cents",
+            kind: Kind::Int64,
+            parts: vec![bytes_of(&c.revenue)],
+        },
+        Column {
+            name: "top_category",
+            kind: Kind::OptUtf8,
+            parts: vec![&prefix, &c.defs, &c.top],
+        },
+    ];
+    parquet::write_columns(&dir.join(format!("part-{worker}.parquet")), c.n, &cols)
+}
+
 fn user_file(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {
     let ids = &loaded.person_ids;
     let cats = &loaded.categories;
@@ -38,9 +134,20 @@ fn user_file(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {
         "top_category",
         nonnull,
         cat_bytes,
-        rows.iter().map(|r| if r.top == NO_CATEGORY { None } else { Some(cats[r.top as usize].as_slice()) }),
+        rows.iter().map(|r| {
+            if r.top == NO_CATEGORY {
+                None
+            } else {
+                Some(cats[r.top as usize].as_slice())
+            }
+        }),
     );
     f.finish()
+}
+
+#[allow(dead_code)]
+pub fn user_file_bytes(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {
+    user_file(rows, loaded)
 }
 
 fn camp_file(rows: &[CampRow], loaded: &Loaded) -> Vec<u8> {
@@ -62,6 +169,7 @@ fn camp_file(rows: &[CampRow], loaded: &Loaded) -> Vec<u8> {
 }
 
 /// Writes one worker's user_daily rows as `part-{worker}[-k].parquet` (always >= 1 file).
+#[allow(dead_code)]
 pub fn write_user_rows(dir: &Path, worker: usize, rows: &[UserRow], loaded: &Loaded) -> io::Result<()> {
     if rows.len() <= MAX_ROWS {
         return std::fs::write(dir.join(format!("part-{worker}.parquet")), user_file(rows, loaded));

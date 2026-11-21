@@ -74,7 +74,11 @@ struct Tw<'a> {
 
 impl<'a> Tw<'a> {
     fn new(out: &'a mut Vec<u8>) -> Self {
-        Tw { out, last: Vec::new(), cur: 0 }
+        Tw {
+            out,
+            last: Vec::new(),
+            cur: 0,
+        }
     }
     fn field(&mut self, id: i16, ty: u8) {
         let delta = id - self.cur;
@@ -146,31 +150,24 @@ impl FileBuilder {
     pub fn new(num_rows: usize, capacity: usize) -> Self {
         let mut buf = Vec::with_capacity(capacity + 4096);
         buf.extend_from_slice(PAR1);
-        FileBuilder { buf, num_rows, cols: Vec::new() }
-    }
-
-    fn page_header(&mut self, page_size: usize, levels: bool) {
-        let n = self.num_rows as i32;
-        let mut tw = Tw::new(&mut self.buf);
-        tw.i32(1, PAGE_DATA);
-        tw.i32(2, page_size as i32);
-        tw.i32(3, page_size as i32);
-        tw.begin(Some(5));
-        tw.i32(1, n);
-        tw.i32(2, ENC_PLAIN);
-        tw.i32(3, ENC_RLE);
-        tw.i32(4, ENC_RLE);
-        tw.end();
-        let _ = levels;
-        tw.out.push(0); // end PageHeader
+        FileBuilder {
+            buf,
+            num_rows,
+            cols: Vec::new(),
+        }
     }
 
     fn begin_col(&mut self, name: &'static str, kind: Kind, page_size: usize) -> u64 {
         assert!(page_size <= i32::MAX as usize, "page too large");
         let offset = self.buf.len() as u64;
-        self.page_header(page_size, kind == Kind::OptUtf8);
+        page_header(&mut self.buf, page_size, self.num_rows);
         self.buf.reserve(page_size);
-        self.cols.push(ColMeta { name, kind, offset, size: 0 });
+        self.cols.push(ColMeta {
+            name,
+            kind,
+            offset,
+            size: 0,
+        });
         offset
     }
 
@@ -262,92 +259,184 @@ impl FileBuilder {
 
     /// Writes the footer and returns the complete file bytes.
     pub fn finish(mut self) -> Vec<u8> {
-        let footer_start = self.buf.len();
         let cols = std::mem::take(&mut self.cols);
-        let num_rows = self.num_rows as i64;
-        {
-            let mut tw = Tw::new(&mut self.buf);
-            tw.i32(1, 1); // version
-            tw.list(2, CT_STRUCT, cols.len() + 1);
-            // root
-            tw.begin(None);
-            tw.binary(4, b"schema");
-            tw.i32(5, cols.len() as i32);
-            tw.end();
-            for c in &cols {
-                tw.begin(None);
-                let (ty, rep) = match c.kind {
-                    Kind::Utf8 => (T_BYTE_ARRAY, REP_REQUIRED),
-                    Kind::OptUtf8 => (T_BYTE_ARRAY, REP_OPTIONAL),
-                    Kind::Int64 => (T_INT64, REP_REQUIRED),
-                    Kind::Date => (T_INT32, REP_REQUIRED),
-                };
-                tw.i32(1, ty);
-                tw.i32(3, rep);
-                tw.binary(4, c.name.as_bytes());
-                match c.kind {
-                    Kind::Utf8 | Kind::OptUtf8 => {
-                        tw.i32(6, CONV_UTF8);
-                        tw.begin(Some(10)); // LogicalType
-                        tw.begin(Some(1)); // STRING
-                        tw.end();
-                        tw.end();
-                    }
-                    Kind::Date => {
-                        tw.i32(6, CONV_DATE);
-                        tw.begin(Some(10));
-                        tw.begin(Some(6)); // DATE
-                        tw.end();
-                        tw.end();
-                    }
-                    Kind::Int64 => {}
-                }
-                tw.end();
-            }
-            tw.i64(3, num_rows);
-            if num_rows == 0 {
-                tw.list(4, CT_STRUCT, 0);
-            } else {
-                tw.list(4, CT_STRUCT, 1);
-                tw.begin(None); // RowGroup
-                tw.list(1, CT_STRUCT, cols.len());
-                let mut total = 0i64;
-                for c in &cols {
-                    total += c.size as i64;
-                    tw.begin(None); // ColumnChunk
-                    tw.i64(2, c.offset as i64);
-                    tw.begin(Some(3)); // ColumnMetaData
-                    let ty = match c.kind {
-                        Kind::Utf8 | Kind::OptUtf8 => T_BYTE_ARRAY,
-                        Kind::Int64 => T_INT64,
-                        Kind::Date => T_INT32,
-                    };
-                    tw.i32(1, ty);
-                    tw.list(2, CT_I32, 2);
-                    tw.raw_i32(ENC_PLAIN);
-                    tw.raw_i32(ENC_RLE);
-                    tw.list(3, CT_BINARY, 1);
-                    tw.raw_binary(c.name.as_bytes());
-                    tw.i32(4, CODEC_UNCOMPRESSED);
-                    tw.i64(5, num_rows);
-                    tw.i64(6, c.size as i64);
-                    tw.i64(7, c.size as i64);
-                    tw.i64(9, c.offset as i64);
-                    tw.end(); // ColumnMetaData
-                    tw.end(); // ColumnChunk
-                }
-                tw.i64(2, total);
-                tw.i64(3, num_rows);
-                tw.i64(5, cols[0].offset as i64);
-                tw.i64(6, total);
-                tw.end(); // RowGroup
-            }
-            tw.binary(6, b"shopping-sessions native writer");
-            tw.out.push(0); // end FileMetaData
-        }
-        let footer_len = (self.buf.len() - footer_start) as u32;
-        self.buf.extend_from_slice(&footer_len.to_le_bytes());
-        self.buf.extend_from_slice(PAR1);
+        footer(&mut self.buf, self.num_rows, &cols);
         self.buf
     }
+}
+
+fn page_header(out: &mut Vec<u8>, page_size: usize, num_values: usize) {
+    assert!(page_size <= i32::MAX as usize, "parquet page too large");
+    let mut tw = Tw::new(out);
+    tw.i32(1, PAGE_DATA);
+    tw.i32(2, page_size as i32);
+    tw.i32(3, page_size as i32);
+    tw.begin(Some(5));
+    tw.i32(1, num_values as i32);
+    tw.i32(2, ENC_PLAIN);
+    tw.i32(3, ENC_RLE);
+    tw.i32(4, ENC_RLE);
+    tw.end();
+    tw.out.push(0); // end PageHeader
+}
+
+/// Appends FileMetaData, its length and the trailing magic.
+fn footer(out: &mut Vec<u8>, num_rows: usize, cols: &[ColMeta]) {
+    let footer_start = out.len();
+    let num_rows = num_rows as i64;
+    {
+        let mut tw = Tw::new(out);
+        tw.i32(1, 1); // version
+        tw.list(2, CT_STRUCT, cols.len() + 1);
+        // root
+        tw.begin(None);
+        tw.binary(4, b"schema");
+        tw.i32(5, cols.len() as i32);
+        tw.end();
+        for c in cols.iter() {
+            tw.begin(None);
+            let (ty, rep) = match c.kind {
+                Kind::Utf8 => (T_BYTE_ARRAY, REP_REQUIRED),
+                Kind::OptUtf8 => (T_BYTE_ARRAY, REP_OPTIONAL),
+                Kind::Int64 => (T_INT64, REP_REQUIRED),
+                Kind::Date => (T_INT32, REP_REQUIRED),
+            };
+            tw.i32(1, ty);
+            tw.i32(3, rep);
+            tw.binary(4, c.name.as_bytes());
+            match c.kind {
+                Kind::Utf8 | Kind::OptUtf8 => {
+                    tw.i32(6, CONV_UTF8);
+                    tw.begin(Some(10)); // LogicalType
+                    tw.begin(Some(1)); // STRING
+                    tw.end();
+                    tw.end();
+                }
+                Kind::Date => {
+                    tw.i32(6, CONV_DATE);
+                    tw.begin(Some(10));
+                    tw.begin(Some(6)); // DATE
+                    tw.end();
+                    tw.end();
+                }
+                Kind::Int64 => {}
+            }
+            tw.end();
+        }
+        tw.i64(3, num_rows);
+        if num_rows == 0 {
+            tw.list(4, CT_STRUCT, 0);
+        } else {
+            tw.list(4, CT_STRUCT, 1);
+            tw.begin(None); // RowGroup
+            tw.list(1, CT_STRUCT, cols.len());
+            let mut total = 0i64;
+            for c in cols.iter() {
+                total += c.size as i64;
+                tw.begin(None); // ColumnChunk
+                tw.i64(2, c.offset as i64);
+                tw.begin(Some(3)); // ColumnMetaData
+                let ty = match c.kind {
+                    Kind::Utf8 | Kind::OptUtf8 => T_BYTE_ARRAY,
+                    Kind::Int64 => T_INT64,
+                    Kind::Date => T_INT32,
+                };
+                tw.i32(1, ty);
+                tw.list(2, CT_I32, 2);
+                tw.raw_i32(ENC_PLAIN);
+                tw.raw_i32(ENC_RLE);
+                tw.list(3, CT_BINARY, 1);
+                tw.raw_binary(c.name.as_bytes());
+                tw.i32(4, CODEC_UNCOMPRESSED);
+                tw.i64(5, num_rows);
+                tw.i64(6, c.size as i64);
+                tw.i64(7, c.size as i64);
+                tw.i64(9, c.offset as i64);
+                tw.end(); // ColumnMetaData
+                tw.end(); // ColumnChunk
+            }
+            tw.i64(2, total);
+            tw.i64(3, num_rows);
+            tw.i64(5, cols[0].offset as i64);
+            tw.i64(6, total);
+            tw.end(); // RowGroup
+        }
+        tw.binary(6, b"shopping-sessions native writer");
+        tw.out.push(0); // end FileMetaData
+    }
+    let footer_len = (out.len() - footer_start) as u32;
+    out.extend_from_slice(&footer_len.to_le_bytes());
+    out.extend_from_slice(PAR1);
+}
+
+/// One column for `write_columns`: the PLAIN page body given as parts, written as-is.
+/// For `Kind::OptUtf8` the parts must start with the definition levels (use `def_levels_prefix`).
+pub struct Column<'a> {
+    pub name: &'static str,
+    pub kind: Kind,
+    pub parts: Vec<&'a [u8]>,
+}
+
+/// Prefix for an optional column's page: 4-byte level length + bit-packed run header.
+/// Followed by `bits` (n.div_ceil(8) bytes, LSB first) and then the non-null values.
+pub fn def_levels_prefix(n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    if n == 0 {
+        v.extend_from_slice(&0u32.to_le_bytes());
+        return v;
+    }
+    let groups = n.div_ceil(8);
+    let hdr = ((groups as u64) << 1) | 1;
+    v.extend_from_slice(&((varint_len(hdr) + groups) as u32).to_le_bytes());
+    uvarint(&mut v, hdr);
+    v
+}
+
+/// Writes a one-row-group file whose column pages are the given parts, without copying
+/// them into an intermediate buffer.
+pub fn write_columns(path: &std::path::Path, num_rows: usize, cols: &[Column]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut headers: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
+    let mut metas = Vec::with_capacity(cols.len());
+    let mut pos = PAR1.len() as u64;
+    for c in cols {
+        let page: usize = c.parts.iter().map(|p| p.len()).sum();
+        let mut h = Vec::with_capacity(32);
+        page_header(&mut h, page, num_rows);
+        let size = (h.len() + page) as u64;
+        metas.push(ColMeta {
+            name: c.name,
+            kind: c.kind,
+            offset: pos,
+            size,
+        });
+        pos += size;
+        headers.push(h);
+    }
+    let mut foot = Vec::with_capacity(1024);
+    footer(&mut foot, num_rows, &metas);
+    let mut f = std::fs::File::create(path)?;
+    let mut bufs: Vec<std::io::IoSlice> = Vec::with_capacity(2 + cols.len() * 4);
+    bufs.push(std::io::IoSlice::new(PAR1));
+    for (c, h) in cols.iter().zip(&headers) {
+        bufs.push(std::io::IoSlice::new(h));
+        for p in &c.parts {
+            if !p.is_empty() {
+                bufs.push(std::io::IoSlice::new(p));
+            }
+        }
+    }
+    bufs.push(std::io::IoSlice::new(&foot));
+    let mut slices: &mut [std::io::IoSlice] = &mut bufs;
+    while !slices.is_empty() {
+        let n = f.write_vectored(slices)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored wrote 0",
+            ));
+        }
+        std::io::IoSlice::advance_slices(&mut slices, n);
+    }
+    Ok(())
 }

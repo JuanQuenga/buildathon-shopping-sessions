@@ -107,7 +107,12 @@ impl CampStore {
             Some(n) if n <= (1 << 20) => (ndays, vec![CampCell::default(); n]),
             _ => (0, Vec::new()),
         };
-        CampStore { day0, ndays, dense, sparse: HashMap::new() }
+        CampStore {
+            day0,
+            ndays,
+            dense,
+            sparse: HashMap::new(),
+        }
     }
     #[inline]
     fn cell(&mut self, camp: u32, day: i32) -> &mut CampCell {
@@ -125,7 +130,11 @@ struct Worker<'a> {
     organic: u32,
     camp: CampStore,
     rows: Vec<UserRow>,
+    /// When set, rows go straight into Parquet column buffers instead of `rows`.
+    cols: Option<output::UserCols>,
     written: usize,
+    t_compute: f64,
+    t_write: f64,
     cat_sum: Vec<u64>,
     cat_touched: Vec<u32>,
     // Per-person session scratch.
@@ -148,7 +157,10 @@ impl<'a> Worker<'a> {
             organic: ncamp as u32,
             camp: CampStore::new(ncamp + 1, day0, ndays),
             rows: Vec::new(),
+            cols: None,
             written: 0,
+            t_compute: 0.0,
+            t_write: 0.0,
             cat_sum: vec![0; loaded.categories.len()],
             cat_touched: Vec::new(),
             s_start: Vec::new(),
@@ -175,7 +187,24 @@ impl<'a> Worker<'a> {
             self.cat_sum[c as usize] = 0;
         }
         self.cat_touched.clear();
-        self.rows.push(UserRow { person, day, sessions, events, revenue, top });
+        if let Some(c) = self.cols.as_mut() {
+            let id = self.loaded.person_ids.get(person as usize);
+            let cat = if top == NO_CATEGORY {
+                None
+            } else {
+                Some(self.loaded.categories[top as usize].as_slice())
+            };
+            c.push(id, day, sessions, events, revenue, cat);
+        } else {
+            self.rows.push(UserRow {
+                person,
+                day,
+                sessions,
+                events,
+                revenue,
+                top,
+            });
+        }
     }
 
     fn person(&mut self, p: usize) {
@@ -240,7 +269,11 @@ impl<'a> Worker<'a> {
                 }
                 j += 1;
             }
-            let credit = if j > 0 && s - last_ts <= WIN_MS { cl[grp_first].campaign } else { self.organic };
+            let credit = if j > 0 && s - last_ts <= WIN_MS {
+                cl[grp_first].campaign
+            } else {
+                self.organic
+            };
             let cell = self.camp.cell(credit, day);
             cell.sessions += 1;
             cell.purchasing += (rev != 0) as i64;
@@ -313,7 +346,11 @@ impl<'a> Worker<'a> {
         let mut di = df.partition_point(|d| (d.1 as usize) <= a) - 1;
         let mut idx = a;
         while idx < b {
-            let end = if di + 1 < df.len() { (df[di + 1].1 as usize).min(b) } else { b };
+            let end = if di + 1 < df.len() {
+                (df[di + 1].1 as usize).min(b)
+            } else {
+                b
+            };
             let day = df[di].0;
             self.camp.cell(camp, day).assisted += (end - idx) as i64;
             idx = end;
@@ -347,8 +384,9 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
     aggregate_with(loaded, threads, None)
 }
 
-/// With `user_dir`, each worker writes its user_daily rows there (one or more files,
-/// at least one even when empty) and `Tables::user_rows` comes back empty.
+/// With `user_dir`, each worker builds its user_daily rows directly as Parquet column
+/// buffers and writes them there as one file (even when empty); `Tables::user_rows`
+/// then comes back empty.
 pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) -> Tables {
     let threads = threads.max(1);
     let (day0, ndays) = if loaded.window_end_ms > loaded.window_start_ms {
@@ -362,14 +400,20 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
     let target = (total / (threads * 64)).clamp(4096, 1 << 20);
     let work = chunks(loaded, target);
     let next = AtomicUsize::new(0);
+    let t_start = Instant::now();
 
     let workers: Vec<Worker> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|tid| {
                 let work = &work;
                 let next = &next;
+                let t_start = &t_start;
                 sc.spawn(move || {
                     let mut w = Worker::new(loaded, day0, ndays);
+                    if user_dir.is_some() {
+                        // Generous reservation; untouched capacity costs only address space.
+                        w.cols = Some(output::UserCols::with_capacity(total / threads / 4 + 1024));
+                    }
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
                         if k >= work.len() {
@@ -381,9 +425,11 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
                         }
                     }
                     if let Some(dir) = user_dir {
-                        output::write_user_rows(dir, tid, &w.rows, loaded).expect("writing user_daily");
-                        w.written = w.rows.len();
-                        w.rows = Vec::new();
+                        w.t_compute = t_start.elapsed().as_secs_f64();
+                        let cols = w.cols.take().unwrap();
+                        output::write_user_cols(dir, tid, &cols).expect("writing user_daily");
+                        w.t_write = t_start.elapsed().as_secs_f64() - w.t_compute;
+                        w.written = cols.len();
                     }
                     w
                 })
@@ -396,6 +442,20 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
     let mut workers = workers;
     let mut user_rows = Vec::with_capacity(workers.len());
     let user_rows_written = workers.iter().map(|w| w.written).sum();
+    if user_dir.is_some() {
+        let fmt = |f: &dyn Fn(&Worker) -> f64| {
+            workers
+                .iter()
+                .map(|w| format!("{:.3}", f(w)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        eprintln!(
+            "[aggregate] compute_end {} write {}",
+            fmt(&|w| w.t_compute),
+            fmt(&|w| w.t_write)
+        );
+    }
     let mut merged: Option<CampStore> = None;
     for w in workers.drain(..) {
         user_rows.push(w.rows);
@@ -434,11 +494,19 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
         }
         for ((c, d), cell) in m.sparse {
             if cell.sessions != 0 || cell.assisted != 0 {
-                camp_rows.push(CampRow { campaign: c, day: d, cell });
+                camp_rows.push(CampRow {
+                    campaign: c,
+                    day: d,
+                    cell,
+                });
             }
         }
     }
-    Tables { user_rows, user_rows_written, camp_rows }
+    Tables {
+        user_rows,
+        user_rows_written,
+        camp_rows,
+    }
 }
 
 #[cfg(test)]
@@ -455,10 +523,18 @@ mod tests {
         for (id, ev, cl) in persons {
             ids.push(id.as_bytes());
             for (ts, cat, cents) in ev {
-                events.push(Event { ts_ms: ts, category: cat, cents });
+                events.push(Event {
+                    ts_ms: ts,
+                    category: cat,
+                    cents,
+                });
             }
             for (ts, camp) in cl {
-                clicks.push(Click { ts_ms: ts, campaign: camp, reserved: 0 });
+                clicks.push(Click {
+                    ts_ms: ts,
+                    campaign: camp,
+                    reserved: 0,
+                });
             }
             eo.push(events.len() as u32);
             co.push(clicks.len() as u32);
@@ -468,7 +544,9 @@ mod tests {
             window_end_ms: 30 * DAY_MS,
             person_ids: ids,
             categories: vec![b"a".to_vec(), b"b".to_vec(), b"unknown".to_vec()],
-            campaigns: (0..ncamp).map(|i| (format!("c{i}").into_bytes(), b"x".to_vec())).collect(),
+            campaigns: (0..ncamp)
+                .map(|i| (format!("c{i}").into_bytes(), b"x".to_vec()))
+                .collect(),
             events,
             event_offsets: eo,
             clicks,
@@ -484,7 +562,7 @@ mod tests {
                 "u",
                 vec![
                     (10 * d, 0, 0),
-                    (10 * d + GAP_MS, 1, 5),     // same session (exactly 30 min)
+                    (10 * d + GAP_MS, 1, 5),         // same session (exactly 30 min)
                     (10 * d + 2 * GAP_MS + 1, 0, 5), // new session
                     (11 * d - 1, 0, 0),
                     (11 * d + 10, 1, 3), // same session, crosses midnight
@@ -497,7 +575,14 @@ mod tests {
         let rows: Vec<UserRow> = t.user_rows.into_iter().flatten().collect();
         assert_eq!(
             rows,
-            vec![UserRow { person: 0, day: 10, sessions: 3, events: 5, revenue: 13, top: 1 }]
+            vec![UserRow {
+                person: 0,
+                day: 10,
+                sessions: 3,
+                events: 5,
+                revenue: 13,
+                top: 1
+            }]
         );
         let mut c = t.camp_rows;
         c.sort_by_key(|r| (r.campaign, r.day));
@@ -506,8 +591,24 @@ mod tests {
         // Campaign 0 clicks at 3d and 10d: same.
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].campaign, 0);
-        assert_eq!(c[0].cell, CampCell { sessions: 0, purchasing: 0, revenue: 0, assisted: 3 });
-        assert_eq!(c[1].cell, CampCell { sessions: 3, purchasing: 3, revenue: 13, assisted: 3 });
+        assert_eq!(
+            c[0].cell,
+            CampCell {
+                sessions: 0,
+                purchasing: 0,
+                revenue: 0,
+                assisted: 3
+            }
+        );
+        assert_eq!(
+            c[1].cell,
+            CampCell {
+                sessions: 3,
+                purchasing: 3,
+                revenue: 13,
+                assisted: 3
+            }
+        );
     }
 
     #[test]
@@ -515,7 +616,11 @@ mod tests {
         let d = DAY_MS;
         // Day 5: purchase cat 0 (10). Day 6: view, then purchase cat 1 (7). Day 7: no purchase.
         let l = mk(
-            vec![("u", vec![(5 * d, 0, 10), (6 * d, 2, 0), (6 * d + 5, 1, 7), (7 * d, 0, 0)], vec![])],
+            vec![(
+                "u",
+                vec![(5 * d, 0, 10), (6 * d, 2, 0), (6 * d + 5, 1, 7), (7 * d, 0, 0)],
+                vec![],
+            )],
             1,
         );
         let rows: Vec<UserRow> = aggregate(&l, 1).user_rows.into_iter().flatten().collect();
@@ -532,7 +637,11 @@ mod tests {
         let d = DAY_MS;
         let mut l = mk(
             vec![
-                ("a", vec![(10 * d, 0, 3), (12 * d + 7, 1, 0), (20 * d, 0, 9)], vec![(9 * d, 0), (11 * d, 1), (19 * d, 2)]),
+                (
+                    "a",
+                    vec![(10 * d, 0, 3), (12 * d + 7, 1, 0), (20 * d, 0, 9)],
+                    vec![(9 * d, 0), (11 * d, 1), (19 * d, 2)],
+                ),
                 ("b", vec![(10 * d + 5, 2, 0)], vec![(10 * d + 5, 2), (10 * d + 5, 1)]),
             ],
             3,
@@ -552,5 +661,31 @@ mod tests {
         let sparse = norm(aggregate(&l, 2));
         assert_eq!(dense, sparse);
         assert!(dense.1.iter().any(|r| r.cell.assisted > 0 && r.cell.sessions == 0));
+    }
+
+    /// `AGG_BENCH_DATA=/path/to/data cargo test --release agg_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agg_bench() {
+        let Ok(dir) = std::env::var("AGG_BENCH_DATA") else {
+            return;
+        };
+        let l = crate::ingest::load(Path::new(&dir), 8);
+        let out = std::env::temp_dir().join(format!("agg_bench_{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        for threads in [1usize, 8] {
+            let (mut best_c, mut best_w) = (f64::MAX, f64::MAX);
+            for _ in 0..7 {
+                let t = Instant::now();
+                let tables = aggregate(&l, threads);
+                best_c = best_c.min(t.elapsed().as_secs_f64());
+                drop(tables);
+                let t = Instant::now();
+                aggregate_with(&l, threads, Some(&out));
+                best_w = best_w.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!("threads {threads}: min aggregate(rows) {best_c:.3}s  min aggregate+write {best_w:.3}s");
+        }
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
