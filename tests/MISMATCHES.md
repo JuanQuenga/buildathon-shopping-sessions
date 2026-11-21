@@ -6,6 +6,7 @@ Newest status first. Each mismatch gets a minimal reproducer (under `tests/repro
 
 | Rev (origin/main) | Official fixtures | Adversarial (27 small + 5 big) | Dev answer | 1M seeds 2-7 + random | 20M (seed 20) vs oracle2 | 60M (seed 60) vs oracle2 | Docker (scorer flags) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| `4f01a6e` (`candidate-3`) | 36/36 | 32/32 | MATCH (0.35s) | 8/8 MATCH (6 cached + 2 random) | MATCH (3.79s) | MATCH (6.63M user / 28K camp rows, 3.89 GB RSS) | 36/36 fixtures + dev MATCH (0.54s); `INGEST_SLOW=1` MATCH; Polars/PyArrow/DuckDB cross-reader PASS; Docker A/B vs cand-1: 20M warm 1.59–1.71s vs 2.00–2.69s, 60M warm 4.77–5.83s vs 7.33s |
 | `c0688ae` (`candidate-2`) | 36/36 | 32/32 | MATCH | 7/7 MATCH | MATCH | MATCH (6.63M user / 28K camp rows) | 36/36 fixtures + dev MATCH; A/B vs cand-1: 1.46x faster CPU @20M, 1.35x @60M, -950 MB RSS |
 | `8ab1414` (`candidate-1`) | 36/36 | 32/32 | MATCH | 7/7 MATCH | MATCH | MATCH (6.63M user / 28K camp rows) | 36/36 fixtures + dev MATCH; 20M 1.58s warm / 2.16s cold; 60M 2.89s warm / 4.24s cold |
 | `80de97b` | 36/36 | 30/30 | MATCH | 7/7 MATCH | MATCH (4.9 s native) | pending | dev + 36 fixtures + 30 adversarial MATCH |
