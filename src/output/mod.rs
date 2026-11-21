@@ -61,6 +61,23 @@ fn camp_file(rows: &[CampRow], loaded: &Loaded) -> Vec<u8> {
     f.finish()
 }
 
+/// Writes one worker's user_daily rows as `part-{worker}[-k].parquet` (always >= 1 file).
+pub fn write_user_rows(dir: &Path, worker: usize, rows: &[UserRow], loaded: &Loaded) -> io::Result<()> {
+    if rows.len() <= MAX_ROWS {
+        return std::fs::write(dir.join(format!("part-{worker}.parquet")), user_file(rows, loaded));
+    }
+    for (k, c) in rows.chunks(MAX_ROWS).enumerate() {
+        std::fs::write(dir.join(format!("part-{worker}-{k}.parquet")), user_file(c, loaded))?;
+    }
+    Ok(())
+}
+
+pub fn write_campaign(dir: &Path, rows: &[CampRow], loaded: &Loaded) -> io::Result<()> {
+    std::fs::write(dir.join("part-0.parquet"), camp_file(rows, loaded))
+}
+
+/// Writes both tables from in-memory rows (used when rows were not written by workers).
+#[allow(dead_code)]
 pub fn write(tables: &Tables, loaded: &Loaded, out: &Path, threads: usize) -> io::Result<()> {
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");

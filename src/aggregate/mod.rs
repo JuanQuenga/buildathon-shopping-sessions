@@ -56,22 +56,29 @@ pub struct CampRow {
 pub struct Tables {
     /// One vector per worker; each becomes one or more Parquet files.
     pub user_rows: Vec<Vec<UserRow>>,
+    /// Rows already written to disk by the workers (see `aggregate_with`).
+    pub user_rows_written: usize,
     pub camp_rows: Vec<CampRow>,
 }
 
 /// Entry point called by main.rs.
 pub fn run(loaded: Loaded, output_dir: &Path, threads: usize) {
     let t = Instant::now();
-    let tables = aggregate(&loaded, threads);
+    let ud = output_dir.join("user_daily");
+    let cd = output_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud).expect("create user_daily");
+    std::fs::create_dir_all(&cd).expect("create campaign_daily");
+    // Workers write their own user_daily files as soon as they run out of work.
+    let tables = aggregate_with(&loaded, threads, Some(&ud));
     eprintln!(
-        "[stage] aggregate {:.3}s (user rows {}, campaign rows {})",
+        "[stage] aggregate+user_write {:.3}s (user rows {}, campaign rows {})",
         t.elapsed().as_secs_f64(),
-        tables.user_rows.iter().map(|v| v.len()).sum::<usize>(),
+        tables.user_rows_written,
         tables.camp_rows.len()
     );
     let t = Instant::now();
-    output::write(&tables, &loaded, output_dir, threads).expect("writing output");
-    eprintln!("[stage] write {:.3}s", t.elapsed().as_secs_f64());
+    output::write_campaign(&cd, &tables.camp_rows, &loaded).expect("writing campaign_daily");
+    eprintln!("[stage] campaign_write {:.3}s", t.elapsed().as_secs_f64());
     if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
         if let Some(kb) = st.lines().find_map(|l| l.strip_prefix("VmHWM:")) {
             let kb: u64 = kb.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
@@ -118,6 +125,7 @@ struct Worker<'a> {
     organic: u32,
     camp: CampStore,
     rows: Vec<UserRow>,
+    written: usize,
     cat_sum: Vec<u64>,
     cat_touched: Vec<u32>,
     // Per-person session scratch.
@@ -140,6 +148,7 @@ impl<'a> Worker<'a> {
             organic: ncamp as u32,
             camp: CampStore::new(ncamp + 1, day0, ndays),
             rows: Vec::new(),
+            written: 0,
             cat_sum: vec![0; loaded.categories.len()],
             cat_touched: Vec::new(),
             s_start: Vec::new(),
@@ -333,7 +342,14 @@ fn chunks(loaded: &Loaded, target: usize) -> Vec<(usize, usize)> {
     out
 }
 
+#[allow(dead_code)]
 pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
+    aggregate_with(loaded, threads, None)
+}
+
+/// With `user_dir`, each worker writes its user_daily rows there (one or more files,
+/// at least one even when empty) and `Tables::user_rows` comes back empty.
+pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) -> Tables {
     let threads = threads.max(1);
     let (day0, ndays) = if loaded.window_end_ms > loaded.window_start_ms {
         let d0 = day_of(loaded.window_start_ms);
@@ -349,7 +365,7 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
 
     let workers: Vec<Worker> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
-            .map(|_| {
+            .map(|tid| {
                 let work = &work;
                 let next = &next;
                 sc.spawn(move || {
@@ -364,6 +380,11 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
                             w.person(p);
                         }
                     }
+                    if let Some(dir) = user_dir {
+                        output::write_user_rows(dir, tid, &w.rows, loaded).expect("writing user_daily");
+                        w.written = w.rows.len();
+                        w.rows = Vec::new();
+                    }
                     w
                 })
             })
@@ -374,6 +395,7 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
     // Merge campaign accumulators.
     let mut workers = workers;
     let mut user_rows = Vec::with_capacity(workers.len());
+    let user_rows_written = workers.iter().map(|w| w.written).sum();
     let mut merged: Option<CampStore> = None;
     for w in workers.drain(..) {
         user_rows.push(w.rows);
@@ -416,7 +438,7 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
             }
         }
     }
-    Tables { user_rows, camp_rows }
+    Tables { user_rows, user_rows_written, camp_rows }
 }
 
 #[cfg(test)]
