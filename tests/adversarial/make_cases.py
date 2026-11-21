@@ -590,6 +590,54 @@ def small_cases():
     c.ck("k7", "v4", "c_1", "2026-09-24T00:00:00Z")
     cases.append(c)
 
+    c = Case("id_encoding_edges",
+             "rules.md 'IDs compare exactly' / byte-wise smallest: IDs of every length around packing limits "
+             "(9-11, 20-22, 31-33 chars), prefix pairs, NUL/DEL/control bytes and punctuation must stay distinct "
+             "and keep byte order for dedup, canonical names, click_id ties and category ties.")
+    c.campaigns += [("c_3", "email")]
+    c.products += [("pb", "book"), ("pB", "books"), ("pn", "bo\x00k")]
+    alnum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    k = 0
+    # distinct users that differ only by length / trailing bytes; each gets one event
+    users = []
+    for n in (1, 2, 8, 9, 10, 11, 12, 16, 20, 21, 22, 31, 32, 33, 64):
+        users.append("a" * n)
+        users.append("z" * n)
+        users.append((alnum * 2)[:n])
+    users += ["ab", "ab\x00", "ab\x00\x00", "ab\x01", "abc", "ab\x7f", "ab-", "ab_", "ab.", "ab~", "ab ",
+              "AB", "Ab", "aB", "0", "00", "000", "-", "_", "~", "\x7f", "a\x00b", "aé", "aÿ"]
+    for i, u in enumerate(users):
+        c.ev(f"ev{i}", u, f1(T + i * 1000), f1(T + H))
+    # event ids that differ only by trailing NUL / length: all distinct events of user 'dd'
+    for i, eid in enumerate(["x", "x\x00", "x\x00\x00", "x" * 10, "x" * 11, "x" * 21, "x" * 22, "X" * 10]):
+        c.ev(eid, "dd", f1(T + i * M), f1(T + H))
+    # duplicates that ARE equal (same long/odd ids) must collapse
+    for eid in ["y" * 33, "y\x00y", "ÿ" * 11]:
+        c.ev(eid, "dup", f1(T + 2 * H), f1(T + 3 * H))
+        c.ev(eid, "dup", f1(T + 2 * H), f1(T + 4 * H), file="part-00001.csv")
+    # canonical name = byte-wise smallest across mixed encodings
+    c.ln("pq" * 6, "pq\x00")            # 12-char id vs 3-byte id with NUL: 'pq\x00' < 'pqpq...'
+    c.ln("pq\x00", "pq" * 11)
+    c.ev("lk1", "pq" * 11, f1(T), f1(T + H))
+    c.ln("mmmmmmmmmm", "mmmmmmmmm")      # 10 vs 9 chars: prefix is smaller
+    c.ev("lk2", "mmmmmmmmmm", f1(T), f1(T + H))
+    c.ln("Zz", "zZ" * 20)
+    c.ev("lk3", "zZ" * 20, f1(T), f1(T + H))
+    # click_id ties across encodings: smallest byte string wins
+    S = T + 5 * H
+    for u, ids in {"ct1": ["k", "k\x00", "k0"], "ct2": ["kk" * 6, "kk" * 5 + "k", "kk" * 5],
+                   "ct3": ["q" * 22, "q" * 21 + "\x00", "q" * 21], "ct4": ["Zk" * 17, "Zk" * 16 + "Z", "a"],
+                   "ct5": ["é", "z" * 40, "~"]}.items():
+        c.ev("e_" + u, u, f1(S), f1(S + H))
+        for j, cid in enumerate(ids):
+            c.ck(cid, u, ["c_1", "c_2", "c_3"][j], f1(S - M))
+    # category ties across prefix-related names: 'bo\x00k' < 'book' < 'books'
+    c.ev("pc1", "cat1", f1(T), f1(T + H), "purchase", "pb", "100")
+    c.ev("pc2", "cat1", f1(T + M), f1(T + H), "purchase", "pB", "100")
+    c.ev("pc3", "cat2", f1(T), f1(T + H), "purchase", "pB", "100")
+    c.ev("pc4", "cat2", f1(T + M), f1(T + H), "purchase", "pn", "100")
+    cases.append(c)
+
     c = Case("revenue_over_32bit",
              "rules.md Outputs: signed 64-bit sums; revenue far above 2^32 in one user-day and one campaign-day.")
     for i in range(450):
@@ -703,7 +751,64 @@ def big_cases(seed=11):
             c.ck(f"{rnd.randrange(1, 10 ** rnd.randrange(1, 6))}_{k}_{dup}", rnd.choice(ids),
                  f"c_{rnd.randrange(1, 201)}", f3(ct), file=f"part-{k % 4:05d}.csv")
     cases.append(c)
+
+    dev = os.environ.get("SS_DEV_DATA")
+    if dev and os.path.isdir(dev):
+        cases.append(injected_dev(dev))
     return cases
+
+
+def injected_dev(dev):
+    """The public dev input with odd lines appended to existing files, so per-ID fallback paths
+    (wide/odd IDs) run inside a realistic 1M-event dataset and must keep global byte order."""
+    c = Case("big_dev_injected",
+             "Dev input + injected lines: odd IDs (NUL, Unicode, 11/22/40-char, uppercase-first) linked to real "
+             "generated IDs, click ties between generated and odd click_ids, odd event_id duplicates across files.")
+    with open(os.path.join(dev, "manifest.json")) as fh:
+        import json
+        man = json.load(fh)
+    c.start, c.end = man["window_start"], man["window_end"]
+    ws = ms(c.start)
+    # pick real generated user ids from the first events file
+    evdir = os.path.join(dev, "events")
+    first = sorted(os.listdir(evdir))
+    sample = []
+    with open(os.path.join(evdir, first[0]), "rb") as fh:
+        fh.readline()
+        for raw in fh:
+            f = raw.rstrip(b"\n").split(b",")
+            if len(f) == 7 and b'"' not in raw and f[1] and f[1] not in sample:
+                sample.append(f[1])
+            if len(sample) >= 6:
+                break
+    odd = ["A", "\x00", "～", "x" * 11, "Q" * 22, "u" + "0" * 39]
+    extra_links = [line(s, o) for s, o in zip(sample, odd)]
+    extra_events, extra_clicks = [], []
+    t0 = ws + 3 * DAY + 11 * H
+    for i, (s, o) in enumerate(zip(sample, odd)):
+        t = t0 + i * 2 * H
+        extra_events.append(line(f"inj{i}", o, f1(t), f1(t + H), "purchase", "p1", "777"))
+        extra_events.append(line(o + "\x00e", s, f1(t + M), f1(t + H), "view", "p1", ""))
+        extra_clicks.append(line(f"k\x00{i}", o, "c_1", f1(t - 30 * M)))
+        extra_clicks.append(line(f"k{i}", s, "c_2", f1(t - 30 * M)))
+        extra_clicks.append(line(f"{'k' * 30}{i}", o, "c_3", f1(t - 30 * M)))
+    for sub in ("events", "clicks", "links"):
+        for name in sorted(os.listdir(os.path.join(dev, sub))):
+            with open(os.path.join(dev, sub, name), "rb") as fh:
+                c.files[f"{sub}/{name}"] = fh.read()
+    for sub, extra in (("events", extra_events), ("clicks", extra_clicks), ("links", extra_links)):
+        names = sorted(k for k in c.files if k.startswith(sub + "/"))
+        for j, l in enumerate(extra):
+            key = names[(j * 7) % len(names)]
+            data = c.files[key]
+            c.files[key] = data + l + b"\n"
+    with open(os.path.join(dev, "products.csv"), "rb") as fh:
+        prod = fh.read().decode()
+    with open(os.path.join(dev, "campaigns.csv"), "rb") as fh:
+        camp = fh.read().decode()
+    c.products = [tuple(l.split(",")) for l in prod.splitlines()[1:]]
+    c.campaigns = [tuple(l.split(",")) for l in camp.splitlines()[1:]]
+    return c
 
 
 def main():
