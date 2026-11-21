@@ -2,36 +2,33 @@
 
 ## Please submit
 
-1. **Tag**: `candidate-11b` (HEAD on `main`, code `7bd0941` merged cleanly onto `candidate-8` base after reverting `c10`'s `mmap`) — **SUBMIT FIRST (clears every gate by a wide margin!)**
-   - **What it changes vs `candidate-8` (`5d0f934`, `0.8752 s`)**:
-     1. **In-place co-partitioned L2-resident `Links` resolution**: removes all `Links` probes and ring buffers from `parse` and eliminates the 32 MiB flat `Links` table. After `dedup`, each bucket `q` probes a `64–128 KiB` L2-resident map; the ~62% unmapped rows stay in place (zero copy) and only ~38% relocate.
-     2. **Direct specialized single-pass `events` & `clicks` row parsers (`src/ingest/direct.rs`)**: bypasses 2-stage `scan1+scan2` on the compact hot path using fused SWAR `0x30..=0x7F` ID validation + BMI2 `PEXT`/`PDEP` 7-bit ASCII `u64` keys, frequency-ordered `ts`/`ingest_ts` pair parsing, and a single 32-byte AVX2 tail check (`f5,f6\n`), with exact single-row fallback to `scan_ref + parse_event`.
-     3. **Zero-fault `tok_sinks` → `relocate` arena reuse + slot-cached L2 prefetch**: reuses already-faulted `tok_sinks` mappings to back `reloc_b`/`reloc_c` (`relocate` minor faults `53,000 → 8,769`, `dedup` `sys` `0.067 → 0.005 s`), plus `p1=512`, `p2=256`, keeping `256 KiB pread` and `candidate-8`'s 4.46× compact Parquet output.
-   - **Local 8-vCPU (`0-3,8-11`) warm A/B vs `candidate-8` (`seed20-20m`, alternating 3-run median, diagnostic under host load 20.1–20.7)**:
-     - **`parse` CPU (`user+sys`)**: `3.580 s → 2.020 s` (**−43.59%**, `137.31 → 77.45 ns/row`; **`parse user`** `2.729 s → 1.262 s`, **−53.8%**)
-     - **Whole-run CPU (`user+sys`)**: `5.395 s → 4.021 s` (**−25.47%**) | **Whole-run wall**: `1.200 s → 0.863 s` (**−28.10%**)
-     - **Hardware counters (`perf stat`)**: `instructions:u` `24.42B → 17.60B` (**−27.93%**), `cycles:u` `17.35B → 12.57B` (**−27.55%**), **`cache-misses:u` `86.27M → 46.72M` (−45.85%)**
-   - **Verification**: 198,750/198,750 generated differential event+click fuzz cases, all unit tests, all 36 official fixtures, all 28 repo adversarial suites, `dev`, `seed2-1m..seed7-1m`, `seed20-20m`, forced `INGEST_GENERIC=1`, byte-identical `INGEST_DUMP` vs `c8` on `dev`/`unicode_ids`/`seed20-20m`, all four 60M datasets (`seed60-60m`, `seed60-longids`, `seed60-5kcat`, `seed60-90d`, peak RSS 5.67 GiB), and Docker `ss-test:c11b` exact `MATCH` on `dev` and `seed20-20m` under scorer flags (`--network none --read-only --user 1000:1000 --memory=8g`).
-
-2. **Tag**: `candidate-11a` (`f6d8110` on `exp/c11-redesign`, ancestor of `candidate-11b`) — **optional intermediate data point (co-partitioned L2 `Links` + quote-bit SIMD scan + BMI2 `PEXT` keys, without direct row parsers or arena reuse)**:
-   - **Local 8-vCPU (`0-3,8-11`) warm A/B vs `candidate-8` (`seed20-20m`, alternating 3-run median, load `< 8`)**:
-     - **`parse` CPU (`user+sys`)**: `3.061 s → 2.385 s` (**−22.1%**; `parse user` `2.338 s → 1.683 s`, **−28.0%**)
-     - **Whole-run CPU (`user+sys`)**: `4.474 s → 4.227 s` (**−5.5%**) | **Wall**: `0.828 s → 0.855 s` (+3.2%)
-     - **Hardware counters**: `instructions:u` `24.42B → 23.54B` (−3.6%), **`cache-misses:u` `82.53M → 52.02M` (−37.0%)**
-   - **Verification**: 28 unit tests, 36 official fixtures, all native datasets + forced `INGEST_GENERIC=1`, byte-identical dumps, and all four 60M comparisons (peak RSS 5.67 GiB).
+- **Tag**: `candidate-12a` (HEAD on `main`, code `c34c244` on glibc bookworm) — **1-variable `group+agg` rework ONLY on `candidate-11b` (`0.8195 s`) base**.
+  - **What it changes vs `candidate-11b` (`ea17016`, `0.8195 s`)** (`links`, `parse`, `dedup`, `relocate`, and `Dockerfile` 100% unchanged):
+    1. **Single-pass CSR in `group_fused`**: stages `CompactEv` alongside person IDs in Pass 1 (`GroupMap` with inline counts) so CSR scatter never re-reads `b_sinks`, `reloc_b`, or `DeadEvents` a second time.
+    2. **Faster `session/credit/assist`**: relative session days (`s_day`), multiply-shift day calc, flat unchecked `CampStore` indexing, advancing assist windows over sorted starts (`Aggregate` worker CPU `0.874 → 0.794 s`, −9.2%).
+    3. **Compact multi-row-group `UserCols` + `u32` `sessions`/`events` Parquet streaming**: flushes bounded Parquet row groups with stable per-file schema (`22.17 MB` at 20M vs `21.40 MB`), cutting `group+agg` minor faults by **−62% to −70%** (`54.6k → 16.5k–19.6k`), `group+agg sys` by **−46%** (`0.191 → 0.103 s`), and **Peak RSS by −120 MB** (`1,076 → 956 MB`).
+    4. Restored `c11b`'s 3-pass radix / 16-item sort cutoffs (`c34c244`) after Sol's byte-radix sort regressed +57 ms.
+  - **Local 8-vCPU (`0-3,8-11`) warm A/B vs `candidate-11b` (`seed20-20m`, high host load ~15)**:
+    - **`group+agg` minor faults**: `51.6k–54.6k → 16.5k–19.6k` (**−62% to −70%**)
+    - **`group+agg` CPU (`user+sys`)**: `1.159 s → 1.037 s` (`−122 ms`, **−10.5%**; `g_sys` `0.224 → 0.118 s`, **−47%**)
+    - **`instructions:u`**: `17.61B → 16.92B` (**−690M instr, −3.9%**) | **`cache-references:u`**: `596.7M → 553.8M` (**−7.2%**) | **`cache-misses:u`**: `48.38M → 47.10M` (−2.6%) | **Peak RSS**: `1,076 → 956 MB` (**−120 MB**)
+    - **Model C predicted official gain**: modest (`~−15 to −35 ms`, `0.8195 → ~0.785–0.805 s`) — clean 1-variable test of `group+agg` + RSS/fault reduction before `12b` (`relocate` + `links-uf` + `24 B RecC`).
+  - **Verification**: 30/30 release unit tests (0 warnings), 36 official fixtures, 32 adversarial suites, `dev` + 1M seeds + `seed20-20m`, **Polars + PyArrow + DuckDB** multi-row-group & wide-revenue (4B cents) exact match, forced `INGEST_GENERIC=1`, all four 60M datasets (`5.67 GiB` peak RSS), and Docker `ss-test:c12a` (`--network none --read-only --user 1000:1000 --memory=8g`) exact `MATCH` on `dev` and `seed20-20m`.
 
 ## Official scores
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
-| `candidate-3` | `63b9256` (`4f01a6e`) | **0.8824 s** | 29 (leaders now 0.42 s) | Accepted exact output |
-| `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | 36 (leaders now 0.36 s) | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 |
-| `candidate-6` | `5f6718c` (`8f5cb0b`) | **0.948 s** | — | Accepted exact output; +65 ms slower with 24 readers × 4 MiB + t=0 fadvise → cold-I/O hypothesis refuted (scored median is warm cache) |
-| `candidate-7` | `8c4250c` (`c4d681c`) | **1.068 s** | — | Accepted exact output (H2: 4 threads vs 8 on c5 base); +0.185 s (+17% HT gain → P ≈ 3.2 core-s, F ≈ 0.27 s) |
-| `candidate-8` | `5d0f934` (`49473d0`) | **0.8752 s** | 37 (BEST SO FAR; leader 0.31 s) | Accepted exact output (H1: 4.46× smaller compact Parquet 97.9→21.9 MB); −7.4 ms vs c5 → output volume is not the bottleneck |
+| `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | NEW BEST (leader 0.31 s) | Accepted exact output; direct specialized events/clicks parsers + co-partitioned L2 Links + zero-fault `tok→reloc` arena reuse (−55.7 ms vs c8) |
+| `candidate-11a` | `f6d8110` | **0.8678 s** | — | Accepted exact output; co-partitioned L2 Links + quote-bit SIMD scan + BMI2 PEXT keys (matched 0.865–0.890 s out-of-sample model prediction!) |
+| `candidate-8` | `5d0f934` (`49473d0`) | **0.8752 s** | 37 | Accepted exact output (H1: 4.46× smaller compact Parquet 97.9→21.9 MB); −7.4 ms vs c5 |
+| `candidate-3` | `63b9256` (`4f01a6e`) | **0.8824 s** | 29 | Accepted exact output |
+| `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | 36 | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 |
 | `candidate-9` | `bcf953c` (`exp/h3-arenas-exit`) | **0.8853 s** | 39 | Accepted exact output (H3: unconditional THP + prefault + `_exit(0)`); +3 ms vs c5 → first-touch/exit not dominant |
-| `candidate-10` | `e3ccaf9` (`9de36c7`) | **0.8938 s** | 40 | Accepted exact output (1 MiB `mmap` w/ worker `munmap` on c8 base); +18.6 ms vs c8 (`256 KiB pread`) → file-backed faults + mid-parse TLB shootdowns regressed; reverted on `main` |
-| `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (disabled `MADV_HUGEPAGE` on `Sinks`, halved chunks to 128 KiB, switched to AVX-512VL-256) |
+| `candidate-10` | `e3ccaf9` (`9de36c7`) | **0.8938 s** | 40 | Accepted exact output (1 MiB `mmap` w/ worker `munmap` on c8 base); +18.6 ms vs c8 (`256 KiB pread`); reverted on `main` |
+| `candidate-6` | `5f6718c` (`8f5cb0b`) | **0.948 s** | — | Accepted exact output; +65 ms slower with 24 readers × 4 MiB + t=0 fadvise → cold-I/O hypothesis refuted |
+| `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (THP off on Sinks, 128 KiB chunks, AVX-512VL-256) |
+| `candidate-7` | `8c4250c` (`c4d681c`) | **1.068 s** | — | Accepted exact output (H2: 4 threads vs 8 on c5 base); +0.185 s |
 | `probe-1` | `4456bb8` | rejected (dev) | — | Deliberate 0-row dev mismatch; confirmed scorer returns row diff (not stderr) on mismatch |
 
 ## 2026-11-20 commit `4f01a6e` (`candidate-3`: 2M huge-page flat Links, RecA eid_hash, ring-32 prefetch, skip view/cart prod.get, 256 KiB L2-hot chunks + 4 prefetch threads, pshufb enc, CompactEv(u64))
