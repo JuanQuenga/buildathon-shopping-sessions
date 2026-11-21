@@ -1480,48 +1480,88 @@ fn insertion_sort_ev(a: &mut [CompactEv]) {
     }
 }
 
-#[inline(always)]
-fn sort_pair(a: &mut CompactEv, b: &mut CompactEv) {
-    let x = a.0;
-    let y = b.0;
-    a.0 = x.min(y);
-    b.0 = x.max(y);
-}
-
-// Use byte-wide histograms to keep the complete counting table in L1.
-fn radix_sort_ev_bytes(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
+/// 3-pass (11+11+10 bit) LSB radix sort on `CompactEv::ts()` (skips trivial passes).
+fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
     let n = slice.len();
-    let mut counts = [[0u32; 256]; 4];
-    for ev in slice.iter() {
-        let bytes = ev.ts().to_le_bytes();
-        for i in 0..4 {
-            counts[i][bytes[i] as usize] += 1;
-        }
-    }
     if tmp.len() < n {
         tmp.resize(n, CompactEv(0));
     }
     let buf = &mut tmp[..n];
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 2048];
+    let mut c2 = [0u32; 1024];
+    for e in slice.iter() {
+        let t = e.ts();
+        c0[(t & 2047) as usize] += 1;
+        c1[((t >> 11) & 2047) as usize] += 1;
+        c2[(t >> 22) as usize] += 1;
+    }
+    let t0 = slice[0].ts();
+    let skip0 = c0[(t0 & 2047) as usize] == n as u32;
+    let skip1 = c1[((t0 >> 11) & 2047) as usize] == n as u32;
+    let skip2 = c2[(t0 >> 22) as usize] == n as u32;
     let mut in_tmp = false;
-    let origin = slice[0].ts().to_le_bytes();
-    for (i, (counts, byte)) in counts.iter_mut().zip(origin).enumerate() {
-        if counts[byte as usize] == n as u32 {
-            continue;
+
+    if !skip0 {
+        let mut acc = 0u32;
+        for c in c0.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
         }
-        let mut acc = 0;
-        for count in &mut *counts {
-            let current = *count;
-            *count = acc;
-            acc += current;
+        for &e in slice.iter() {
+            let b = (e.ts() & 2047) as usize;
+            let dst = unsafe { c0.get_unchecked_mut(b) };
+            unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
+            *dst += 1;
         }
-        let (src, dst) = if in_tmp { (&*buf, &mut *slice) } else { (&*slice, &mut *buf) };
-        let shift = i * 8;
-        for &ev in src {
-            let bin = ((ev.ts() >> shift) & 255) as usize;
-            let pos = unsafe { counts.get_unchecked_mut(bin) };
-            // Prefix counts delimit disjoint output ranges that cover dst.
-            unsafe { *dst.get_unchecked_mut(*pos as usize) = ev };
-            *pos += 1;
+        in_tmp = true;
+    }
+    if !skip1 {
+        let mut acc = 0u32;
+        for c in c1.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &e in buf.iter() {
+                let b = ((e.ts() >> 11) & 2047) as usize;
+                let dst = unsafe { c1.get_unchecked_mut(b) };
+                unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
+                *dst += 1;
+            }
+        } else {
+            for &e in slice.iter() {
+                let b = ((e.ts() >> 11) & 2047) as usize;
+                let dst = unsafe { c1.get_unchecked_mut(b) };
+                unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
+                *dst += 1;
+            }
+        }
+        in_tmp = !in_tmp;
+    }
+    if !skip2 {
+        let mut acc = 0u32;
+        for c in c2.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &e in buf.iter() {
+                let b = (e.ts() >> 22) as usize;
+                let dst = unsafe { c2.get_unchecked_mut(b) };
+                unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
+                *dst += 1;
+            }
+        } else {
+            for &e in slice.iter() {
+                let b = (e.ts() >> 22) as usize;
+                let dst = unsafe { c2.get_unchecked_mut(b) };
+                unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
+                *dst += 1;
+            }
         }
         in_tmp = !in_tmp;
     }
@@ -1532,31 +1572,16 @@ fn radix_sort_ev_bytes(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
 
 #[inline]
 fn sort_ev_slice(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
-    match slice {
-        [] | [_] => {}
-        [a, b] => sort_pair(a, b),
-        [a, b, c] => {
-            sort_pair(a, b);
-            sort_pair(b, c);
-            sort_pair(a, b);
-        }
-        [a, b, c, d] => {
-            sort_pair(a, b);
-            sort_pair(c, d);
-            sort_pair(a, c);
-            sort_pair(b, d);
-            sort_pair(b, c);
-        }
-        _ => {
-            let n = slice.len();
-            if n <= 16 {
-                insertion_sort_ev(slice);
-            } else if n <= 256 {
-                slice.sort_unstable();
-            } else {
-                radix_sort_ev_bytes(slice, tmp);
-            }
-        }
+    let n = slice.len();
+    if n <= 1 {
+        return;
+    }
+    if n <= 16 {
+        insertion_sort_ev(slice);
+    } else if n <= 256 {
+        slice.sort_unstable();
+    } else {
+        radix_sort_ev(slice, tmp);
     }
 }
 
@@ -1566,35 +1591,27 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
     if n <= 1 {
         return n;
     }
-    if n <= 24 {
+    if n <= 16 {
         for i in 1..n {
-            let v = unsafe { *cl.get_unchecked(i) };
+            let v = cl[i];
             let mut j = i;
-            while j > 0 {
-                let prev = unsafe { *cl.get_unchecked(j - 1) };
-                if (prev.ts, prev.cid) <= (v.ts, v.cid) {
-                    break;
-                }
-                unsafe { *cl.get_unchecked_mut(j) = prev };
+            while j > 0 && (cl[j - 1].ts > v.ts || (cl[j - 1].ts == v.ts && cl[j - 1].cid > v.cid)) {
+                cl[j] = cl[j - 1];
                 j -= 1;
             }
-            unsafe { *cl.get_unchecked_mut(j) = v };
+            cl[j] = v;
         }
     } else {
         cl.sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid)));
     }
-    // Most slices have no duplicates. Leave the sorted prefix alone.
-    let Some(first_duplicate) = cl.windows(2).position(|pair| pair[0].cid == pair[1].cid) else {
-        return n;
-    };
-    let mut out = first_duplicate + 1;
-    for read in out + 1..n {
-        if cl[read].cid != cl[out - 1].cid {
-            cl[out] = cl[read];
-            out += 1;
+    let mut w = 1usize;
+    for r in 1..n {
+        if cl[r].cid != cl[w - 1].cid {
+            cl[w] = cl[r];
+            w += 1;
         }
     }
-    out
+    w
 }
 
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
