@@ -27,19 +27,19 @@ use std::path::Path;
 /// when compact representation limits hold, falling back to the parallel memory-bounded
 /// generic path (`generic::run_to_output`) otherwise. `INGEST_SLOW=1` or `INGEST_DUMP`
 /// routes through `Loaded` + `aggregate::run` for differential verification.
-pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) {
+pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) -> Option<par::SinkArena> {
     let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
     let generic_forced = std::env::var("INGEST_GENERIC").map(|v| v == "1").unwrap_or(false);
     let dump_path = std::env::var("INGEST_DUMP").ok();
     if !slow_forced && dump_path.is_none() {
-        if !generic_forced && fast::run_to_output(data_dir, output_dir, threads) {
-            return;
-        }
         if !generic_forced {
+            if let Ok(mapping) = fast::run_to_output(data_dir, output_dir, threads) {
+                return mapping;
+            }
             eprintln!("[ingest] fast path not applicable: using parallel generic path");
         }
         generic::run_to_output(data_dir, output_dir, threads);
-        return;
+        return None;
     }
     let loaded = if slow_forced {
         par::diagnose(threads, None, 0);
@@ -58,6 +58,7 @@ pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) {
         dump(&loaded, Path::new(&p));
     }
     aggregate::run(loaded, output_dir, threads);
+    None
 }
 
 #[allow(dead_code)]

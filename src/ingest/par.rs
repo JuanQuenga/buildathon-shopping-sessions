@@ -268,6 +268,11 @@ impl<T> SyncPtr<T> {
         self.0.add(i).write(v)
     }
     #[inline(always)]
+    pub(super) unsafe fn copy_from(self, start: usize, src: &[T]) {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.0.add(start), src.len()) };
+    }
+
+    #[inline(always)]
     pub unsafe fn slice<'a>(self, start: usize, len: usize) -> &'a mut [T] {
         std::slice::from_raw_parts_mut(self.0.add(start), len)
     }
@@ -395,33 +400,9 @@ fn thp_enabled() -> &'static str {
 
 fn sink_thp() -> bool {
     static USE_THP: OnceLock<bool> = OnceLock::new();
-    *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        // In always mode, let the kernel try THP without explicit advice
-        // that can trigger synchronous compaction on first writes.
-        _ => !matches!(thp_enabled(), "always" | "never") && probe_sink_thp(),
+    *USE_THP.get_or_init(|| {
+        std::env::var("INGEST_SINK_THP").as_deref() != Ok("0") && thp_enabled() != "never"
     })
-}
-
-fn probe_sink_thp() -> bool {
-    let bytes = 8 * HUGE_PAGE_BYTES;
-    let Some((aligned, raw, len)) = map_aligned(bytes) else {
-        return false;
-    };
-    let fast = unsafe {
-        if madvise(aligned, bytes, 14) == 0 {
-            let start = Instant::now();
-            for offset in (0..bytes).step_by(HUGE_PAGE_BYTES) {
-                aligned.add(offset).write_volatile(1);
-            }
-            start.elapsed() < std::time::Duration::from_millis(8)
-        } else {
-            false
-        }
-    };
-    huge_free(raw, len);
-    fast
 }
 
 pub fn diagnose(threads: usize, cache: Option<bool>, prefetch: usize) {
@@ -530,32 +511,38 @@ pub fn fadvise_range(fd: i32, off: u64, len: u64) {
 /// Anonymous memory region aligned to 2 MiB with optional MADV_HUGEPAGE.
 /// Returns (aligned pointer, raw mapping pointer, raw length) for `huge_free`.
 pub fn huge_alloc(bytes: usize) -> (*mut u8, *mut u8, usize) {
-    huge_alloc_ex(bytes, true)
+    huge_alloc_ex(bytes, sink_thp())
 }
 
 const HUGE_PAGE_BYTES: usize = 2 << 20;
 
 fn map_aligned(bytes: usize) -> Option<(*mut u8, *mut u8, usize)> {
     let hp = HUGE_PAGE_BYTES;
-    let len = bytes.div_ceil(hp) * hp + hp;
+    let len = bytes.max(1).next_multiple_of(hp);
+    let reserved = len.checked_add(hp)?;
     unsafe {
-        let raw = mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0);
+        let raw = mmap(std::ptr::null_mut(), reserved, 3, 0x22, -1, 0);
         if raw as isize == -1 || raw.is_null() {
             return None;
         }
-        let aligned = raw.add(raw.align_offset(hp));
-        Some((aligned, raw, len))
+        let prefix = raw.align_offset(hp);
+        let aligned = raw.add(prefix);
+        if prefix != 0 {
+            assert_eq!(munmap(raw, prefix), 0);
+        }
+        assert_eq!(munmap(aligned.add(len), hp - prefix), 0);
+        Some((aligned, aligned, len))
     }
 }
 
-pub fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
+fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
     let (a, p, len) = map_aligned(bytes).expect("mmap failed");
     unsafe {
-        if use_thp {
-            madvise(a, len - HUGE_PAGE_BYTES, 14);
+        if use_thp && bytes >= HUGE_PAGE_BYTES {
+            madvise(a, len, 14); // MADV_HUGEPAGE
         }
         if std::env::var("INGEST_POPULATE").is_ok() {
-            madvise(a, len - HUGE_PAGE_BYTES, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
+            madvise(a, len, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
         }
     }
     (a, p, len)
@@ -578,7 +565,6 @@ pub struct Sinks<T: Copy> {
     base: *mut T,
     arena: SinkArena,
     cap: usize,
-    stride: usize,
     swcb: Vec<SwcbLine>,
     pub len: Vec<usize>,
     pub over: Vec<Vec<T>>,
@@ -602,7 +588,7 @@ impl Drop for SinkMapping {
     }
 }
 
-pub(super) struct SinkArena {
+pub(crate) struct SinkArena {
     base: *mut u8,
     bytes: usize,
     mapping: Arc<SinkMapping>,
@@ -611,12 +597,12 @@ pub(super) struct SinkArena {
 unsafe impl Send for SinkArena {}
 
 impl SinkArena {
-    fn new(bytes: usize) -> Self {
+    pub(super) fn new(bytes: usize) -> Self {
         let (base, raw, len) = huge_alloc_ex(bytes, sink_thp());
         Self { base, bytes, mapping: Arc::new(SinkMapping { raw, len }) }
     }
 
-    fn split_at(self, offset: usize) -> (Self, Self) {
+    pub(super) fn split_at(self, offset: usize) -> (Self, Self) {
         assert!(offset <= self.bytes && offset % 64 == 0);
         let rest = Self {
             base: unsafe { self.base.add(offset) },
@@ -624,6 +610,150 @@ impl SinkArena {
             mapping: Arc::clone(&self.mapping),
         };
         (Self { bytes: offset, ..self }, rest)
+    }
+}
+
+/// The unallocated tail of an exclusively borrowed arena. Typed allocations
+/// are disjoint and can outlive the cursor, up to the arena borrow.
+#[derive(Default)]
+pub(super) struct Scratch<'a>(&'a mut [MaybeUninit<u8>]);
+
+impl SinkArena {
+    pub(super) fn scratch(&mut self) -> Scratch<'_> {
+        Scratch(unsafe { std::slice::from_raw_parts_mut(self.base.cast(), self.bytes) })
+    }
+}
+
+impl<'a> Scratch<'a> {
+    pub(super) fn buffer<T>(&mut self, capacity: usize) -> ArenaVec<'a, T> {
+        let align = std::mem::align_of::<T>().max(64);
+        let pad = self.0.as_ptr().align_offset(align);
+        let bytes = capacity.checked_mul(std::mem::size_of::<T>()).unwrap();
+        if bytes == 0 || pad > self.0.len() || bytes > self.0.len() - pad {
+            return ArenaVec::Heap(Vec::with_capacity(capacity));
+        }
+        let (area, rest) = std::mem::take(&mut self.0).split_at_mut(pad + bytes);
+        self.0 = rest;
+        let ptr = area[pad..].as_mut_ptr().cast();
+        let slots = unsafe { std::slice::from_raw_parts_mut(ptr, capacity) };
+        ArenaVec::Borrowed(ArenaBuffer { slots, len: 0 })
+    }
+}
+
+pub(super) struct ArenaBuffer<'a, T> {
+    slots: &'a mut [MaybeUninit<T>],
+    len: usize,
+}
+
+impl<T> Drop for ArenaBuffer<'_, T> {
+    fn drop(&mut self) {
+        let initialized = std::ptr::slice_from_raw_parts_mut(self.slots.as_mut_ptr().cast::<T>(), self.len);
+        unsafe { std::ptr::drop_in_place(initialized) };
+    }
+}
+
+/// A vector using scratch space until it needs more capacity. Growth uses
+/// the heap so skewed partitions do not need fixed arena capacity limits.
+pub(super) enum ArenaVec<'a, T> {
+    Borrowed(ArenaBuffer<'a, T>),
+    Heap(Vec<T>),
+}
+
+impl<T> Default for ArenaVec<'_, T> {
+    fn default() -> Self {
+        Self::Heap(Vec::new())
+    }
+}
+
+impl<T> ArenaVec<'_, T> {
+    #[inline]
+    pub(super) fn as_mut_ptr(&mut self) -> *mut T {
+        match self {
+            Self::Borrowed(a) => a.slots.as_mut_ptr().cast(),
+            Self::Heap(v) => v.as_mut_ptr(),
+        }
+    }
+
+    /// All elements in the new initialized range must be valid `T`s.
+    #[inline]
+    pub(super) unsafe fn set_len(&mut self, len: usize) {
+        match self {
+            Self::Borrowed(a) => {
+                debug_assert!(len <= a.slots.len());
+                a.len = len;
+            }
+            Self::Heap(v) => unsafe { v.set_len(len) },
+        }
+    }
+
+    pub(super) fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Borrowed(a) if additional > a.slots.len() - a.len => {
+                let mut heap = Vec::with_capacity((a.len + additional).max(a.slots.len() * 2));
+                // Transfer initialized values to the heap and retire the
+                // borrowed slots without dropping their previous contents.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(a.slots.as_ptr().cast(), heap.as_mut_ptr(), a.len);
+                    heap.set_len(a.len);
+                }
+                a.len = 0;
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(v) => v.reserve(additional),
+            Self::Borrowed(_) => {}
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        match self {
+            Self::Borrowed(a) => {
+                let initialized = std::ptr::slice_from_raw_parts_mut(a.slots.as_mut_ptr().cast::<T>(), a.len);
+                a.len = 0;
+                unsafe { std::ptr::drop_in_place(initialized) };
+            }
+            Self::Heap(v) => v.clear(),
+        }
+    }
+
+    #[inline]
+    pub(super) fn push(&mut self, value: T) {
+        self.reserve(1);
+        let len = self.len();
+        unsafe {
+            self.as_mut_ptr().add(len).write(value);
+            self.set_len(len + 1);
+        }
+    }
+
+    pub(super) fn resize(&mut self, len: usize, value: T) where T: Copy {
+        let old = self.len();
+        self.reserve(len.saturating_sub(old));
+        for i in old..len {
+            unsafe { self.as_mut_ptr().add(i).write(value) };
+        }
+        unsafe { self.set_len(len) };
+    }
+}
+
+impl<T> std::ops::Deref for ArenaVec<'_, T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Borrowed(a) => unsafe { std::slice::from_raw_parts(a.slots.as_ptr().cast(), a.len) },
+            Self::Heap(v) => v,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for ArenaVec<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Borrowed(a) => unsafe { std::slice::from_raw_parts_mut(a.slots.as_mut_ptr().cast(), a.len) },
+            Self::Heap(v) => v,
+        }
     }
 }
 
@@ -640,21 +770,25 @@ impl<T: Copy> Sinks<T> {
         cap.max(Self::per_line()).next_multiple_of(Self::per_line())
     }
 
-    fn from_arena(parts: usize, cap: usize, stride: usize, arena: SinkArena) -> Self {
+    pub(super) fn in_arena(parts: usize, cap: usize, arena: SinkArena) -> Self {
+        assert_eq!(arena.bytes, Self::arena_bytes(parts, cap));
+        let cap = Self::aligned_cap(cap);
         Sinks {
             base: arena.base.cast(),
             arena,
             cap,
-            stride,
             swcb: vec![SwcbLine([0u8; SWCB_BYTES]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
         }
     }
 
+    pub(super) fn arena_bytes(parts: usize, cap: usize) -> usize {
+        parts * Self::aligned_cap(cap) * std::mem::size_of::<T>()
+    }
+
     pub fn new(parts: usize, cap: usize) -> Self {
-        let cap = Self::aligned_cap(cap);
-        Self::from_arena(parts, cap, cap, SinkArena::new(parts * cap * std::mem::size_of::<T>()))
+        Self::in_arena(parts, cap, SinkArena::new(Self::arena_bytes(parts, cap)))
     }
 
     pub(super) fn into_arena(self) -> SinkArena {
@@ -662,28 +796,19 @@ impl<T: Copy> Sinks<T> {
     }
 
     pub(super) fn reuse_pair<U: Copy>(
-        parts: usize, cap: usize, other_cap: usize, source_parts: usize, arena: Option<SinkArena>,
-    ) -> (Self, Sinks<U>) {
-        let cap = Self::aligned_cap(cap);
-        let other_cap = Sinks::<U>::aligned_cap(other_cap);
-        let bytes = parts * cap * std::mem::size_of::<T>();
-        let other_bytes = parts * other_cap * std::mem::size_of::<U>();
-        if let Some(arena) = arena.filter(|a| bytes + other_bytes <= a.bytes) {
-            let stride = arena.bytes / source_parts;
-            // With two source partitions per destination, start each output
-            // subarena where token writes already populated the old partition.
-            if 2 * parts <= source_parts && bytes.max(other_bytes) <= stride * parts {
-                let (first, second) = arena.split_at(parts * stride);
-                return (
-                    Self::from_arena(parts, cap, stride / std::mem::size_of::<T>(), first),
-                    Sinks::from_arena(parts, other_cap, stride / std::mem::size_of::<U>(), second),
-                );
+        parts: usize, cap: usize, other_cap: usize, arena: Option<SinkArena>,
+    ) -> (Self, Sinks<U>, Option<SinkArena>) {
+        let bytes = Self::arena_bytes(parts, cap);
+        let other_bytes = Sinks::<U>::arena_bytes(parts, other_cap);
+        if let Some(arena) = arena {
+            if bytes + other_bytes <= arena.bytes {
+                let (first, rest) = arena.split_at(bytes);
+                let (second, tail) = rest.split_at(other_bytes);
+                return (Self::in_arena(parts, cap, first), Sinks::in_arena(parts, other_cap, second), Some(tail));
             }
-            let (first, second) = arena.split_at(bytes);
-            (Self::from_arena(parts, cap, cap, first), Sinks::from_arena(parts, other_cap, other_cap, second))
-        } else {
-            (Self::new(parts, cap), Sinks::new(parts, other_cap))
+            return (Self::new(parts, cap), Sinks::new(parts, other_cap), Some(arena));
         }
+        (Self::new(parts, cap), Sinks::new(parts, other_cap), None)
     }
 
     /// Append to partition `p`'s SWCB. When full, stream it to the arena or
@@ -716,7 +841,7 @@ impl<T: Copy> Sinks<T> {
         if nl <= self.cap {
             unsafe {
                 use std::arch::x86_64::*;
-                let dst = self.base.add(p * self.stride + base_idx) as *mut __m256i;
+                let dst = self.base.add(p * self.cap + base_idx) as *mut __m256i;
                 let src = line_ptr as *const __m256i;
                 debug_assert_eq!(dst as usize & 63, 0);
                 debug_assert_eq!(src as usize & 63, 0);
@@ -748,7 +873,7 @@ impl<T: Copy> Sinks<T> {
                 let src = unsafe { std::slice::from_raw_parts(self.swcb.as_ptr().add(p) as *const T, rem) };
                 if l <= self.cap {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.stride + base_idx), rem);
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.cap + base_idx), rem);
                     }
                 } else {
                     self.over[p].extend_from_slice(src);
@@ -760,7 +885,7 @@ impl<T: Copy> Sinks<T> {
 
     #[inline]
     pub fn part(&self, p: usize) -> (&[T], &[T]) {
-        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.stride), self.len[p].min(self.cap)) };
+        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p].min(self.cap)) };
         (a, &self.over[p])
     }
 
