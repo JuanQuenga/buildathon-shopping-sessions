@@ -1,0 +1,4 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e1,y1,2100-02-29T10:00:00Z,2100-02-01T00:00:00Z,view,p1,
+e2,y2,2100-03-01T10:00:00Z,2100-02-01T00:00:00Z,view,p1,
+e3,y3,4107578400000,2100-03-01T11:00:00Z,view,p1,

@@ -1,0 +1,11 @@
+user_id,day,sessions,events,revenue_cents,top_category
+t1,2026-10-03,1,2,1000,unknowa
+t10,2026-10-03,3,3,400,books
+t2,2026-10-03,1,2,1000,unknown
+t3,2026-10-03,1,2,1000,unknown
+t4,2026-10-03,1,1,100,unknown
+t5,2026-10-03,3,3,1300,books
+t6,2026-10-03,1,1,100,shoes
+t6,2026-10-04,1,1,100,books
+t7,2026-10-03,1,2,0,
+t9,2026-10-03,1,2,200,Shoes

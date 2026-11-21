@@ -1,0 +1,4 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e1,n1,2027-02-29T10:00:00Z,2027-02-01T00:00:00Z,view,p1,
+e2,n2,2027-03-01T00:30:00+01:00,2027-02-01T00:00:00Z,view,p1,
+e3,n3,2027-02-28T10:00:00Z,2027-02-01T00:00:00Z,view,p1,
