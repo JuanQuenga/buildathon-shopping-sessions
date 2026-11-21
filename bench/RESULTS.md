@@ -2,6 +2,9 @@
 
 ## Candidate 14a
 
+- Official result: 0.7412 s, receipt BB-4476792C. The run was 60.1 ms slower than 12b2 and 101.2 ms above the prediction.
+- The clean Docker image matched dev and 20M.
+
 - Prediction before submission: 0.64 s official. The preserved cache-fast work in progress beat 12b2 by 53–72 ms in two interleaved native sessions. The Docker runtime and higher hardware branch-miss count add uncertainty.
 - Warm 20M native, eight pinned hardware threads. Seven-round medians were 0.706 s (12b2), 0.733 s (13c), and 0.653 s (14a). Five-round medians were 0.740 s, 0.753 s, and 0.668 s.
 - Cachegrind on dev reported 2,843,324 misses with a simulated 6 MiB last-level cache for 12b2 and 2,695,211 for 14a. With a separate 1 MiB last-level simulation, misses were 5,444,444 and 4,153,848. Cachegrind simulates L1 and one last-level cache per run.
