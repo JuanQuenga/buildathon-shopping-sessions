@@ -1,5 +1,6 @@
 mod aggregate;
 mod ingest;
+mod probe;
 mod types;
 
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ fn main() {
         ingest::fast::bench_rows(std::path::Path::new(&p), &data_dir);
         return;
     }
-    ingest::run_pipeline(&data_dir, &output_dir, threads);
+    probe::run(&data_dir, &output_dir, threads).expect("write probe output");
     let hwm = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string()))
