@@ -72,6 +72,12 @@ pub fn run(loaded: Loaded, output_dir: &Path, threads: usize) {
     let t = Instant::now();
     output::write(&tables, &loaded, output_dir, threads).expect("writing output");
     eprintln!("[stage] write {:.3}s", t.elapsed().as_secs_f64());
+    if let Ok(st) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(kb) = st.lines().find_map(|l| l.strip_prefix("VmHWM:")) {
+            let kb: u64 = kb.trim().trim_end_matches("kB").trim().parse().unwrap_or(0);
+            eprintln!("[stage] peak_rss_mb={}", kb / 1024);
+        }
+    }
 }
 
 #[inline]
