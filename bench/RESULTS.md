@@ -2,12 +2,18 @@
 
 ## Please submit
 
-- **Tag**: `candidate-9` (commit `bcf953c` on branch `exp/h3-arenas-exit`) — **ready for immediate official submission in the open slot NOW (H3: 1-variable arena prefault + `MADV_HUGEPAGE` + immediate `_exit(0)` on `candidate-5` base)**.
-  - **What it tests (H3)**: clean 1-variable A/B on `candidate-5` base (`3bccd6e`, `0.8826 s` official):
-    1. Requests `MADV_HUGEPAGE` unconditionally on `Sinks` and pre-touches every 2 MiB stride in parallel inside worker `init` (eliminating lazy faulting during `parse` and removing serial `probe_sink_thp()`).
-    2. Calls raw `SYS_exit_group(0)` (`_exit(0)`) immediately after `write_campaign_raw` writes the last output byte, skipping `par::drop_par(b_sinks + ck_sinks)`, `drop(workers)` (12.1 ms serial!), `drop(dead)`, `drop(ctx)`, and `/proc/self/status` (still frees `tok_sinks` when `ne_raw > 30M` to keep 60M peak RSS low).
-  - **Verification**: warning-free release tests passed, native `dev` + `seed20-20m` exact `MATCH`, Docker `ss-test:h3` exact `MATCH` on `dev`, `E1`, and `seed60-60m` (16.243 s wall, 3.51 GiB peak RSS under 8 GiB cap).
-- **Also ready on branch `exp/h4-scratch` (`7c757c6`)**: H4 static musl binary on `FROM scratch` (single layer, ~2.1 MB, 36/36 Docker fixtures passed) — queued as optional next A/B depending on H3 and the CPU-seconds proxy table.
+- **Tag**: `candidate-10` (HEAD on `main`, code `9de36c7`) — **ready for official submission NOW** (builds on best official `candidate-8` `0.8752 s`, cutting total 8T CPU-seconds by **−5.11% vs c8 / −13.8% vs c3** and `sys` CPU by **−51% vs c3**!).
+  - **What it tests**:
+    1. **Zero-copy 1 MiB `mmap` CSV chunks with worker-side parallel `munmap`** (each file unmapped immediately on the worker finishing its last chunk → saves **−71 ms `sys` CPU** vs 1 MiB `pread`, keeps outside-`main` teardown **5.5 ms**, avoids 1.87 GB kernel→user `pread` copy).
+    2. **Tighter sink arena over-provisioning** (−98 ms total CPU on `mmap` + cleanup).
+    3. **Parallel cleanup of aggregation worker state & `Links::build` temporaries** (audited serial `F` reduced **13.10 → 9.96 ms**, serial group finish **3.24 → 0.24 ms**).
+    4. Retains `candidate-8`'s 4.46× compact Parquet output (**21.64 MB** at 20M) and full parallel generic safety.
+  - **Local 8-vCPU (`0-3,8-11`) Docker warm comparison (`seed20-20m`, median of 3)**:
+    - `c3` (`4f01a6e`, `0.8824 s` official): `3.200 user + 1.249 sys = 4.449 CPU-s` (`165.0 ns/row`, `F 18.8 ms`)
+    - `c8` (`5d0f934`, `0.8752 s` official): `3.334 user + 0.747 sys = 4.044 CPU-s` (`150.0 ns/row`, `F 10.1 ms`)
+    - **`c10` (`9de36c7`)**: **`3.248 user + 0.615 sys = 3.837 CPU-s`** (**`142.3 ns/row`**, **`F 9.4 ms`**, **−13.8% total CPU vs c3, −5.1% vs c8**)
+  - **Verification**: 28/28 unit tests (0 warnings), full native `check_all.sh` (36 official, 32 adversarial, dev, 8× 1M seeds, 20M `oracle2`), forced `INGEST_GENERIC=1`, Polars/PyArrow/DuckDB, Docker 36/36 + dev, Docker `seed60-60m` exact `MATCH` (**7.802 s**, 3.51 GiB RSS), Docker `seed60-longids` exact `MATCH` (**9.772 s**, 5.67 GiB RSS).
+- **Note**: `candidate-9` (H3: `bcf953c`, prefault + unconditional `MADV_HUGEPAGE` + `_exit(0)`) is still pending its official score; `exp/h4-scratch` (`7c757c6`, 2.1 MB static musl `FROM scratch`) is also ready if we want to test H4 in the next slot.
 
 ## Official scores
 
