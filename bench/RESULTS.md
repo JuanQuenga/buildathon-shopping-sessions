@@ -1,6 +1,14 @@
 # Benchmark results
 
-## Please submit
+## Candidate 14b
+
+- Prediction before submission: 0.74 s official. The native median gained 30 ms against 12b2, yet the higher parse CPU and the earlier 14a and 13c scores point to a smaller gain on Cascade Lake.
+- The compact parser prefetches an immutable alias table lookup after reading the user ID and writes events and clicks directly to canonical person partitions. The table keeps one bit per candidate slot and verifies full IDs before resolving a match. Relocation is gone.
+- The 512 person partitions reduce grouping scratch. The union-find packs endpoints using shard-local key suffixes, keeping standard 60M on the compact path with 2,638,654 accepted edges. The larger-category, long-window, and wide-key variants use the existing fallback.
+- Five interleaved pinned 20M medians were 0.644 s for 12b2, 0.587 s for 13c, and 0.614 s for 14b. The 14b run peaked near 514 MiB RSS. The 6 MiB Cachegrind pass on dev reported 2,555,060 misses versus 2,843,324 for 12b2. The separate 1 MiB simulation went from 5,444,444 to 6,047,079.
+- Native verification passed 61 release unit tests, 36 official fixtures, 32 adversarial cases, dev, six 1M seeds, 20M, all four 60M variants, and forced generic dev.
+
+## Candidate 13c
 
 - **Tag**: `candidate-13c` (HEAD on `main`, glibc bookworm) — **Prototype C VMA-uncontended pread + LocalAlloc slabs + L2-hot 4-wide AVX2 RelocMap + dynamic group+agg + fast `eid` & `links` direct parsers** (beats `candidate-12b2` on same-session interleaved local wall by **−71 ms** at **2.2× lower RSS** and **2.3× fewer faults**!).
   - **Root cause fixed vs `candidate-13b` (`38e9a39`, official `0.8135 s`)**:
@@ -21,6 +29,8 @@
 | `candidate-12b2` | `79d1dce` | **0.6811 s** | **CURRENT BEST** | Accepted exact output; 1-var `MADV_POPULATE_WRITE` on 12b (−8.5 ms vs 12b; local 4k wall 0.780 s) |
 | `candidate-12b` | `3889b4c` (`4ec2aa3`) | **0.6896 s** | 24 | Accepted exact output; 1-var unified arena reuse + `mallopt` (−30.9 ms vs 12a) |
 | `candidate-12a` | `bf812eb` (`c34c244`) | **0.7205 s** | 26 | Accepted exact output; −99.0 ms vs 11b from 1-var `group+agg` rework |
+| `candidate-14a` | `d0c11dc` | 0.7412 s | — | Accepted with receipt BB-4476792C. Predicted 0.64 s. |
+| `candidate-13c` | `399f833` | 0.7492 s | — | Accepted exact output |
 | `candidate-13b` | `38e9a39` | **0.8135 s** | — | Accepted exact output; Prototype C CPU/L2 overhaul (512 MiB RSS, local 4k wall 1.012 s; confirmed `official ≈ 0.19 + 0.63 × local_wall`) |
 | `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | — | Accepted exact output; direct specialized row parsers + co-partitioned L2 Links + `tok→reloc` reuse |
 | `candidate-11a` | `f6d8110` | **0.8678 s** | — | Accepted exact output; co-partitioned L2 Links + quote-bit SIMD scan + BMI2 PEXT keys |

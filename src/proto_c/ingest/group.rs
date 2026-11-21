@@ -425,8 +425,6 @@ pub fn run(
     ctx: &ParseRows,
     input: &[Rows<'_>],
     dead: &Dead<'_>,
-    dead_clicks: Option<&Dead<'_>>,
-    relocated: &[Rows<'_>],
     region: &Region<'_>,
     output_dir: &Path,
     ne_raw: usize,
@@ -442,17 +440,9 @@ pub fn run(
             .iter()
             .enumerate()
             .map(|(tid, w)| w.events[q].len() - dead.count(tid, q))
-            .sum::<usize>()
-            + relocated.iter().map(|w| w.events[q].len()).sum::<usize>();
+            .sum::<usize>();
         if *count > 0 {
-            click_cnt_part[q] = input
-                .iter()
-                .enumerate()
-                .map(|(tid, w)| {
-                    w.clicks[q].len() - dead_clicks.map_or(0, |dc| dc.count(tid, q))
-                })
-                .sum::<usize>()
-                + relocated.iter().map(|w| w.clicks[q].len()).sum::<usize>();
+            click_cnt_part[q] = input.iter().map(|w| w.clicks[q].len()).sum();
         }
     }
     let ne = ev_cnt_part.iter().sum::<usize>();
@@ -543,9 +533,6 @@ pub fn run(
             for (tid, rows) in input.iter().enumerate() {
                 dead.for_live(rows, tid, q, &mut visit);
             }
-            for rows in relocated {
-                rows.for_events(q, &mut visit);
-            }
             debug_assert_eq!(live, n);
             unsafe {
                 w.pid.set_len(live);
@@ -588,18 +575,7 @@ pub fn run(
                     w.ck_cnt[id as usize] += 1;
                 }
             };
-            if let Some(dc) = dead_clicks {
-                for (tid, rows) in input.iter().enumerate() {
-                    dc.for_live_clicks(rows, tid, q, &mut visit_ck);
-                }
-            } else {
-                for rows in input {
-                    for &r in rows.clicks[q].rows() {
-                        visit_ck(r);
-                    }
-                }
-            }
-            for rows in relocated {
+            for rows in input {
                 for &r in rows.clicks[q].rows() {
                     visit_ck(r);
                 }

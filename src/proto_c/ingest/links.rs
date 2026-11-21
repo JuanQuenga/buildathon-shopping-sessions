@@ -1,113 +1,92 @@
 use super::{direct, par, read, Chunks, ReadBuffers, Result, PARTITIONS};
 use crate::proto_c::arena::{Bucket, LocalAlloc, Region};
-use crate::proto_c::packed::{self, hash, ID_BITS, ID_MASK, LOW_HASH_BITS, PERSON_BITS, PERSON_MASK};
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use crate::proto_c::packed::{hash, unpermute, ID_BITS, LOW_HASH_BITS, PERSON_BITS, PERSON_MASK, PERSON_PART_BITS};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-const INDEX_LIMIT: usize = 1 << (64 - ID_BITS);
+const INDEX_LIMIT: usize = 1 << (64 - PERSON_BITS);
 
 #[inline(always)]
 pub fn partition(h: u64) -> usize {
-    (h >> 56) as usize
+    (h >> (64 - PERSON_PART_BITS)) as usize
 }
 
-#[derive(Clone, Copy)]
-struct Shard {
-    start: usize,
-    len: usize,
-}
-
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(64))]
-pub struct RelocBucket {
-    keys: [u64; 4],
-    canon: [u64; 4],
-}
-
-/// L2-hot per-worker 4-wide AVX2 hash map built once per raw shard `q`.
-/// Keys store `perm35 + 1` so `0` unambiguously marks an empty lane with no mask.
-#[derive(Default)]
-pub struct RelocMap {
-    buckets: Vec<RelocBucket>,
-    mask: usize,
-}
-
-impl RelocMap {
-    pub fn reset(&mut self, pairs: &[(u64, u64)]) {
-        let cap = pairs.len().div_ceil(2).next_power_of_two().max(1);
-        if self.buckets.len() < cap {
-            self.buckets.resize(cap, RelocBucket::default());
-        }
-        let buckets = &mut self.buckets[..cap];
-        buckets.fill(RelocBucket::default());
-        let mask = cap - 1;
-        self.mask = mask;
-        for &(perm35, canon43) in pairs {
-            let k = perm35 + 1;
-            let mut slot = perm35 as usize & mask;
-            'ins: loop {
-                let b = unsafe { buckets.get_unchecked_mut(slot) };
-                for lane in 0..4 {
-                    if b.keys[lane] == 0 {
-                        b.keys[lane] = k;
-                        b.canon[lane] = canon43;
-                        break 'ins;
-                    }
-                }
-                slot = (slot + 1) & mask;
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn prefetch(&self, perm35: u64) -> usize {
-        let slot = perm35 as usize & self.mask;
-        unsafe {
-            _mm_prefetch::<_MM_HINT_T0>(self.buckets.as_ptr().add(slot).cast());
-        }
-        slot
-    }
-
-    #[inline(always)]
-    pub fn resolve_slot(&self, perm35: u64, mut slot: usize) -> Option<(usize, u64)> {
-        use std::arch::x86_64::*;
-        let needle = unsafe { _mm256_set1_epi64x((perm35 + 1) as i64) };
-        let zero = unsafe { _mm256_setzero_si256() };
-        let mask = self.mask;
-        unsafe {
-            loop {
-                let b = self.buckets.get_unchecked(slot);
-                let keys = _mm256_load_si256(b.keys.as_ptr().cast());
-                let hits = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
-                    as u32;
-                if hits != 0 {
-                    let c = *b.canon.get_unchecked(hits.trailing_zeros() as usize);
-                    return Some(((c >> PERSON_BITS) as usize, c & PERSON_MASK));
-                }
-                if _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, zero))) != 0 {
-                    return None;
-                }
-                slot = (slot + 1) & mask;
-            }
-        }
-    }
-}
+// The top 23 permuted bits select a slot. Its remaining 20 bits and the
+// canonical 43-bit person fit in one word, with one flag for slot collisions.
+const SLOT_BITS: u32 = 23;
+const TAG_BITS: u32 = ID_BITS - SLOT_BITS;
+const TAG_MASK: u64 = (1 << TAG_BITS) - 1;
+const MORE: u64 = 1 << 63;
+const WORDS_PER_PART: usize = (1 << SLOT_BITS) / 64 / PARTITIONS;
 
 pub struct Links<'a> {
-    pairs: &'a [(u64, u64)],
-    by_raw: [Shard; PARTITIONS],
+    present: &'a [u64],
+    offsets: &'a [u32],
+    entries: &'a [u64],
 }
 
-impl<'a> Links<'a> {
+pub struct Probe {
+    pub raw: u64,
+    hash: u64,
+    index: u32,
+}
+
+impl Links<'_> {
     #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
+    pub fn prepare(&self, raw: u64) -> Probe {
+        self.prepare_hash(raw, hash(raw))
     }
 
     #[inline(always)]
-    pub fn shard(&self, q: usize) -> &[(u64, u64)] {
-        let s = unsafe { *self.by_raw.get_unchecked(q) };
-        unsafe { self.pairs.get_unchecked(s.start..s.start + s.len) }
+    fn prepare_hash(&self, raw: u64, hash: u64) -> Probe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
+        let mut index = u32::MAX;
+        if !self.present.is_empty() {
+            let slot = (hash >> (64 - SLOT_BITS)) as usize;
+            let word = slot >> 6;
+            let bit = 1u64 << (slot & 63);
+            let present = unsafe { *self.present.get_unchecked(word) };
+            if present & bit != 0 {
+                let offset = unsafe { *self.offsets.get_unchecked(word) };
+                index = offset + (present & (bit - 1)).count_ones();
+                unsafe {
+                    _mm_prefetch::<_MM_HINT_T0>(self.entries.as_ptr().add(index as usize).cast());
+                }
+            }
+        }
+        Probe { raw, hash, index }
+    }
+
+    #[inline(always)]
+    pub fn resolve(&self, probe: &Probe) -> u64 {
+        if probe.index == u32::MAX {
+            return probe.hash;
+        }
+        let tag = (probe.hash >> LOW_HASH_BITS) & TAG_MASK;
+        let entry = unsafe { *self.entries.get_unchecked(probe.index as usize) };
+        if entry & TAG_MASK == tag {
+            return (entry >> TAG_BITS) << LOW_HASH_BITS;
+        }
+        if entry & MORE != 0 {
+            let word = (probe.hash >> (64 - SLOT_BITS + 6)) as usize;
+            return self.resolve_collision(probe.hash, word, tag);
+        }
+        probe.hash
+    }
+
+    #[cold]
+    fn resolve_collision(&self, hash: u64, word: usize, tag: u64) -> u64 {
+        let slot = (hash >> (64 - SLOT_BITS)) as usize & 63;
+        let lo = self.offsets[word] as usize + self.present[word].count_ones() as usize;
+        let hi = self.offsets[word + 1] as usize;
+        // Collisions have the same 20-bit tag space as the first entries.
+        // A separate slot number disambiguates collisions in the same word.
+        for entry in self.entries[lo..hi].chunks_exact(2) {
+            if entry[0] == slot as u64 && entry[1] & TAG_MASK == tag {
+                return (entry[1] >> TAG_BITS) << LOW_HASH_BITS;
+            }
+        }
+        hash
     }
 }
 
@@ -188,17 +167,15 @@ pub fn build<'a>(
     let edges = pairs.iter().map(|p| p.len()).sum::<usize>();
     if edges == 0 {
         timer.lap("links-uf");
-        return Ok(Links {
-            pairs: &[],
-            by_raw: [Shard { start: 0, len: 0 }; PARTITIONS],
-        });
+        return Ok(Links { present: &[], offsets: &[], entries: &[] });
     }
-    if 2 * edges > INDEX_LIMIT {
-        return Err("link endpoints exceed the 21-bit union-find limit");
+    if 2 * edges >= INDEX_LIMIT {
+        return Err("link endpoints exceed the union-find index limit");
     }
 
-    // Pack each endpoint into an eight-byte (key, original edge endpoint) word.
-    // Each parse worker scatters its endpoints by key hash for parallel interning.
+    // The shard carries the high bits of the reversible hash. The remaining
+    // bits and the edge position fit in one word, including on 60M datasets.
+    // Each parse worker scatters its endpoints for parallel interning.
     let mut edge_base = Vec::with_capacity(pairs.len());
     let mut prefix = 0;
     for p in &pairs {
@@ -215,10 +192,12 @@ pub fn build<'a>(
                 std::array::from_fn(|_| Bucket::default());
             for (i, &pair) in pairs.rows().enumerate() {
                 for (side, key) in pair.into_iter().enumerate() {
-                    let p = partition(hash(key));
+                    let h = hash(key);
+                    let p = partition(h);
+                    let suffix = (h >> LOW_HASH_BITS) & PERSON_MASK;
                     let pos = 2 * (edge_base[tid] + i) + side;
                     if buckets[p]
-                        .push_local(alloc, key | ((pos as u64) << ID_BITS))
+                        .push_local(alloc, suffix | ((pos as u64) << PERSON_BITS))
                         .is_none()
                     {
                         out.push(Err("link endpoint arena exhausted"));
@@ -259,18 +238,19 @@ pub fn build<'a>(
             table.fill(0);
             let mut count = 0;
             for encoded in endpoints.iter().flat_map(|b| b[p].rows()) {
-                let key = encoded & ID_MASK;
-                let mut slot = (hash(key) >> LOW_HASH_BITS) as usize & (cap - 1);
+                let suffix = encoded & PERSON_MASK;
+                let mut slot = suffix as usize & (cap - 1);
                 loop {
                     let v = table[slot];
                     if v == 0 {
-                        table[slot] = key | ((count as u64) << ID_BITS);
+                        table[slot] = suffix | (((count + 1) as u64) << PERSON_BITS);
                         // Each shard writes to its own key range.
+                        let key = unpermute(((p as u64) << PERSON_BITS) | suffix);
                         unsafe { key_write.write(base + count, key) };
                         count += 1;
                         break;
                     }
-                    if v & ID_MASK == key {
+                    if v & PERSON_MASK == suffix {
                         break;
                     }
                     slot = (slot + 1) & (cap - 1);
@@ -278,8 +258,8 @@ pub fn build<'a>(
                 // Each original endpoint occurs exactly once.
                 unsafe {
                     ep_write.write(
-                        (encoded >> ID_BITS) as usize,
-                        (base + (table[slot] >> ID_BITS) as usize) as u32,
+                        (encoded >> PERSON_BITS) as usize,
+                        (base + (table[slot] >> PERSON_BITS) as usize - 1) as u32,
                     );
                 }
             }
@@ -310,76 +290,96 @@ pub fn build<'a>(
         },
     );
 
-    let root_counts = par::run(
+    let parts = par::run(
         threads,
         PARTITIONS,
         |_| Vec::new(),
-        |out, p| {
+        |parts, p| {
+            let mut by_slot = Vec::with_capacity(counts_by_part[p]);
             let start = offsets[p];
             let end = start + counts_by_part[p];
-            let mut roots = 0;
             for i in start..end {
-                let root = find(parent, i as u32);
-                parent[i].store(root, Relaxed);
-                roots += usize::from(root as usize == i);
+                let root = find(parent, i as u32) as usize;
+                if root == i {
+                    continue;
+                }
+                let alias = hash(keys[i]) >> LOW_HASH_BITS;
+                let canonical = hash(keys[root]) >> LOW_HASH_BITS;
+                by_slot.push((alias, canonical));
             }
-            out.push((p, roots, end - start - roots));
+            by_slot.sort_unstable_by_key(|&(alias, _)| alias);
+            let mut present = vec![0u64; WORDS_PER_PART];
+            let mut offsets = vec![0u32; WORDS_PER_PART];
+            let mut entries = Vec::with_capacity(by_slot.len());
+            let mut pos = 0;
+            let mut collided = Vec::new();
+            for (word, (present, offset)) in present.iter_mut().zip(&mut offsets).enumerate() {
+                *offset = entries.len() as u32;
+                collided.clear();
+                while let Some(&(alias, canonical)) = by_slot.get(pos) {
+                    let within = (alias >> TAG_BITS) as usize & (64 * WORDS_PER_PART - 1);
+                    if within >> 6 != word {
+                        break;
+                    }
+                    let slot = within & 63;
+                    let bit = 1u64 << slot;
+                    let entry = (canonical << TAG_BITS) | (alias & TAG_MASK);
+                    if *present & bit == 0 {
+                        *present |= bit;
+                        entries.push(entry);
+                    } else {
+                        *entries.last_mut().unwrap() |= MORE;
+                        collided.extend_from_slice(&[slot as u64, entry]);
+                    }
+                    pos += 1;
+                }
+                entries.extend_from_slice(&collided);
+            }
+            parts.push((p, present, offsets, entries, by_slot.len()));
         },
     );
-    let mut by_raw = [Shard { start: 0, len: 0 }; PARTITIONS];
-    let mut mapped_count = 0;
-    for (p, _roots, mapped) in root_counts.into_iter().flatten() {
-        by_raw[p].len = mapped;
-        mapped_count += mapped;
-    }
+    let mut parts: Vec<_> = parts.into_iter().flatten().collect();
+    parts.sort_unstable_by_key(|part| part.0);
 
-    let mut pairs_len = 0;
+    let words = WORDS_PER_PART * PARTITIONS;
+    let entry_len = parts.iter().map(|part| part.3.len()).sum::<usize>();
+    let present = persistent.slice(words, 0u64).ok_or("link bitmap arena exhausted")?;
+    let offsets = persistent.slice(words + 1, 0u32).ok_or("link prefix arena exhausted")?;
+    let entries = persistent.slice(entry_len, 0u64).ok_or("link entry arena exhausted")?;
+    let present_write = par::SyncPtr(present.as_mut_ptr());
+    let offsets_write = par::SyncPtr(offsets.as_mut_ptr());
+    let entries_write = par::SyncPtr(entries.as_mut_ptr());
+    let mut entry_offsets = [0; PARTITIONS + 1];
     for p in 0..PARTITIONS {
-        by_raw[p].start = pairs_len;
-        pairs_len += by_raw[p].len;
+        entry_offsets[p + 1] = entry_offsets[p] + parts[p].3.len();
     }
-
-    let out_pairs = persistent
-        .uninit::<(u64, u64)>(pairs_len)
-        .ok_or("compact link pairs arena exhausted")?;
-    let pairs_write = par::SyncPtr(out_pairs.as_mut_ptr().cast::<(u64, u64)>());
+    offsets[words] = entry_len as u32;
     par::run(
         threads,
         PARTITIONS,
         |_| (),
         |_, p| {
-            let shard = by_raw[p];
-            if shard.len == 0 {
-                return;
-            }
-            let start = offsets[p];
-            let end = start + counts_by_part[p];
-            let dst = unsafe { pairs_write.slice(shard.start, shard.len) };
-            let mut w = 0usize;
-            for i in start..end {
-                let root = parent[i].load(Relaxed) as usize;
-                if root == i {
-                    continue;
+            let (_, bits, prefix, records, _) = &parts[p];
+            let start = p * WORDS_PER_PART;
+            let base = entry_offsets[p];
+            // Each task fills the bitmap, prefix and entries for its own shard.
+            unsafe {
+                present_write.slice(start, WORDS_PER_PART).copy_from_slice(bits);
+                for (i, &offset) in prefix.iter().enumerate() {
+                    offsets_write.write(start + i, base as u32 + offset);
                 }
-                let perm35 = packed::record_person(keys[i], hash(keys[i]));
-                let canon43 = hash(keys[root]) >> LOW_HASH_BITS;
-                dst[w] = (perm35, canon43);
-                w += 1;
+                entries_write.slice(base, records.len()).copy_from_slice(records);
             }
-            debug_assert_eq!(w, shard.len);
         },
     );
-    let out_pairs = unsafe { std::slice::from_raw_parts(out_pairs.as_ptr().cast::<(u64, u64)>(), pairs_len) };
-
     eprintln!(
-        "[links] edges={edges} linked_ids={} mapped={mapped_count} pair_bytes={}",
-        counts_by_part.iter().sum::<usize>(), out_pairs.len() * 16
+        "[links] edges={edges} linked_ids={} mapped={} table_bytes={}",
+        counts_by_part.iter().sum::<usize>(),
+        parts.iter().map(|part| part.4).sum::<usize>(),
+        present.len() * 8 + offsets.len() * 4 + entries.len() * 8,
     );
     timer.lap("links-uf");
-    Ok(Links {
-        pairs: out_pairs,
-        by_raw,
-    })
+    Ok(Links { present, offsets, entries })
 }
 
 #[cfg(test)]
@@ -387,32 +387,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_links_and_reloc_map() {
-        let a = packed::encode(b"U1", b'u').unwrap();
-        let b = packed::encode(b"u1", b'u').unwrap();
-        let c = packed::encode(b"u00", b'u').unwrap();
-        let d = packed::encode(b"u1a", b'u').unwrap();
-        let parent = std::array::from_fn::<_, 3, _>(|i| AtomicU32::new(i as u32));
-        let keys = [b, c, a];
-        union(&parent, &keys, 0, 1);
-        union(&parent, &keys, 2, 1);
-        assert_eq!(find(&parent, 0), 2);
-        assert_eq!(find(&parent, 1), 2);
-
-        let hb = hash(b);
-        let ha = hash(a);
-        let hd = hash(d);
-        let pb = packed::record_person(b, hb);
-        let ca = ha >> LOW_HASH_BITS;
-        let mut map = RelocMap::default();
-        map.reset(&[(pb, ca)]);
-        let s1 = map.prefetch(pb);
-        assert_eq!(
-            map.resolve_slot(pb, s1),
-            Some(((ca >> PERSON_BITS) as usize, ca & PERSON_MASK))
-        );
-        let pd = packed::record_person(d, hd);
-        let s2 = map.prefetch(pd);
-        assert_eq!(map.resolve_slot(pd, s2), None);
+    fn verifies_full_alias_and_retains_unlinked_ids() {
+        let slot = 5u64;
+        let home = slot << (64 - SLOT_BITS);
+        let alias = |tag: u64| home | (tag << LOW_HASH_BITS);
+        let links = Links {
+            present: &[1 << 5, 0],
+            offsets: &[0, 3, 3],
+            entries: &[MORE | (17 << TAG_BITS) | 8, slot, (23 << TAG_BITS) | 9],
+        };
+        assert_eq!(links.resolve(&links.prepare_hash(0, alias(8))), 17 << LOW_HASH_BITS);
+        assert_eq!(links.resolve(&links.prepare_hash(0, alias(9))), 23 << LOW_HASH_BITS);
+        assert_eq!(links.resolve(&links.prepare_hash(0, alias(10))), alias(10));
+        assert_eq!(links.resolve(&links.prepare_hash(0, 0)), 0);
     }
 }

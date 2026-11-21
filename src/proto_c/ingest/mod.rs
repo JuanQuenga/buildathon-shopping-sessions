@@ -18,8 +18,8 @@ use crate::proto_c::{arena::Arena, packed};
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, &'static str>;
-const PARTITIONS: usize = 256;
-const MAX_THREADS: usize = 8;
+const PARTITIONS: usize = 1 << packed::PERSON_PART_BITS;
+const MAX_THREADS: usize = 32;
 const CHUNK: usize = 256 << 10;
 const WEEK: i64 = 7 * ts::DAY_MS;
 
@@ -164,7 +164,7 @@ fn prescan_compatible(files: &[FileInfo]) -> Result<()> {
     Ok(())
 }
 
-pub fn run(data_dir: &Path, out: &Path, threads: usize, inline: bool) -> Result<Arena> {
+pub fn run(data_dir: &Path, out: &Path, threads: usize) -> Result<Arena> {
     let threads = threads.clamp(1, MAX_THREADS);
     let mut timer = Timer::new("stage");
     let (ws, we) = small::read_manifest(data_dir);
@@ -277,9 +277,8 @@ pub fn run(data_dir: &Path, out: &Path, threads: usize, inline: bool) -> Result<
         );
         timer.lap("populate");
     }
-    let _ = inline;
     let rows::Parsed { live, tokens } =
-        rows::parse(&ctx, &chunks, &buffers, &records, &phase, threads)?;
+        rows::parse(&ctx, &chunks, &buffers, &links, &records, &phase, threads)?;
     if populate == "cursor" {
         let tokens = phase.stop_cursor_population();
         let rows = records.stop_cursor_population();
@@ -302,23 +301,14 @@ pub fn run(data_dir: &Path, out: &Path, threads: usize, inline: bool) -> Result<
     timer.lap("dedup");
     phase.rewind();
 
-    let (relocated, dead_clicks) = if links.is_empty() {
-        (Vec::new(), None)
-    } else {
-        let (rows, dc) = rows::relocate(&live, &dead, &links, &phase, &persistent, threads)?;
-        timer.lap("relocate");
-        (rows, Some(dc))
-    };
     eprintln!(
-        "[arena] links_scratch_bytes={link_scratch} token_bytes={token_bytes} token_and_dedup_bytes={token_and_dedup_bytes} token_loc_overflows={loc_overflows} records_bytes={} persistent_bytes={} relocated_bytes={}",
-        records.used(), persistent.used(), phase.used()
+        "[arena] links_scratch_bytes={link_scratch} token_bytes={token_bytes} token_and_dedup_bytes={token_and_dedup_bytes} token_loc_overflows={loc_overflows} records_bytes={} persistent_bytes={}",
+        records.used(), persistent.used()
     );
     group::run(
         &ctx,
         &live,
         &dead,
-        dead_clicks.as_ref(),
-        &relocated,
         &phase,
         out,
         ne_raw,

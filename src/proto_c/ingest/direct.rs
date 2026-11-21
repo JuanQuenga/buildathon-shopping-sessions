@@ -171,8 +171,10 @@ impl Tail {
 }
 
 pub(super) trait EventOutput {
-    fn valid(&mut self, eid: u64, ingest: u32, user: u64, ts: u32, cc: u32);
-    fn valid_sec(&mut self, eid: u64, ingest: u32, user: u64, sec: u32, cc: u32);
+    type Person;
+    fn prepare(&self, user: u64) -> Self::Person;
+    fn valid(&mut self, eid: u64, ingest: u32, user: Self::Person, ts: u32, cc: u32);
+    fn valid_sec(&mut self, eid: u64, ingest: u32, user: Self::Person, sec: u32, cc: u32);
     fn invalid(&mut self, eid: u64, ingest: u32);
     fn unsupported(&mut self, limit: &'static str);
 }
@@ -183,6 +185,7 @@ pub(super) trait EventOutput {
 unsafe fn event(rows: &ParseRows, p: *const u8, emit: &mut impl EventOutput) -> Option<*const u8> {
     let (eid, p) = id_eid(p)?;
     let (user, p) = id(p, b'u')?;
+    let user = emit.prepare(user);
     let (p, delim, q) = open(p);
     let len = if *p.add(19) == b'Z' && ends(p, 20, delim, q) {
         20
@@ -348,7 +351,7 @@ fn parse_event(
             if let Some(cc) = cc {
                 let usr =
                     packed::encode(usr, b'u').ok_or("event user ID exceeds the 43-bit alphabet")?;
-                emit.valid(eid, ingest, usr, (t - rows.ws) as u32, cc);
+                emit.valid(eid, ingest, emit.prepare(usr), (t - rows.ws) as u32, cc);
                 return Ok(());
             }
         }

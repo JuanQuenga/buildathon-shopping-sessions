@@ -8,11 +8,7 @@ pub mod packed;
 use std::path::Path;
 
 pub fn run_to_output(data_dir: &Path, out: &Path, threads: usize) -> Result<arena::Arena, &'static str> {
-    let inline = matches!(
-        std::env::var("PROTO_C_LINKS").as_deref(),
-        Ok("inline")
-    );
-    ingest::run(data_dir, out, threads, inline)
+    ingest::run(data_dir, out, threads)
 }
 
 #[cfg(test)]

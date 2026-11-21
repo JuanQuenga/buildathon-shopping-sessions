@@ -25,7 +25,8 @@ const _: () = assert!(UPPER_EXTENT + SUB36[8] - 1 <= ID_MASK);
 const H1: u64 = 0xd6e8_feb8_6659_fd93;
 const H2: u64 = 0xa5a3_564e_27f8_862d;
 pub const LOW_HASH_BITS: u32 = 64 - ID_BITS;
-pub const PERSON_BITS: u32 = ID_BITS - 8;
+pub const PERSON_PART_BITS: u32 = 9;
+pub const PERSON_BITS: u32 = ID_BITS - PERSON_PART_BITS;
 pub const PERSON_MASK: u64 = (1 << PERSON_BITS) - 1;
 #[cfg(any(test, feature = "narrow"))]
 const TOKEN_BITS: u32 = ID_BITS - 9;
@@ -62,14 +63,18 @@ const fn inverse_odd(x: u64) -> u64 {
 #[inline]
 pub fn restore_person(q: usize, person: u64) -> u64 {
     if cfg!(feature = "narrow") {
-        let z = ((q as u64 & 255) << PERSON_BITS) | person;
-        let y = z ^ (z >> 22);
-        let x = y.wrapping_mul(inverse_odd(H2)) & ID_MASK;
-        let original = x ^ (x >> 21) ^ (x >> 42);
-        original.wrapping_mul(inverse_odd(H1)) & ID_MASK
+        unpermute((q as u64) << PERSON_BITS | person)
     } else {
         person
     }
+}
+
+#[inline(always)]
+pub fn unpermute(z: u64) -> u64 {
+    let y = z ^ (z >> 22);
+    let x = y.wrapping_mul(inverse_odd(H2)) & ID_MASK;
+    let original = x ^ (x >> 21) ^ (x >> 42);
+    original.wrapping_mul(inverse_odd(H1)) & ID_MASK
 }
 
 // Dense ranks preserve the order of the padded base-37 encoding while
@@ -578,7 +583,7 @@ impl Tok10 {
         let location = if idx >= (NARROW_ROW_MASK as usize - 1) {
             (1u32 << 25) - 2
         } else {
-            ((q as u32) << 17) | (idx as u32)
+            ((q as u32) << 16) | (idx as u32)
         };
         Some(Self {
             head: ((h >> LOW_HASH_BITS) & TOKEN_MASK)
@@ -662,10 +667,10 @@ mod tests {
         assert_eq!(size_of::<Tok10>(), 10);
         assert_eq!(size_of::<RecB8>(), 8);
         let compact =
-            Tok10::pack(0, u64::MAX, 1_234_567, (7 << 27) | (250 << 19) | 65_533).unwrap();
+            Tok10::pack(0, u64::MAX, 1_234_567, (7 << 27) | (250 << 18) | 65_533).unwrap();
         assert_eq!(compact.key(), TOKEN_MASK);
         assert_eq!(compact.ingest(), 1_234_567);
-        assert_eq!(compact.location(7), (7 << 27) | (250 << 19) | 65_533);
+        assert_eq!(compact.location(7), (7 << 27) | (250 << 18) | 65_533);
         let fast = Tok10::pack_valid_fast(u64::MAX, 1_234_567, 250, 65_533).unwrap();
         assert_eq!(fast.key(), compact.key());
         assert_eq!(fast.ingest(), compact.ingest());
@@ -744,7 +749,7 @@ mod tests {
             prev = code;
             let h = hash(code);
             assert_eq!(
-                restore_person((h >> 56) as usize, record_person(code, h)),
+                restore_person((h >> (64 - PERSON_PART_BITS)) as usize, record_person(code, h)),
                 code
             );
             let mut out = [0; 16];
