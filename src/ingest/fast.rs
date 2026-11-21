@@ -17,14 +17,15 @@ use crate::aggregate::{self, output, CampStore, NO_CATEGORY};
 use crate::types::*;
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
 const DAY_MS_U64: u64 = ts::DAY_MS as u64;
-const CHUNK: u64 = 1 << 20;
+const CHUNK: u64 = 256 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
@@ -64,7 +65,8 @@ struct RecA<K: Key> {
     ingest: u32,
     /// (cat << 24) | cents; INVALID_CC if row fails validation as a kept copy
     cc: u32,
-    _pad: u32,
+    /// Low 32 bits of eid.h() (independent of top p1_bits), avoiding re-hashing in dedup Pass 1.
+    eid_hash: u32,
 }
 
 /// Surviving event keyed by person. 16 bytes for u64 keys, 32 bytes for u128 keys.
@@ -132,6 +134,7 @@ struct Ctx {
     camp: IdLookup,
     files: Vec<FileInfo>,
     handles: Vec<File>,
+    pref_stop: Arc<AtomicBool>,
     link_chunks: Vec<Chunk>,
     main_chunks: Vec<Chunk>,
     event_bytes: u64,
@@ -157,19 +160,54 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         }
     }
     let handles: Vec<File> = files.iter().map(|f| File::open(&f.path).expect("open csv")).collect();
+    let pref_stop = Arc::new(AtomicBool::new(false));
     if std::env::var("INGEST_NO_PREFETCH").is_err() {
-        let mut order: Vec<(std::path::PathBuf, u64)> = Vec::new();
+        let mut segs: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+        let seg_sz: u64 = 16 << 20;
         for f in files.iter().filter(|f| f.kind == Kind::Links).chain(files.iter().filter(|f| f.kind != Kind::Links)) {
-            order.push((f.path.clone(), f.len));
-        }
-        std::thread::spawn(move || {
-            use std::os::fd::AsRawFd;
-            for (path, len) in order {
-                if let Ok(h) = File::open(&path) {
-                    par::fadvise_willneed(h.as_raw_fd(), len);
-                }
+            let mut off = 0u64;
+            while off < f.len {
+                let len = seg_sz.min(f.len - off);
+                segs.push((f.path.clone(), off, len));
+                off += len;
             }
-        });
+        }
+        let n_pref = segs.len().min(4);
+        if n_pref > 0 {
+            let segs = Arc::new(segs);
+            let next = Arc::new(AtomicUsize::new(0));
+            for _ in 0..n_pref {
+                let segs = Arc::clone(&segs);
+                let next = Arc::clone(&next);
+                let stop = Arc::clone(&pref_stop);
+                std::thread::spawn(move || {
+                    use std::os::fd::AsRawFd;
+                    let mut cached: Option<(std::path::PathBuf, File)> = None;
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= segs.len() {
+                            break;
+                        }
+                        let (ref path, off, len) = segs[i];
+                        let fd = match cached.as_ref() {
+                            Some((p, h)) if p == path => h.as_raw_fd(),
+                            _ => match File::open(path) {
+                                Ok(h) => {
+                                    let fd = h.as_raw_fd();
+                                    cached = Some((path.clone(), h));
+                                    fd
+                                }
+                                Err(_) => continue,
+                            },
+                        };
+                        par::fadvise_range(fd, off, len);
+                    }
+                });
+            }
+        }
     }
     let chunks = scan::plan(&files, CHUNK);
     let link_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
@@ -186,6 +224,7 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         camp,
         files,
         handles,
+        pref_stop,
         link_chunks,
         main_chunks,
         event_bytes,
@@ -235,7 +274,7 @@ struct Deduped<K: Key> {
     ne_raw: usize,
 }
 
-fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<Deduped<K>, Need> {
+fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<Deduped<K>, Need> {
     let flag = Flag(AtomicU8::new(0));
     let (ws, we) = (ctx.ws, ctx.we);
     let dt = &ctx.dt;
@@ -276,7 +315,8 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
     // ---------------- Events + clicks parse ----------------
     let est_ev = (ctx.event_bytes / 75) as usize + 1024;
     let est_ck = (ctx.click_bytes / 40) as usize + 1024;
-    // Dynamic partition counts: keep SWCB (p1 * 256B = 128-512 KB) in L2 AND dedup u32 table (128-256 KB) deep in L2.
+    // Dynamic partition counts: keep SWCB (p1 * 256B = 128-512 KB) + 256 KB chunk buffer in L2,
+    // AND keep dedup u32 table (128-256 KB) deep in L2.
     let p1_bits: u32 = if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 10 } else { 11 };
     let p1: usize = 1 << p1_bits;
     let p2_bits: u32 = if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 10 };
@@ -292,31 +332,22 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
         ts: u32,
         campaign: u32,
     }
-    const CK_BATCH: usize = 32;
+    const CK_RING: usize = 32;
     struct ParseState<K: Key> {
         ev: Sinks<RecA<K>>,
         ck: Sinks<RecC<K>>,
-        ck_batch: [PendingClick<K>; CK_BATCH],
-        ck_nb: usize,
+        ck_ring: [PendingClick<K>; CK_RING],
+        ck_cnt: usize,
         buf: Vec<u8>,
     }
-    let flush_clicks = |st: &mut ParseState<K>| {
-        for idx in 0..st.ck_nb {
-            let pc = st.ck_batch[idx];
-            let person = links.canonical_h(pc.user, pc.uh);
-            let q = (person.h() >> (64 - p2_bits)) as usize;
-            st.ck.push(q, RecC { person, cid: pc.cid, ts: pc.ts, campaign: pc.campaign });
-        }
-        st.ck_nb = 0;
-    };
     let states: Vec<ParseState<K>> = par::run_fini(
         threads,
         ctx.main_chunks.len(),
         |_| ParseState {
             ev: Sinks::new(p1, cap_a),
             ck: Sinks::new(p2, cap_c),
-            ck_batch: [PendingClick { user: K::default(), uh: 0, cid: K::default(), ts: 0, campaign: 0 }; CK_BATCH],
-            ck_nb: 0,
+            ck_ring: [PendingClick { user: K::default(), uh: 0, cid: K::default(), ts: 0, campaign: 0 }; CK_RING],
+            ck_cnt: 0,
             buf: Vec::with_capacity(CHUNK as usize + 8192),
         },
         |st, i| {
@@ -325,64 +356,81 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
             }
             let c = ctx.main_chunks[i];
             let fi = &ctx.files[c.file as usize];
-            let (lo, hi) = scan::read_chunk(&ctx.handles[c.file as usize], fi.len, c, &mut st.buf);
-            let buf = std::mem::take(&mut st.buf);
-            match fi.kind {
-                Kind::Events => scan::scan::<7, _>(&buf, lo, hi, |b, f| {
-                    if let Err(n) = parse_event(dt, b, f, ws, we, &ctx.prod, p1_bits, &mut st.ev) {
-                        flag.set(n);
+            let mut buf = std::mem::take(&mut st.buf);
+            let (lo, hi) = scan::read_chunk(&ctx.handles[c.file as usize], fi.len, c, &mut buf);
+            if lo < hi {
+                match fi.kind {
+                    Kind::Events => scan::scan::<7, _>(&buf, lo, hi, |b, f| {
+                        if let Err(n) = parse_event::<ALL_CAT, K>(dt, b, f, ws, we, &ctx.prod, p1_bits, &mut st.ev) {
+                            flag.set(n);
+                        }
+                    }),
+                    Kind::Clicks => {
+                        let ck_base = ws - WEEK_MS;
+                        let has_links = links.has_links;
+                        scan::scan::<4, _>(&buf, lo, hi, |b, f| {
+                            if flen(f[0]) == 0 || flen(f[1]) == 0 {
+                                return;
+                            }
+                            let campaign = unsafe { ctx.camp.get(fptr(b, f[2]), flen(f[2])) };
+                            if campaign == INVALID_CAMP {
+                                return;
+                            }
+                            let t = match fts(dt, b, f[3]) {
+                                Some(t) if t >= ck_base && t < we => t,
+                                _ => return,
+                            };
+                            let cid: K = match fkey(b, f[0]) {
+                                Some(v) => v,
+                                None => {
+                                    flag.set(Need::Wide);
+                                    return;
+                                }
+                            };
+                            let user: K = match fkey(b, f[1]) {
+                                Some(v) => v,
+                                None => {
+                                    flag.set(Need::Wide);
+                                    return;
+                                }
+                            };
+                            let uh = user.h();
+                            let ts_rel = (t - ck_base) as u32;
+                            if has_links {
+                                links.prefetch_map_h(uh);
+                                let slot = st.ck_cnt & (CK_RING - 1);
+                                if st.ck_cnt >= CK_RING {
+                                    let pc = unsafe { *st.ck_ring.get_unchecked(slot) };
+                                    let (person, ph) = links.canonical_h_hash(pc.user, pc.uh);
+                                    let q = (ph >> (64 - p2_bits)) as usize;
+                                    st.ck.push(q, RecC { person, cid: pc.cid, ts: pc.ts, campaign: pc.campaign });
+                                }
+                                unsafe {
+                                    *st.ck_ring.get_unchecked_mut(slot) =
+                                        PendingClick { user, uh, cid, ts: ts_rel, campaign };
+                                }
+                                st.ck_cnt += 1;
+                            } else {
+                                let q = (uh >> (64 - p2_bits)) as usize;
+                                st.ck.push(q, RecC { person: user, cid, ts: ts_rel, campaign });
+                            }
+                        });
                     }
-                }),
-                Kind::Clicks => {
-                    let ck_base = ws - WEEK_MS;
-                    let has_links = links.has_links;
-                    scan::scan::<4, _>(&buf, lo, hi, |b, f| {
-                        if flen(f[0]) == 0 || flen(f[1]) == 0 {
-                            return;
-                        }
-                        let campaign = unsafe { ctx.camp.get(fptr(b, f[2]), flen(f[2])) };
-                        if campaign == INVALID_CAMP {
-                            return;
-                        }
-                        let t = match fts(dt, b, f[3]) {
-                            Some(t) if t >= ck_base && t < we => t,
-                            _ => return,
-                        };
-                        let cid: K = match fkey(b, f[0]) {
-                            Some(v) => v,
-                            None => {
-                                flag.set(Need::Wide);
-                                return;
-                            }
-                        };
-                        let user: K = match fkey(b, f[1]) {
-                            Some(v) => v,
-                            None => {
-                                flag.set(Need::Wide);
-                                return;
-                            }
-                        };
-                        let uh = user.h();
-                        let ts_rel = (t - ck_base) as u32;
-                        if has_links {
-                            links.prefetch_map_h(uh);
-                            st.ck_batch[st.ck_nb] = PendingClick { user, uh, cid, ts: ts_rel, campaign };
-                            st.ck_nb += 1;
-                            if st.ck_nb == CK_BATCH {
-                                flush_clicks(st);
-                            }
-                        } else {
-                            let q = (uh >> (64 - p2_bits)) as usize;
-                            st.ck.push(q, RecC { person: user, cid, ts: ts_rel, campaign });
-                        }
-                    });
+                    Kind::Links => unreachable!(),
                 }
-                Kind::Links => unreachable!(),
             }
             st.buf = buf;
         },
         |st| {
-            flush_clicks(st);
+            let n_rem = st.ck_cnt.min(CK_RING);
+            let start = st.ck_cnt - n_rem;
+            for k in start..st.ck_cnt {
+                let pc = unsafe { *st.ck_ring.get_unchecked(k & (CK_RING - 1)) };
+                let (person, ph) = links.canonical_h_hash(pc.user, pc.uh);
+                let q = (ph >> (64 - p2_bits)) as usize;
+                st.ck.push(q, RecC { person, cid: pc.cid, ts: pc.ts, campaign: pc.campaign });
+            }
+            st.ck_cnt = 0;
             st.ev.finish();
             st.ck.finish();
         },
@@ -390,6 +438,7 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
     if let Some(n) = flag.get() {
         return Err(n);
     }
+    ctx.pref_stop.store(true, Ordering::Relaxed);
     let mut ev_sinks: Vec<Sinks<RecA<K>>> = Vec::with_capacity(threads);
     let mut ck_sinks: Vec<Sinks<RecC<K>>> = Vec::with_capacity(threads);
     for s in states {
@@ -466,8 +515,9 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
                 let mut flat = 0u32;
                 for &(sl, _) in active {
                     for r in sl {
-                        let h = r.eid.h();
-                        let fp = (h >> 50) as u32; // 14-bit fingerprint
+                        // Reuse low 32 bits of eid.h() computed during parse (zero hashing in dedup Pass 1!).
+                        let h = r.eid_hash;
+                        let fp = h >> 18; // 14-bit fingerprint
                         let mut slot = (h as usize) & mask;
                         loop {
                             let v = unsafe { *table.get_unchecked(slot) };
@@ -540,18 +590,17 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
                 }
             }
 
-            // Pass 2: 100% SEQUENTIAL scan over winners, directly prefetched into Links::maps (no unprefetched Bloom miss!).
-            const B: usize = 32;
-            let mut batch: [(*const RecA<K>, u64); B] = [(std::ptr::null(), 0); B];
-            let mut nb = 0usize;
-            let flush = |batch: &[(*const RecA<K>, u64)], out: &mut Sinks<RecB<K>>| {
-                for &(rp, uh) in batch {
-                    let r = unsafe { &*rp };
-                    let person = links.canonical_h(r.user, uh);
-                    let q = (person.h() >> (64 - p2_bits)) as usize;
-                    out.push(q, RecB { person, ts: r.ts, cc: r.cc });
-                }
-            };
+            // Pass 2: 100% SEQUENTIAL scan over winners with continuous ring-32 prefetch into Links flat huge-page table.
+            #[derive(Clone, Copy)]
+            struct PendingEv<K: Key> {
+                user: K,
+                uh: u64,
+                ts: u32,
+                cc: u32,
+            }
+            const EV_RING: usize = 32;
+            let mut ring = [PendingEv { user: K::default(), uh: 0, ts: 0, cc: 0 }; EV_RING];
+            let mut cnt = 0usize;
             let has_links = links.has_links;
             let mut flat = 0usize;
             for &(sl, _) in active {
@@ -564,19 +613,31 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
                     let uh = r.user.h();
                     if has_links {
                         links.prefetch_map_h(uh);
-                        batch[nb] = (r as *const RecA<K>, uh);
-                        nb += 1;
-                        if nb == B {
-                            flush(&batch, &mut st.out);
-                            nb = 0;
+                        let slot = cnt & (EV_RING - 1);
+                        if cnt >= EV_RING {
+                            let pe = unsafe { *ring.get_unchecked(slot) };
+                            let (person, ph) = links.canonical_h_hash(pe.user, pe.uh);
+                            let q = (ph >> (64 - p2_bits)) as usize;
+                            st.out.push(q, RecB { person, ts: pe.ts, cc: pe.cc });
                         }
+                        unsafe {
+                            *ring.get_unchecked_mut(slot) = PendingEv { user: r.user, uh, ts: r.ts, cc: r.cc };
+                        }
+                        cnt += 1;
                     } else {
                         let q = (uh >> (64 - p2_bits)) as usize;
                         st.out.push(q, RecB { person: r.user, ts: r.ts, cc: r.cc });
                     }
                 }
             }
-            flush(&batch[..nb], &mut st.out);
+            let n_rem = cnt.min(EV_RING);
+            let start = cnt - n_rem;
+            for k in start..cnt {
+                let pe = unsafe { *ring.get_unchecked(k & (EV_RING - 1)) };
+                let (person, ph) = links.canonical_h_hash(pe.user, pe.uh);
+                let q = (ph >> (64 - p2_bits)) as usize;
+                st.out.push(q, RecB { person, ts: pe.ts, cc: pe.cc });
+            }
         },
         |st| {
             st.out.finish();
@@ -590,12 +651,25 @@ fn ingest_to_sinks<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<
     Ok(Deduped { b_sinks, ck_sinks, p2, ne_raw })
 }
 
-/// 8-byte compact surviving event inside a P2 partition (L2-resident, 2x denser than `Event`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-struct CompactEv {
-    ts: u32,
-    cc: u32,
+/// 8-byte compact surviving event inside a P2 partition: `(ts << 32) | cc`.
+/// Single-instruction `u64` ordering sorts primarily by `ts` ascending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct CompactEv(u64);
+
+impl CompactEv {
+    #[inline(always)]
+    fn new(ts: u32, cc: u32) -> Self {
+        CompactEv(((ts as u64) << 32) | (cc as u64))
+    }
+    #[inline(always)]
+    fn ts(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+    #[inline(always)]
+    fn cc(self) -> u32 {
+        self.0 as u32
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -611,7 +685,7 @@ fn insertion_sort_ev(a: &mut [CompactEv]) {
     for i in 1..a.len() {
         let v = unsafe { *a.get_unchecked(i) };
         let mut j = i;
-        while j > 0 && unsafe { a.get_unchecked(j - 1).ts } > v.ts {
+        while j > 0 && unsafe { a.get_unchecked(j - 1).0 } > v.0 {
             unsafe { *a.get_unchecked_mut(j) = *a.get_unchecked(j - 1) };
             j -= 1;
         }
@@ -619,23 +693,23 @@ fn insertion_sort_ev(a: &mut [CompactEv]) {
     }
 }
 
-/// 3-pass (11+11+10 bit) LSB radix sort on `CompactEv::ts` (skips trivial passes).
+/// 3-pass (11+11+10 bit) LSB radix sort on `CompactEv::ts()` (skips trivial passes).
 fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
     let n = slice.len();
     if tmp.len() < n {
-        tmp.resize(n, CompactEv { ts: 0, cc: 0 });
+        tmp.resize(n, CompactEv(0));
     }
     let buf = &mut tmp[..n];
     let mut c0 = [0u32; 2048];
     let mut c1 = [0u32; 2048];
     let mut c2 = [0u32; 1024];
     for e in slice.iter() {
-        let t = e.ts;
+        let t = e.ts();
         c0[(t & 2047) as usize] += 1;
         c1[((t >> 11) & 2047) as usize] += 1;
         c2[(t >> 22) as usize] += 1;
     }
-    let t0 = slice[0].ts;
+    let t0 = slice[0].ts();
     let skip0 = c0[(t0 & 2047) as usize] == n as u32;
     let skip1 = c1[((t0 >> 11) & 2047) as usize] == n as u32;
     let skip2 = c2[(t0 >> 22) as usize] == n as u32;
@@ -649,7 +723,7 @@ fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
             acc += v;
         }
         for &e in slice.iter() {
-            let b = (e.ts & 2047) as usize;
+            let b = (e.ts() & 2047) as usize;
             let dst = unsafe { c0.get_unchecked_mut(b) };
             unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
             *dst += 1;
@@ -665,14 +739,14 @@ fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
         }
         if in_tmp {
             for &e in buf.iter() {
-                let b = ((e.ts >> 11) & 2047) as usize;
+                let b = ((e.ts() >> 11) & 2047) as usize;
                 let dst = unsafe { c1.get_unchecked_mut(b) };
                 unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
                 *dst += 1;
             }
         } else {
             for &e in slice.iter() {
-                let b = ((e.ts >> 11) & 2047) as usize;
+                let b = ((e.ts() >> 11) & 2047) as usize;
                 let dst = unsafe { c1.get_unchecked_mut(b) };
                 unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
                 *dst += 1;
@@ -689,14 +763,14 @@ fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
         }
         if in_tmp {
             for &e in buf.iter() {
-                let b = (e.ts >> 22) as usize;
+                let b = (e.ts() >> 22) as usize;
                 let dst = unsafe { c2.get_unchecked_mut(b) };
                 unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
                 *dst += 1;
             }
         } else {
             for &e in slice.iter() {
-                let b = (e.ts >> 22) as usize;
+                let b = (e.ts() >> 22) as usize;
                 let dst = unsafe { c2.get_unchecked_mut(b) };
                 unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
                 *dst += 1;
@@ -718,7 +792,7 @@ fn sort_ev_slice(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
     if n <= 16 {
         insertion_sort_ev(slice);
     } else if n <= 256 {
-        slice.sort_unstable_by_key(|e| e.ts);
+        slice.sort_unstable();
     } else {
         radix_sort_ev(slice, tmp);
     }
@@ -755,7 +829,8 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
 
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
 fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Timer) -> Result<(), Need> {
-    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = ingest_to_sinks::<K>(ctx, threads, tm)?;
+    // Non-purchase events (view/cart, ~97%) never use `category` in daily outputs; skip `prod.get` for them!
+    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = ingest_to_sinks::<false, K>(ctx, threads, tm)?;
 
     let ud = output_dir.join("user_daily");
     let cd = output_dir.join("campaign_daily");
@@ -850,14 +925,21 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
         #[inline(always)]
         fn count_interval(&mut self, camp: u32, lo: u32, hi: u32) {
             let st = &self.s_start;
+            let df = &self.day_first;
+            if st.len() == 1 {
+                let s0 = unsafe { *st.get_unchecked(0) };
+                if lo <= s0 && s0 <= hi {
+                    self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += 1;
+                }
+                return;
+            }
             let a = st.partition_point(|&x| x < lo);
             let b = st.partition_point(|&x| x <= hi);
             if a >= b {
                 return;
             }
-            let df = &self.day_first;
             if df.len() == 1 {
-                self.camp.cell(camp, df[0].0).assisted += (b - a) as i64;
+                self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += (b - a) as i64;
                 return;
             }
             let mut di = df.partition_point(|d| (d.1 as usize) <= a) - 1;
@@ -879,6 +961,14 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
         fn assists(&mut self, pcl: &[CompactClick<K>]) {
             let first = self.s_start[0];
             let last = *unsafe { self.s_start.last().unwrap_unchecked() };
+            if pcl.len() == 1 {
+                let c = unsafe { *pcl.get_unchecked(0) };
+                let lo = c.ts.saturating_sub(WEEK_MS_U32);
+                if lo <= last && c.ts >= first {
+                    self.count_interval(c.campaign, lo, c.ts);
+                }
+                return;
+            }
             self.stamp = self.stamp.wrapping_add(1);
             if self.stamp == 0 {
                 self.c_stamp.fill(0);
@@ -963,25 +1053,34 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             if n == 0 {
                 return;
             }
-            w.map.reset(n / 8 + 16);
+            w.map.reset(n / 20 + 16);
             w.persons.clear();
             w.counts.clear();
-            w.pid.clear();
-            w.pid.reserve(n);
+            if w.pid.capacity() < n {
+                w.pid.reserve(n - w.pid.len());
+            }
+            unsafe { w.pid.set_len(n) };
+            let pid_ptr = w.pid.as_mut_ptr();
+            let mut j = 0usize;
             for s in b_sinks.iter() {
                 let (a, o) = s.part(q);
-                for r in a.iter().chain(o.iter()) {
-                    let next = w.persons.len() as u32;
-                    let (id, ins) = w.map.insert(r.person, next);
-                    if ins {
-                        w.persons.push(r.person);
-                        w.counts.push(0);
-                        if w.map.len() * 2 > map_cap(&w.map) {
-                            grow(&mut w.map, &w.persons);
+                for sl in [a, o] {
+                    for r in sl {
+                        let next = w.persons.len() as u32;
+                        let (id, ins) = w.map.insert(r.person, next);
+                        if ins {
+                            w.persons.push(r.person);
+                            w.counts.push(0);
+                            if w.map.len() * 2 > map_cap(&w.map) {
+                                grow(&mut w.map, &w.persons);
+                            }
                         }
+                        unsafe {
+                            *w.counts.get_unchecked_mut(id as usize) += 1;
+                            pid_ptr.add(j).write(id);
+                        }
+                        j += 1;
                     }
-                    unsafe { *w.counts.get_unchecked_mut(id as usize) += 1 };
-                    w.pid.push(id);
                 }
             }
             let np = w.persons.len();
@@ -1001,14 +1100,16 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             let mut j = 0usize;
             for s in b_sinks.iter() {
                 let (a, o) = s.part(q);
-                for r in a.iter().chain(o.iter()) {
-                    let id = unsafe { *w.pid.get_unchecked(j) } as usize;
-                    let pos = unsafe { *w.fill.get_unchecked(id) } as usize;
-                    unsafe {
-                        ev_ptr.add(pos).write(CompactEv { ts: r.ts, cc: r.cc });
-                        *w.fill.get_unchecked_mut(id) = (pos + 1) as u32;
+                for sl in [a, o] {
+                    for r in sl {
+                        let id = unsafe { *pid_ptr.add(j) } as usize;
+                        let pos = unsafe { *w.fill.get_unchecked(id) } as usize;
+                        unsafe {
+                            ev_ptr.add(pos).write(CompactEv::new(r.ts, r.cc));
+                            *w.fill.get_unchecked_mut(id) = (pos + 1) as u32;
+                        }
+                        j += 1;
                     }
-                    j += 1;
                 }
             }
 
@@ -1018,10 +1119,12 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             w.ck_cnt.resize(np, 0);
             for s in ck_sinks.iter() {
                 let (a, o) = s.part(q);
-                for r in a.iter().chain(o.iter()) {
-                    if let Some(id) = w.map.get(r.person) {
-                        w.cl_raw.push((id, CompactClick { ts: r.ts, campaign: r.campaign, cid: r.cid }));
-                        unsafe { *w.ck_cnt.get_unchecked_mut(id as usize) += 1 };
+                for sl in [a, o] {
+                    for r in sl {
+                        if let Some(id) = w.map.get(r.person) {
+                            w.cl_raw.push((id, CompactClick { ts: r.ts, campaign: r.campaign, cid: r.cid }));
+                            unsafe { *w.ck_cnt.get_unchecked_mut(id as usize) += 1 };
+                        }
                     }
                 }
             }
@@ -1083,7 +1186,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
                 let (mut ud_sessions, mut ud_events, mut ud_revenue) = (0u32, 0u32, 0i64);
 
                 while i < ev_en {
-                    let s = unsafe { w.ev_buf.get_unchecked(i).ts };
+                    let s = unsafe { w.ev_buf.get_unchecked(i).ts() };
                     let day = if (s as u64) < next_day_s {
                         ud_day
                     } else {
@@ -1106,14 +1209,16 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
                     let mut rev = 0u64;
                     while k < ev_en {
                         let e = unsafe { *w.ev_buf.get_unchecked(k) };
-                        if e.ts - prev > GAP_MS_U32 {
+                        let ets = e.ts();
+                        if ets - prev > GAP_MS_U32 {
                             break;
                         }
-                        prev = e.ts;
-                        let cents = e.cc & 0x00FF_FFFF;
+                        prev = ets;
+                        let cc = e.cc();
+                        let cents = cc & 0x00FF_FFFF;
                         if cents != 0 {
                             rev += cents as u64;
-                            let cat = e.cc >> 24;
+                            let cat = cc >> 24;
                             let slot = unsafe { w.cat_sum.get_unchecked_mut(cat as usize) };
                             if *slot == 0 {
                                 w.cat_touched.push(cat);
@@ -1190,7 +1295,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
 }
 
 fn run<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<Loaded, Need> {
-    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = ingest_to_sinks::<K>(ctx, threads, tm)?;
+    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = ingest_to_sinks::<true, K>(ctx, threads, tm)?;
     let (ws, we) = (ctx.ws, ctx.we);
 
     // ---------------- Person grouping (written in place) ----------------
@@ -1390,8 +1495,10 @@ fn grow<K: Key>(m: &mut Map<K, u32>, persons: &[K]) {
 }
 
 /// Parses one event row into the P1 sinks.
+/// When `ALL_CAT == false`, `prod.get` is skipped for non-purchases (`view`/`cart`, ~97% of rows)
+/// because their category is never used by daily outputs (`product_id` non-emptiness is still enforced).
 #[inline(always)]
-fn parse_event<K: Key>(
+fn parse_event<const ALL_CAT: bool, K: Key>(
     dt: &DateTable,
     b: &[u8],
     f: &[(u32, u32); 7],
@@ -1418,7 +1525,8 @@ fn parse_event<K: Key>(
             None => (u32::MAX, None),
         },
     };
-    let mut rec = RecA { eid, user: K::default(), ts: 0, ingest, cc: INVALID_CC, _pad: 0 };
+    let eid_h = eid.h();
+    let mut rec = RecA { eid, user: K::default(), ts: 0, ingest, cc: INVALID_CC, eid_hash: eid_h as u32 };
     'v: {
         let ims = match ingest_ms {
             Some(v) => v,
@@ -1438,7 +1546,7 @@ fn parse_event<K: Key>(
         let ty = f[4];
         let cents = if flen(ty) == 4 {
             let w = unsafe { std::ptr::read_unaligned(fptr(b, ty) as *const u32) };
-            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+            if (w == u32::from_le_bytes(*b"view")) | (w == u32::from_le_bytes(*b"cart")) {
                 0
             } else {
                 break 'v;
@@ -1462,21 +1570,43 @@ fn parse_event<K: Key>(
         };
         rec.user = fkey(b, f[1]).ok_or(Need::Wide)?;
         rec.ts = (t - ws) as u32;
-        let cat = unsafe { prod.get(fptr(b, f[5]), flen(f[5])) };
+        let cat = if ALL_CAT || cents != 0 {
+            unsafe { prod.get(fptr(b, f[5]), flen(f[5])) }
+        } else {
+            0
+        };
         rec.cc = (cat << 24) | cents;
     }
-    let p = (eid.h() >> (64 - p1_bits)) as usize;
+    let p = (eid_h >> (64 - p1_bits)) as usize;
     sinks.push(p, rec);
     Ok(())
 }
 
 /// Linked-id resolution: id key -> canonical id key (only ids whose canonical differs).
+/// Stored in ONE 2 MiB huge-page-backed flat partitioned table (zero `maps[p]` pointer
+/// indirection, ~100% 2M dTLB hit rate even at 128 MB / 60M events!).
 struct Links<K: Key> {
     has_links: bool,
-    maps: Vec<Map<K, K>>,
+    base: *mut (K, K),
+    raw: (*mut u8, usize),
+    part_bits: u32,
+    part_mask: usize,
+}
+unsafe impl<K: Key> Send for Links<K> {}
+unsafe impl<K: Key> Sync for Links<K> {}
+impl<K: Key> Drop for Links<K> {
+    fn drop(&mut self) {
+        if self.raw.1 != 0 {
+            par::huge_free(self.raw.0, self.raw.1);
+        }
+    }
 }
 
 impl<K: Key> Links<K> {
+    fn empty() -> Links<K> {
+        Links { has_links: false, base: std::ptr::null_mut(), raw: (std::ptr::null_mut(), 0), part_bits: 0, part_mask: 0 }
+    }
+
     fn build(pairs: &[Vec<(K, K)>], threads: usize) -> Links<K> {
         let mut off = vec![0usize; pairs.len() + 1];
         for (i, v) in pairs.iter().enumerate() {
@@ -1485,7 +1615,7 @@ impl<K: Key> Links<K> {
         let nl = off[pairs.len()];
         if nl == 0 {
             eprintln!("[ingest] links=0 linked_ids=0");
-            return Links { has_links: false, maps: Vec::new() };
+            return Links::empty();
         }
         let off = &off;
 
@@ -1531,23 +1661,28 @@ impl<K: Key> Links<K> {
         unsafe { ep.set_len(2 * nl) };
         let epp = SyncPtr(ep.as_mut_ptr());
         let scattered_ref = &scattered;
-        let mut keys_parts: Vec<(usize, Vec<K>)> = par::run(threads, LP, |_| Vec::new(), move |res, p| {
-            let n: usize = scattered_ref.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
-            let mut m: Map<K, u32> = Map::with_capacity(n);
-            let mut keys: Vec<K> = Vec::with_capacity(n / 2 + 8);
-            for s in scattered_ref.iter() {
-                for &(k, e) in &s.flat[s.pos[p]..s.pos[p + 1]] {
-                    let (id, ins) = m.insert(k, keys.len() as u32);
-                    if ins {
-                        keys.push(k);
+        let mut keys_parts: Vec<(usize, Vec<K>)> = par::run(
+            threads,
+            LP,
+            |_| (Vec::new(), Map::<K, u32>::with_capacity(1024)),
+            move |(res, m), p| {
+                let n: usize = scattered_ref.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
+                m.reset(n);
+                let mut keys: Vec<K> = Vec::with_capacity(n / 2 + 8);
+                for s in scattered_ref.iter() {
+                    for &(k, e) in &s.flat[s.pos[p]..s.pos[p + 1]] {
+                        let (id, ins) = m.insert(k, keys.len() as u32);
+                        if ins {
+                            keys.push(k);
+                        }
+                        unsafe { epp.write(e as usize, ((p as u64) << 32) | id as u64) };
                     }
-                    unsafe { epp.write(e as usize, ((p as u64) << 32) | id as u64) };
                 }
-            }
-            res.push((p, keys));
-        })
+                res.push((p, keys));
+            },
+        )
         .into_iter()
-        .flatten()
+        .flat_map(|x| x.0)
         .collect();
         drop(scattered);
         keys_parts.sort_unstable_by_key(|x| x.0);
@@ -1609,11 +1744,12 @@ impl<K: Key> Links<K> {
             }
         });
 
-        // 5. Build per-partition canonical map (only id != canonical).
+        // 5. Collect (key, canonical) per partition (only id != canonical), then populate
+        //    ONE contiguous 2 MiB huge-page flat partitioned table in parallel.
         let base_ref = &base;
-        let mut maps_parts: Vec<(usize, Map<K, K>, usize)> = par::run(threads, LP, |_| Vec::new(), move |res, p| {
+        let canon_parts: Vec<(usize, Vec<(K, K)>)> = par::run(threads, LP, |_| Vec::new(), move |res, p| {
             let (s, e) = (base_ref[p] as usize, base_ref[p + 1] as usize);
-            let mut canon: Vec<(K, K)> = Vec::new();
+            let mut canon: Vec<(K, K)> = Vec::with_capacity((e - s) * 3 / 4 + 8);
             for i in s..e {
                 let r = uf_find(parent_ref, i as u32) as usize;
                 let c = keys_ref[best_ref[r].load(Ordering::Relaxed) as usize];
@@ -1622,35 +1758,68 @@ impl<K: Key> Links<K> {
                     canon.push((k, c));
                 }
             }
-            let cnt = canon.len();
-            let mut m: Map<K, K> = Map::with_capacity(cnt);
-            for (k, c) in canon {
-                m.insert(k, c);
-            }
-            res.push((p, m, cnt));
+            res.push((p, canon));
         })
         .into_iter()
         .flatten()
         .collect();
-        maps_parts.sort_unstable_by_key(|x| x.0);
-        let total_mapped: usize = maps_parts.iter().map(|x| x.2).sum();
+        let total_mapped: usize = canon_parts.iter().map(|x| x.1.len()).sum();
         eprintln!("[ingest] links={nl} linked_ids={nn} mapped={total_mapped}");
         if total_mapped == 0 {
-            return Links { has_links: false, maps: Vec::new() };
+            return Links::empty();
         }
-        Links { has_links: true, maps: maps_parts.into_iter().map(|x| x.1).collect() }
+        let max_cnt = canon_parts.iter().map(|x| x.1.len()).max().unwrap_or(0);
+        // Keep load <= 50% (typically 29-39%) so probes almost never spill across a 64B cache line.
+        let part_cap = (max_cnt * 2).next_power_of_two().max(16);
+        let part_bits = part_cap.trailing_zeros();
+        let part_mask = part_cap - 1;
+        // Anonymous mmap is zero-filled by the OS, which equals (K::default(), K::default()) = (0, 0).
+        let (a, raw_p, raw_l) = par::huge_alloc(LP * part_cap * std::mem::size_of::<(K, K)>());
+        let flat_ptr = SyncPtr(a as *mut (K, K));
+        let canon_ref = &canon_parts;
+        par::run(threads, canon_ref.len(), |_| (), move |_, idx| {
+            let (p, ref canon) = canon_ref[idx];
+            let sl = unsafe { flat_ptr.slice(p << part_bits, part_cap) };
+            for &(k, c) in canon {
+                let mut s = (k.h() as usize) & part_mask;
+                loop {
+                    let dst = unsafe { sl.get_unchecked_mut(s) };
+                    if dst.0.is_zero() {
+                        *dst = (k, c);
+                        break;
+                    }
+                    s = (s + 1) & part_mask;
+                }
+            }
+        });
+        Links { has_links: true, base: a as *mut (K, K), raw: (raw_p, raw_l), part_bits, part_mask }
     }
 
     #[inline(always)]
-    fn canonical_h(&self, k: K, h: u64) -> K {
+    fn canonical_h_hash(&self, k: K, h: u64) -> (K, u64) {
         let p = (h >> (64 - LP_BITS)) as usize;
-        unsafe { self.maps.get_unchecked(p) }.get_h(k, h).unwrap_or(k)
+        let pbase = p << self.part_bits;
+        let mask = self.part_mask;
+        let mut s = (h as usize) & mask;
+        loop {
+            let slot = unsafe { *self.base.add(pbase | s) };
+            if slot.0 == k {
+                return (slot.1, slot.1.h());
+            }
+            if slot.0.is_zero() {
+                return (k, h);
+            }
+            s = (s + 1) & mask;
+        }
     }
 
     #[inline(always)]
     fn prefetch_map_h(&self, h: u64) {
         let p = (h >> (64 - LP_BITS)) as usize;
-        unsafe { self.maps.get_unchecked(p) }.prefetch_h(h)
+        let idx = (p << self.part_bits) | ((h as usize) & self.part_mask);
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(self.base.add(idx) as *const i8);
+        }
     }
 }
 
@@ -1728,7 +1897,7 @@ pub fn bench_rows(path: &Path, data_dir: &Path) {
                         2 => acc += fkey::<u64>(b, f[0]).unwrap_or(0) as i64 ^ fkey::<u64>(b, f[1]).unwrap_or(0) as i64,
                         3 => acc += unsafe { prod.get(fptr(b, f[5]), flen(f[5])) } as i64,
                         _ => {
-                            let _ = parse_event::<u64>(&dt, b, f, ws, we, &prod, p1_bits, &mut sinks);
+                            let _ = parse_event::<false, u64>(&dt, b, f, ws, we, &prod, p1_bits, &mut sinks);
                         }
                     }
                 });
@@ -1756,25 +1925,25 @@ mod tests {
         let mut tmp = Vec::new();
         for &n in &[0usize, 1, 2, 15, 16, 17, 256, 257, 4096, 100_000] {
             let mut a: Vec<CompactEv> = (0..n)
-                .map(|i| CompactEv { ts: (next() as u32) % 1_209_600_000, cc: i as u32 })
+                .map(|i| CompactEv::new((next() as u32) % 1_209_600_000, i as u32))
                 .collect();
             let mut b = a.clone();
             sort_ev_slice(&mut a, &mut tmp);
-            b.sort_by_key(|e| e.ts);
-            assert!(a.windows(2).all(|w| w[0].ts <= w[1].ts));
-            assert_eq!(a.iter().map(|e| e.ts).collect::<Vec<_>>(), b.iter().map(|e| e.ts).collect::<Vec<_>>());
+            b.sort_by_key(|e| e.ts());
+            assert!(a.windows(2).all(|w| w[0].ts() <= w[1].ts()));
+            assert_eq!(a.iter().map(|e| e.ts()).collect::<Vec<_>>(), b.iter().map(|e| e.ts()).collect::<Vec<_>>());
             // Also test identical timestamps (all passes skipped) and full u32 range
             if n > 0 {
-                let mut same = vec![CompactEv { ts: 42, cc: 1 }; n];
+                let mut same = vec![CompactEv::new(42, 1); n];
                 sort_ev_slice(&mut same, &mut tmp);
-                assert!(same.iter().all(|e| e.ts == 42));
-                let mut full: Vec<CompactEv> = (0..n).map(|i| CompactEv { ts: next() as u32, cc: i as u32 }).collect();
+                assert!(same.iter().all(|e| e.ts() == 42));
+                let mut full: Vec<CompactEv> = (0..n).map(|i| CompactEv::new(next() as u32, i as u32)).collect();
                 let mut full_b = full.clone();
                 sort_ev_slice(&mut full, &mut tmp);
-                full_b.sort_unstable_by_key(|e| e.ts);
+                full_b.sort_unstable_by_key(|e| e.ts());
                 assert_eq!(
-                    full.iter().map(|e| e.ts).collect::<Vec<_>>(),
-                    full_b.iter().map(|e| e.ts).collect::<Vec<_>>()
+                    full.iter().map(|e| e.ts()).collect::<Vec<_>>(),
+                    full_b.iter().map(|e| e.ts()).collect::<Vec<_>>()
                 );
             }
         }

@@ -277,24 +277,18 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
                 None => hi,
             }
         };
-        scan_tile::<N, F>(buf, cur, tile_end, sc, &mut f);
+        scan_tile_stage1(buf, cur, tile_end, sc);
+        scan_tile_stage2::<N, F>(buf, cur, sc, &mut f);
         cur = tile_end;
     }
 }
 
 #[inline(always)]
-fn scan_tile<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
-    buf: &[u8],
-    lo: usize,
-    hi: usize,
-    sc: &mut Scratch,
-    f: &mut F,
-) {
+fn scan_tile_stage1(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
     let ptr = buf.as_ptr();
     let tile_len = hi - lo;
     let seps = &mut sc.seps;
     let lfs = &mut sc.lfs;
-    // Pre-reserve exact upper bound once per tile: ZERO capacity checks in the 64B loop.
     let need_seps = tile_len + 72;
     if seps.capacity() < need_seps {
         seps.clear();
@@ -320,8 +314,6 @@ fn scan_tile<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
             let valid = below(rem as u32);
             (sep & valid, q & valid, nl & valid)
         };
-        // Fast unrolled bit extraction: `cnt <= 8` holds for >94% of 64-byte CSV blocks,
-        // avoiding unpredictable branches while keeping ILP high across two 32-bit halves.
         let mut m0 = m as u32;
         let mut m1 = (m >> 32) as u32;
         let c0 = m0.count_ones() as usize;
@@ -331,7 +323,6 @@ fn scan_tile<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
         unsafe {
             let o0 = sep_base.add(sep_len);
             let o1 = o0.add(c0);
-            // Always extract first 4 from each half (guaranteed < 72 scratch slack), handle >4 rarely.
             for k in 0..4 {
                 *o0.add(k) = b0.wrapping_add(m0.trailing_zeros());
                 m0 &= m0.wrapping_sub(1);
@@ -371,9 +362,23 @@ fn scan_tile<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
         qb += q.count_ones();
         base += 64;
     }
+    unsafe {
+        seps.set_len(sep_len);
+        lfs.set_len(lf_len);
+    }
+}
 
-    let seps_sl = unsafe { std::slice::from_raw_parts(sep_base, sep_len) };
-    let lfs_sl = unsafe { std::slice::from_raw_parts(lf_base, lf_len) };
+#[inline(always)]
+fn scan_tile_stage2<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
+    buf: &[u8],
+    lo: usize,
+    sc: &Scratch,
+    f: &mut F,
+) {
+    let ptr = buf.as_ptr();
+    let seps_sl = &sc.seps[..];
+    let lfs_sl = &sc.lfs[..];
+    let sep_len = seps_sl.len();
     let mut k = 0usize;
     let mut row_start = lo as u32;
     let mut q_prev = 0u32;
@@ -383,14 +388,27 @@ fn scan_tile<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
             let mut fields = [(0u32, 0u32); N];
             let mut wrapped = 0u32;
             let mut s = row_start;
-            for j in 0..N {
-                let e = unsafe { *seps_sl.get_unchecked(k + j) };
-                let b0 = unsafe { *ptr.add(s as usize) };
-                let b1 = unsafe { *ptr.add(e.saturating_sub(1) as usize) };
-                let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
-                wrapped += w;
-                fields[j] = (s + w, e - w);
-                s = e + 1;
+            if lo > 0 {
+                // Every separator e >= lo >= 1, so e - 1 is valid without saturating_sub cmov!
+                for j in 0..N {
+                    let e = unsafe { *seps_sl.get_unchecked(k + j) };
+                    let b0 = unsafe { *ptr.add(s as usize) };
+                    let b1 = unsafe { *ptr.add((e - 1) as usize) };
+                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
+                    wrapped += w;
+                    fields[j] = (s + w, e - w);
+                    s = e + 1;
+                }
+            } else {
+                for j in 0..N {
+                    let e = unsafe { *seps_sl.get_unchecked(k + j) };
+                    let b0 = unsafe { *ptr.add(s as usize) };
+                    let b1 = unsafe { *ptr.add(e.saturating_sub(1) as usize) };
+                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
+                    wrapped += w;
+                    fields[j] = (s + w, e - w);
+                    s = e + 1;
+                }
             }
             if qc - q_prev == 2 * wrapped {
                 f(buf, &fields);

@@ -30,17 +30,18 @@ anything else. So odd product ids never force a fallback.
 `INGEST_DUMP=<file>` writes a canonical text dump of `Loaded`. Fast and slow dumps are
 byte-identical on dev.
 
-## Pipeline (fast path)
+## Pipeline (fused fast path)
+
+`ingest::run_pipeline` runs the fused fast path (`fast::run_to_output`) directly from CSVs to Parquet without materializing `Loaded`. `INGEST_SLOW=1`, `INGEST_DUMP=<file>`, or any input outside the compact representation (`>15B` IDs, `>256` categories, window `>42d`, non-F1 `ingest_ts` outside `[1970, 2106)`) automatically falls back to `fast::load` / `slow::load` + `aggregate::run`.
 
 | Stage | What | Data |
 | --- | --- | --- |
-| small | manifest, products, campaigns; file list; 1 MiB chunk plan; async `posix_fadvise(WILLNEED)` thread over all CSVs (links first) | |
+| small | manifest, products (`u8`/`u32` dense `IdLookup` + inline/HashMap fallback), campaigns; file list; 256 KiB chunk plan; up to 4 parallel async `posix_fadvise(WILLNEED)` prefetch threads (16 MiB segments, links first, stopped after `parse`) | |
 | links-parse | parallel chunk parse of `links/*.csv` | `(K,K)` pairs per thread |
-| links-uf | endpoints scattered to 256 hash partitions; per-partition interning; lock-free parallel union-find (link larger index under smaller, CAS path halving); smallest key per root by CAS; per-partition map `id -> canonical`, holding only ids whose canonical differs | `Links` |
-| parse | events and clicks, 1 MiB LF-aligned chunks read with `pread` into a thread-local padded buffer, work-stealing over chunks | events: `RecA` 32 B into 2048 partitions by hash(event_id); valid clicks: `RecC` 32 B into 1024 partitions by hash(canonical person) |
-| dedup | per event partition: open-addressing table of `fp32 | idx`, full-key verify, keep min `ingest`; winners that are valid resolve the canonical person (batched prefetch) | `RecB` 16 B into 1024 person partitions |
-| group | per person partition: person map, counts, scatter directly into the final `events` array at the partition's base, sort each person by ts; clicks: person lookup (drop persons without events), sort by (person, ts, click key), drop adjacent duplicate click ids | final arrays |
-| assemble | offsets, clicks, canonical id bytes (`StringTable`) | `Loaded` |
+| links-uf | flat 2-pass count/scatter to 256 hash partitions; per-partition interning (reused map); parallel `keys`/`parent`/`best` init; lock-free parallel union-find (link larger index under smaller, CAS path halving); smallest key per root by CAS; ONE 2 MiB huge-page-backed flat partitioned table `id -> canonical` (zero pointer chasing, ~100% 2M dTLB hit rate) | `Links` |
+| parse | events and clicks, 256 KiB LF-aligned chunks read with `pread` into L2-hot thread-local padded buffers (no redundant zeroing), L1/L2-tiled branchless SIMD scanner, L1 `DateTable` + specialized 13-digit F3, `pshufb` `u64::enc`; skips `prod.get` on non-purchases (`view`/`cart`); `RecA` carries `eid_hash: u32` in its 4-byte pad; valid clicks resolve canonical person via continuous ring-32 prefetcher | events: `RecA` 32 B into dynamic `P1` (256/1024/2048) 256B SWCB sinks; valid clicks: `RecC` 32 B into dynamic `P2` (256/512/1024) 256B SWCB sinks |
+| dedup | per `P1` partition: compact L2-resident `u32` table (`fp14 | idx18`, `u64` fallback >=262k) using precomputed `RecA::eid_hash` + L1 `dead` bitset; 100% sequential Pass 2 resolving canonical persons via continuous ring-32 prefetch into flat huge-page `Links` | `RecB` 16 B into `P2` 256B SWCB sinks |
+| group+agg | per `P2` partition (largest first): L2-resident `CompactEv(u64)` `(ts<<32)|cc` scatter + insertion/driftsort/3-pass LSB radix sort + per-person sessionize/credit/assists + direct streaming `UserWriter` Parquet output + per-worker `CampStore` merged into `campaign_daily` | `user_daily/*.parquet`, `campaign_daily/part-0.parquet` |
 
 Details that matter for exactness:
 
@@ -66,29 +67,21 @@ Details that matter for exactness:
   (person, ts, click key): equal click ids are adjacent.
 * **Records**: `ts` is u32 ms relative to `window_start` for events, or to `window_start - 7d`
   for clicks. `ingest` is u32 seconds + 1. `cat << 24 | cents` (cents <= 10^7 < 2^24).
-* Sinks are per-thread huge-page arenas (`MADV_HUGEPAGE`) with fixed per-partition regions
-  (1.5x the estimate) and a heap overflow vector. They are written with non-temporal
-  16-byte stores (`sfence` before hand-off) and unmapped when dropped.
+* Sinks are per-thread huge-page arenas (`MADV_HUGEPAGE`, 1.25x estimate) fronted by L2-resident
+  256-byte software write-combining buffers (SWCBs) that flush 4 full cache lines at a time via
+  8x `_mm256_stream_si256` non-temporal stores (`sfence` in parallel `run_fini`), plus heap
+  overflow vectors. Unmapped immediately when dropped.
 
 ## Stage timings
 
 stderr reports `[ingest] <stage> <wall>s cpu <summed thread cpu>s`.
 
-Measured on the shared dev box: a 16-thread Ryzen 7 8845HS, `taskset -c 0-7`, `NCPU=8`, warm
-page cache. The box is shared with about 12 other agents (load average 15–50), so numbers are
-noisy. Use the best of several runs.
+See `bench/RESULTS.md` for full Docker and native A/B benchmarks on `seed20-20m` (1.87 GB) and
+`seed60-60m` (5.72 GB).
 
-| Dataset | links | parse | dedup | group | assemble | ingest total | pipeline total |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| seed20-20m (1.87 GB, 20.9M raw events) | 0.10 | 0.56 | 0.23 | 0.15 | 0.02 | 1.09 | 1.25 |
-| seed60-60m (5.7 GB, 64.4M raw events) | see below | | | | | | |
-
-At 60M on this box, the 5.4 GB input does not stay in page cache (about 7 GB available
-memory with the other agents), so parse is I/O-bound (8 s). The scorer has 24 GB.
-
-Single-thread costs (`INGEST_BENCH2=<events csv>`, CPU time per row, about 77 B/row): scan
-36 ns, plus both timestamps 28 ns, plus keys 6 ns, plus product lookup 10 ns. A full row with
-the sink push is 100–115 ns warm.
+Single-thread costs (`INGEST_BENCH2=<events csv>`, CPU time per row, ~77 B/row): scan
+23–27 ns (~2.8–3.4 GB/s), plus both timestamps ~18 ns, plus keys ~6 ns, full `parse_event` +
+SWCB push ~69 ns/row (>1.1 GB/s single-core).
 
 ## Knobs
 

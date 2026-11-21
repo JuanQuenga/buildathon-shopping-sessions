@@ -108,11 +108,14 @@ mod tests {
 /// Exact id -> value lookup with a dense fast path for ids shaped
 /// `<prefix><decimal without leading zero>` (e.g. `p123`, `c_45`); every other
 /// id goes through an exact hash map (inline `u128` for <= 15 bytes, `HashMap`
-/// for > 15 bytes). Shaped ids map 1:1 to their number, so the dense array is exact.
+/// for > 15 bytes). Uses a compact `u8` dense table (50 KB for 50k products -> L1/L2 hot!)
+/// when all values fit in `0..255`, otherwise `u32`.
 pub struct IdLookup {
-    prefix: [u8; 4],
+    prefix_val: u32,
+    prefix_mask: u32,
     plen: usize,
-    dense: Vec<u32>,
+    dense_u8: Vec<u8>,
+    dense_u32: Vec<u32>,
     rest: Map,
     rest_len: usize,
     long_rest: std::collections::HashMap<Vec<u8>, u32>,
@@ -120,6 +123,7 @@ pub struct IdLookup {
 }
 
 const NONE: u32 = u32::MAX;
+const NONE_U8: u8 = u8::MAX;
 
 impl IdLookup {
     pub fn build<'a>(entries: impl Iterator<Item = (&'a [u8], u32)> + Clone, default: u32) -> IdLookup {
@@ -127,19 +131,23 @@ impl IdLookup {
         let plen = first.iter().take(4).take_while(|b| !b.is_ascii_digit()).count();
         let mut prefix = [0u8; 4];
         prefix[..plen].copy_from_slice(&first[..plen]);
+        let prefix_val = u32::from_le_bytes(prefix);
+        let prefix_mask = if plen == 0 { 0 } else { u32::MAX >> (8 * (4 - plen) as u32) };
         let n_entries = entries.clone().count();
         let limit = (n_entries as u64) * 4 + 1024;
-        let mut dense: Vec<u32> = Vec::new();
+        let mut max_v = 0u32;
+        let mut dense_u32: Vec<u32> = Vec::new();
         let mut rest_entries = Vec::new();
         let mut long_rest = std::collections::HashMap::new();
         for (id, v) in entries {
+            max_v = max_v.max(v);
             match shaped(id, &prefix[..plen]) {
                 Some(n) if plen > 0 && n < limit => {
-                    if dense.len() <= n as usize {
-                        dense.resize(n as usize + 1, NONE);
+                    if dense_u32.len() <= n as usize {
+                        dense_u32.resize(n as usize + 1, NONE);
                     }
-                    if dense[n as usize] == NONE {
-                        dense[n as usize] = v;
+                    if dense_u32[n as usize] == NONE {
+                        dense_u32[n as usize] = v;
                     }
                 }
                 _ => {
@@ -155,7 +163,23 @@ impl IdLookup {
         for (k, v) in &rest_entries {
             rest.insert(*k, *v);
         }
-        IdLookup { prefix, plen, dense, rest, rest_len: rest_entries.len(), long_rest, default }
+        let (dense_u8, dense_u32) = if !dense_u32.is_empty() && max_v < NONE_U8 as u32 {
+            let d8: Vec<u8> = dense_u32.iter().map(|&v| if v == NONE { NONE_U8 } else { v as u8 }).collect();
+            (d8, Vec::new())
+        } else {
+            (Vec::new(), dense_u32)
+        };
+        IdLookup {
+            prefix_val,
+            prefix_mask,
+            plen,
+            dense_u8,
+            dense_u32,
+            rest,
+            rest_len: rest_entries.len(),
+            long_rest,
+            default,
+        }
     }
 
     /// Lookup of field bytes at `p` with `len` bytes; 16+ readable bytes after `p` required.
@@ -163,17 +187,24 @@ impl IdLookup {
     pub unsafe fn get(&self, p: *const u8, len: usize) -> u32 {
         let pl = self.plen;
         if len > pl && len <= pl + 8 && pl > 0 {
-            let s = std::slice::from_raw_parts(p, pl);
-            if s == &self.prefix[..pl] && *p.add(pl) != b'0' {
+            let w = std::ptr::read_unaligned(p as *const u32);
+            if (w & self.prefix_mask) == self.prefix_val && *p.add(pl) != b'0' {
                 let nd = len - pl;
                 if let Some(n) = super::tsfast::digits8(p.add(pl), nd) {
-                    if (n as usize) < self.dense.len() {
-                        let v = *self.dense.get_unchecked(n as usize);
+                    let ni = n as usize;
+                    if !self.dense_u8.is_empty() {
+                        if ni < self.dense_u8.len() {
+                            let v = *self.dense_u8.get_unchecked(ni);
+                            if v != NONE_U8 {
+                                return v as u32;
+                            }
+                        }
+                    } else if ni < self.dense_u32.len() {
+                        let v = *self.dense_u32.get_unchecked(ni);
                         if v != NONE {
                             return v;
                         }
                     }
-                    // shaped (<= 8 digits) but absent from dense: only `rest` could hold it if it was >= limit
                     if self.rest_len == 0 && self.long_rest.is_empty() {
                         return self.default;
                     }

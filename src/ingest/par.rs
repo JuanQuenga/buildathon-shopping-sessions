@@ -90,13 +90,11 @@ extern "C" {
     fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
 }
 
-/// Start asynchronous readahead of a whole file, in 64 MiB steps.
-pub fn fadvise_willneed(fd: i32, len: u64) {
-    let step = 64u64 << 20;
-    let mut off = 0;
-    while off < len {
-        unsafe { posix_fadvise(fd, off as i64, step.min(len - off) as i64, 3) };
-        off += step;
+/// Start asynchronous readahead of a specific file range.
+#[inline]
+pub fn fadvise_range(fd: i32, off: u64, len: u64) {
+    if len > 0 {
+        unsafe { posix_fadvise(fd, off as i64, len as i64, 3) };
     }
 }
 

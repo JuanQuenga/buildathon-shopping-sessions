@@ -65,6 +65,23 @@ impl Key for u128 {
     }
 }
 
+#[repr(align(16))]
+struct LiveMasks([[u8; 16]; 11]);
+
+static LIVE_MASKS: LiveMasks = LiveMasks([
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0],
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0],
+]);
+
 impl Key for u64 {
     #[inline(always)]
     unsafe fn enc(p: *const u8, len: usize) -> Option<u64> {
@@ -73,26 +90,21 @@ impl Key for u64 {
         }
         use std::arch::x86_64::*;
         let v = _mm_loadu_si128(p as *const __m128i);
-        let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        let live = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), idx);
+        let live = _mm_load_si128(LIVE_MASKS.0.as_ptr().add(len) as *const __m128i);
         // Unsigned range checks via signed shift by -128: (x - base - 128) < (-128 + width)
         // Digits '0'..='9' (0x30..=0x39): base = 0x30, width = 10 -> sub 0xB0 (-80), cmpgt -118
         let dig = _mm_cmpgt_epi8(_mm_set1_epi8(-118), _mm_sub_epi8(v, _mm_set1_epi8(0xB0u8 as i8)));
         // Alpha 'A'..='Z' or 'a'..='z': (v | 0x20) in 0x61..=0x7A -> sub 0xE1 (-31), cmpgt -102
         let v_lo = _mm_or_si128(v, _mm_set1_epi8(0x20));
         let alpha = _mm_cmpgt_epi8(_mm_set1_epi8(-102), _mm_sub_epi8(v_lo, _mm_set1_epi8(0xE1u8 as i8)));
-        let ok = _mm_or_si128(dig, alpha);
-        let bad = _mm_andnot_si128(ok, live);
+        let bad = _mm_andnot_si128(_mm_or_si128(dig, alpha), live);
         if _mm_movemask_epi8(bad) != 0 {
             return None;
         }
-        // Offset: dig -> 0x2F, upper -> 0x36, lower -> 0x3C (= 0x36 + 6).
-        // For alpha: bit 5 of v is 0x20 iff lower. is_lo = (v & 0x20) != 0.
-        let is_lo = _mm_cmpeq_epi8(_mm_and_si128(v, _mm_set1_epi8(0x20)), _mm_set1_epi8(0x20));
-        // base_off = dig ? 0x2F : 0x36; then add 6 if alpha & is_lo (note: for dig, bit 5 is 1 too! so mask with alpha)
-        let base_off = _mm_blendv_epi8(_mm_set1_epi8(0x36), _mm_set1_epi8(0x2F), dig);
-        let lo_add = _mm_and_si128(_mm_and_si128(alpha, is_lo), _mm_set1_epi8(6));
-        let off = _mm_add_epi8(base_off, lo_add);
+        // Single-cycle pshufb offset LUT indexed by high nibble (3->0x2F, 4..5->0x36, 6..7->0x3C).
+        let hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+        let off_lut = _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3C, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0);
+        let off = _mm_shuffle_epi8(off_lut, hi);
         let code = _mm_and_si128(_mm_sub_epi8(v, off), live);
         // pairs: c0*64 + c1 (12 bits) in 16-bit lanes
         let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
@@ -196,27 +208,6 @@ impl<K: Key, V: Copy + Default> Map<K, V> {
                 return None;
             }
             s = (s + 1) & self.mask;
-        }
-    }
-    #[inline(always)]
-    pub fn get_h(&self, k: K, h: u64) -> Option<V> {
-        let mut s = h as usize & self.mask;
-        loop {
-            let slot = unsafe { self.e.get_unchecked(s) };
-            if slot.0 == k {
-                return Some(slot.1);
-            }
-            if slot.0.is_zero() {
-                return None;
-            }
-            s = (s + 1) & self.mask;
-        }
-    }
-    #[inline(always)]
-    pub fn prefetch_h(&self, h: u64) {
-        let s = h as usize & self.mask;
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(self.e.as_ptr().add(s) as *const i8);
         }
     }
 }

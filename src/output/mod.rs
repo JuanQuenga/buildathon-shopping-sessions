@@ -70,8 +70,15 @@ impl UserCols {
     }
     #[inline(always)]
     pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
-        self.ids.extend_from_slice(&(id.len() as u32).to_le_bytes());
-        self.ids.extend_from_slice(id);
+        let ilen = id.len();
+        self.ids.reserve(4 + ilen);
+        unsafe {
+            let cur = self.ids.len();
+            let dst = self.ids.as_mut_ptr().add(cur);
+            std::ptr::copy_nonoverlapping((ilen as u32).to_le_bytes().as_ptr(), dst, 4);
+            std::ptr::copy_nonoverlapping(id.as_ptr(), dst.add(4), ilen);
+            self.ids.set_len(cur + 4 + ilen);
+        }
         self.day.push(day);
         self.sessions.push(sessions as i64);
         self.events.push(events as i64);
@@ -81,8 +88,15 @@ impl UserCols {
         }
         if let Some(t) = top {
             *unsafe { self.defs.last_mut().unwrap_unchecked() } |= 1 << (self.n & 7);
-            self.top.extend_from_slice(&(t.len() as u32).to_le_bytes());
-            self.top.extend_from_slice(t);
+            let tlen = t.len();
+            self.top.reserve(4 + tlen);
+            unsafe {
+                let cur = self.top.len();
+                let dst = self.top.as_mut_ptr().add(cur);
+                std::ptr::copy_nonoverlapping((tlen as u32).to_le_bytes().as_ptr(), dst, 4);
+                std::ptr::copy_nonoverlapping(t.as_ptr(), dst.add(4), tlen);
+                self.top.set_len(cur + 4 + tlen);
+            }
         }
         self.n += 1;
     }

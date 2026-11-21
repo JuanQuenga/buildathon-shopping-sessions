@@ -55,15 +55,15 @@ struct DateEntry {
 
 #[repr(C, align(64))]
 pub struct DateTable {
-    entries: [DateEntry; 128],
+    entries: [DateEntry; 256],
 }
 
 impl DateTable {
     /// Prepopulate valid dates in `[ws - 14d, we + 14d]` (up to 96 days, zero collisions across
-    /// any 4 consecutive months). Dates outside 1970..2106 or missing from the cache fall back to
-    /// exact `civil19`.
+    /// any 4 consecutive months, zero-multiply slot hash). Dates outside 1970..2106 or missing
+    /// from the cache fall back to exact `civil19`.
     pub fn build(ws_ms: i64, we_ms: i64) -> Self {
-        let mut entries = [DateEntry::default(); 128];
+        let mut entries = [DateEntry::default(); 256];
         let d0 = ws_ms.div_euclid(DAY_MS) - 14;
         let d1 = (we_ms.div_euclid(DAY_MS) + 14).min(d0 + 95);
         for d in d0..=d1 {
@@ -98,11 +98,10 @@ impl DateTable {
     #[inline(always)]
     fn slot(a: u64, ddt: u32) -> usize {
         // Month hash mod 4 (cycles 1,2,3,0 across all 12 months incl. Dec->Jan):
-        // month_tens = (a >> 40) & 1, month_ones = (a >> 48) & 3
-        let m4 = ((((a >> 40) & 1) << 1) + ((a >> 48) & 3)) & 3;
-        // Day 01..31 -> 1..31 mod 32: tens = ddt & 3, ones = (ddt >> 8) & 0x0F
-        let day5 = ((ddt & 3).wrapping_mul(10).wrapping_add((ddt >> 8) & 0x0F)) & 31;
-        ((m4 as usize) << 5) | (day5 as usize)
+        let m4 = (((a >> 48) ^ ((a >> 39) & 2)) & 3) as usize;
+        // Day 01..31 -> 6-bit BCD ((tens & 3) << 4) | (ones & 0x0F): zero multiply, zero collision!
+        let day6 = (((ddt & 3) << 4) | ((ddt >> 8) & 0x0F)) as usize;
+        (m4 << 6) | day6
     }
 
     /// Parse `YYYY-MM-DDTHH:MM:SS` (19 bytes) -> UTC epoch seconds (before zone), or None.
@@ -111,19 +110,19 @@ impl DateTable {
         let a = ld8(p); // YYYY-MM-
         let ddt = (std::ptr::read_unaligned(p.add(8) as *const u32)) & 0x00FF_FFFF; // DDT
         let e = self.entries.get_unchecked(Self::slot(a, ddt));
-        if e.a == a && e.ddt == ddt {
+        if (e.a == a) & (e.ddt == ddt) {
             let c = ld8(p.add(11)); // HH:MM:SS
-            const MC: u64 = 0xFFFF_00FF_FF00_FFFF;
             const SC: u64 = 0x0000_FF00_00FF_0000;
             const VC: u64 = ((b':' as u64) << 40) | ((b':' as u64) << 16);
-            if digits_ok(c, MC) & ((c & SC) == VC) {
-                let d = c.wrapping_sub(0x3030_3030_3030_3030);
-                let hour = ((d & 0xF) * 10 + ((d >> 8) & 0xF)) as i64;
+            let d = c.wrapping_sub(0x3030_3030_3030_3030);
+            // Simultaneously verifies H0<=2, H1<=9, M0<=5, M1<=9, S0<=5, S1<=9 (no carries on valid digits).
+            let ok_hms = (((d.wrapping_add(0x767A_0076_7A00_767Du64) | d) & 0x8080_0080_8000_8080u64) == 0)
+                & ((c & SC) == VC);
+            let hour = ((d & 0xF) * 10 + ((d >> 8) & 0xF)) as i64;
+            if ok_hms & (hour <= 23) {
                 let minute = (((d >> 24) & 0xF) * 10 + ((d >> 32) & 0xF)) as i64;
                 let second = (((d >> 48) & 0xF) * 10 + ((d >> 56) & 0xF)) as i64;
-                if (hour <= 23) & (minute <= 59) & (second <= 59) {
-                    return Some(e.day_sec as i64 + hour * 3600 + minute * 60 + second);
-                }
+                return Some(e.day_sec as i64 + hour * 3600 + minute * 60 + second);
             }
             return None;
         }
@@ -131,54 +130,103 @@ impl DateTable {
     }
 
     /// Fast path for `ingest_ts` (guaranteed valid F1): returns `Some(epoch_seconds)` if whole
-    /// seconds, `None` if unparseable, or falls back to `parse_with` for non-F1.
+    /// seconds, `None` if unparseable or non-F1.
     #[inline(always)]
     pub unsafe fn parse_f1_sec(&self, p: *const u8, len: usize) -> Option<i64> {
-        if len == 20 && *p.add(19) == b'Z' {
+        if (len == 20) & (*p.add(19) == b'Z') {
             return self.civil19_sec(p);
         }
         None
     }
 
-    /// Exact equivalent of `ts::parse_ts` using the L1 date cache.
+    /// Exact equivalent of `ts::parse_ts` using the L1 date cache + specialized 13-digit F3
+    /// + branchless F2 sign + cold fallback for rare forms.
     #[inline(always)]
     pub unsafe fn parse(&self, p: *const u8, len: usize) -> Option<i64> {
         if len == 20 {
             if *p.add(19) == b'Z' {
                 return self.civil19_sec(p).map(|s| s * 1000);
             }
-            return f3(p, len);
+            return parse_cold(p, len);
         }
         if len == 13 {
-            let hi = digits8(p, 5)?;
-            let lo = digits8(p.add(5), 8)?;
-            return Some((hi * 100_000_000 + lo) as i64);
+            let raw_hi = ld8(p);
+            let raw_lo = ld8(p.add(5));
+            const M5: u64 = 0x0000_00FF_FFFF_FFFF;
+            if digits_ok(raw_hi, M5) & digits_ok(raw_lo, u64::MAX) {
+                let hi = swar_dec8_unchecked(((raw_hi & M5) << 24) | 0x0000_0000_0030_3030u64);
+                let lo = swar_dec8_unchecked(raw_lo);
+                return Some((hi * 100_000_000 + lo) as i64);
+            }
+            return None;
         }
         if len == 25 {
             let s = *p.add(19);
-            if s == b'+' || s == b'-' {
+            if (s == b'+') | (s == b'-') {
                 let base_sec = self.civil19_sec(p)?;
                 let o = ld8(p.add(17)); // "SS+HH:MM"
                 const MO: u64 = 0xFFFF_00FF_FF00_0000;
-                if !digits_ok(o, MO) || (o >> 40) & 0xFF != b':' as u64 {
+                if !digits_ok(o, MO) | (((o >> 40) & 0xFF) != b':' as u64) {
                     return None;
                 }
                 let oh = dig(o, 3) * 10 + dig(o, 4);
                 let om = dig(o, 6) * 10 + dig(o, 7);
-                if oh > 23 || om > 59 {
+                if (oh > 23) | (om > 59) {
                     return None;
                 }
                 let off = oh * 3600 + om * 60;
-                let sec = if s == b'+' { base_sec - off } else { base_sec + off };
-                return Some(sec * 1000);
+                let delta = if s == b'+' { -off } else { off };
+                return Some((base_sec + delta) * 1000);
             }
-            return f3(p, len);
+            return parse_cold(p, len);
         }
-        if len == 0 {
-            return None;
-        }
-        f3(p, len)
+        parse_cold(p, len)
     }
+}
+
+/// Cold fallback for rare dates outside DateTable, unusual F3 lengths, or malformed strings.
+#[cold]
+#[inline(never)]
+unsafe fn parse_cold(p: *const u8, len: usize) -> Option<i64> {
+    if len == 20 {
+        if *p.add(19) == b'Z' {
+            return civil19_sec_cold(p).map(|s| s * 1000);
+        }
+        return f3(p, len);
+    }
+    if len == 25 {
+        let s = *p.add(19);
+        if s == b'+' || s == b'-' {
+            let base_sec = civil19_sec_cold(p)?;
+            let o = ld8(p.add(17));
+            const MO: u64 = 0xFFFF_00FF_FF00_0000;
+            if !digits_ok(o, MO) || (o >> 40) & 0xFF != b':' as u64 {
+                return None;
+            }
+            let oh = dig(o, 3) * 10 + dig(o, 4);
+            let om = dig(o, 6) * 10 + dig(o, 7);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = oh * 3600 + om * 60;
+            let sec = if s == b'+' { base_sec - off } else { base_sec + off };
+            return Some(sec * 1000);
+        }
+        return f3(p, len);
+    }
+    if len == 0 {
+        return None;
+    }
+    f3(p, len)
+}
+
+#[inline(always)]
+fn swar_dec8_unchecked(x: u64) -> u64 {
+    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32)))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32))))
+        >> 32
 }
 
 /// Cold fallback for `YYYY-MM-DDTHH:MM:SS` -> UTC epoch seconds.
@@ -255,7 +303,7 @@ pub unsafe fn f3(p: *const u8, len: usize) -> Option<i64> {
 #[cfg(test)]
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize) -> Option<i64> {
-    let dt = DateTable { entries: [DateEntry::default(); 128] };
+    let dt = DateTable { entries: [DateEntry::default(); 256] };
     dt.parse(p, len)
 }
 
