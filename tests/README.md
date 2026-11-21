@@ -25,3 +25,26 @@ so regenerate rather than copy: `$DATA/bin/generate --seed N --events E --clicks
 
 Expected outputs (from the reference oracle) live next to each dataset as `$DATA/expected/<name>/`
 once computed; the dev answer CSVs are in `starter/dev-answer/dev-answer/`.
+
+## How to run the checks
+
+Python: `$SS_HOME/work-test/venv` (polars 2.1.0, pyarrow, duckdb; `pip install -r tests/requirements.txt`).
+All scripts source `scripts/env.sh` (override `SS_HOME`, `SS_DATA`, `PY`).
+
+| Command | What |
+| --- | --- |
+| `scripts/check_all.sh head [N]` | Build origin/main in a clean export; run 36 official fixtures, 30 adversarial cases, dev answer, seeds 2-7, N random 1M seeds. `SS_BIG=1` adds 20M vs oracle2. Prints a PASS/FAIL matrix. |
+| `scripts/check_all.sh <binary or image>` | Same for a given native binary or Docker image tag. |
+| `scripts/diff_check.sh CAND DATA [EXPECTED]` | One dataset: run candidate (timed), compare with reference output (cached) or EXPECTED. |
+| `scripts/run_candidate.sh CAND DATA OUT` | Run once with the scorer env. Docker images get the scorer flags: `--read-only --tmpfs /tmp:size=64m --user 1000:1000 --network none --cpus 8 --memory 24g --memory-swap 24g --pids-limit 4096 --cap-drop ALL`. |
+| `scripts/run_adversarial.sh CAND` | Adversarial cases only (`tests/adversarial/cases`, plus `$SS_DATA/adversarial-big` if generated with `make_cases.py ... --big`). |
+| `scripts/build_head.sh [REV]` / `scripts/build_image.sh [REV]` | Build binary / image from a committed rev (never from the shared dirty tree). |
+| `scripts/oracle2.sh DATA` | DuckDB oracle output for large generated data (cached in `$SS_DATA/expected2/`). |
+| `scripts/compare.py EXP ACT` | Official compare.py semantics + exact multiset + invariants + stray-file warnings. |
+
+Oracles: `reference/ref.py` (pure-Python literal reference, ~16 s per 1M events; see
+`reference/NOTES.md`) and `reference/oracle2.py` (DuckDB SQL, 3.7 s per 1M, 50 s for 20M; not
+CR-exact, generated data only). They agree on dev, seeds 2-7, and every adversarial case without CR.
+
+Adversarial cases: `tests/adversarial/cases/<name>/CASE.md` has the rule citation;
+`expected/*.txt` are human-readable dumps of the reference output.
