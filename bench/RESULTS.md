@@ -2,23 +2,20 @@
 
 ## Please submit
 
-- **Tag**: `candidate-6` (HEAD on `main`, code `8f5cb0b`) — **ready for the 4:08 AM official slot** (clean single-variable I/O A/B on `candidate-5` base).
-  - **What it tests (I/O A+D)**: keeps `candidate-5`'s exact compute, single-materialization dedup, adaptive THP, AVX2 scanner, parallel teardown, and parallel generic safety unchanged, replacing ONLY the input I/O path with:
-    1. Unconditional `t = 0` `posix_fadvise(WILLNEED)` across all files.
-    2. **24 dedicated reader threads** reading **4 MiB** LF-aligned chunks (16× fewer `pread` syscalls than 256 KiB) into a **bounded 32-buffer 4 KiB-aligned pool (128 MiB cap)** started at `t = 0` concurrently with `small` + `links-parse` + `links-uf`, handing filled buffers directly to the parse threads (`parse_wait_s = 0.000 s`).
-    3. `O_DIRECT` aligned reads built & verified behind `INGEST_ODIRECT=1` (OFF by default in `candidate-6`; ready for clean 1-line A/B in `candidate-7` at 4:36 AM if warranted).
-  - **Local `seed20-20m` A/B (`NCPU=4`, median of 3, `mincore`-verified cold & warm)**:
-    - Cold cache: `candidate-5` **3.069 s** → **`candidate-6` buffered 2.000 s (−34.8%!!)** (`candidate-6` direct 2.168 s).
-    - Warm cache: `candidate-5` **1.660 s** → **`candidate-6` buffered 1.485 s (−10.5%)** (`candidate-6` direct 1.889 s).
-    - `parse_wait_s = 0.000 s` across both cold & warm; outside-`main` teardown ~10 ms; peak RSS ~1.00 GiB.
-  - **Verification**: 22/22 release unit tests (0 warnings), full native `check_all.sh` (36 official, 32 adversarial, dev, 8× 1M seeds, 20M vs `oracle2`), `INGEST_ODIRECT=1` exact `MATCH` on dev + 20M (plus `EINVAL` fallback tests), `INGEST_GENERIC=1` exact `MATCH` on dev + 20M, Docker `ss-test:candidate-6` 36/36 official + dev, Docker `seed60-60m` exact `MATCH` (10.032 s, 3.52 GiB RSS), Docker `seed60-longids` exact `MATCH` (14.553 s, 5.68 GiB RSS).
+- **Tag**: `candidate-7` (HEAD on `main`) — **ready for the 4:36 AM official slot (H2: 1-variable thread-count A/B on `candidate-5` base)**.
+  - **What it tests (H2)**: reverts `candidate-6`'s 24-reader pool cleanly back to `candidate-5` (`2bd1a01`, 0.8826 s official) and changes **ONLY** worker thread count from `8` → **`4`** (1 physical core per thread on 4C×2T Cascade Lake).
+    - If wall stays ~0.88 s (or drops < 0.85 s): proves 0.88 s is NOT per-core parallel compute (points to HT oversubscription / bandwidth / output / fixed cost).
+    - If wall jumps to ~1.30–1.50 s: proves 0.88 s IS parallel CPU compute scaling strongly with threads.
+  - **Next (5:08 AM slot, in flight)**: `candidate-8` (**H1**: 4–6× smaller compact Parquet output on `candidate-5` base — RLE_DICTIONARY + DELTA_BINARY_PACKED + narrow physical INT32 + Snappy, single `write` per file, zero external deps).
+  - **Verification**: 17/17 release unit tests (0 warnings), Docker `ss-test:candidate-7` under `--cpus 8` confirmed `threads=4` and exact `MATCH` on `dev` (inherits full `candidate-5` gate + 4× 60M parallel generic safety).
 
 ## Official scores
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
 | `candidate-3` | `63b9256` (`4f01a6e`) | **0.8824 s** | 29 (leaders now 0.42 s) | Accepted exact output (best official so far) |
-| `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | — | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 → wall is dominated by I/O or non-compute fixed cost |
+| `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | 36 (leaders now 0.36 s) | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 |
+| `candidate-6` | `5f6718c` (`8f5cb0b`) | **0.948 s** | — | Accepted exact output; +65 ms slower with 24 readers × 4 MiB + t=0 fadvise → cold-I/O hypothesis refuted (scored median is warm cache) |
 | `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (disabled `MADV_HUGEPAGE` on `Sinks`, halved chunks to 128 KiB, switched to AVX-512VL-256) |
 | `probe-1` | `4456bb8` | rejected (dev) | — | Deliberate 0-row dev mismatch; confirmed scorer returns row diff (not stderr) on mismatch |
 
