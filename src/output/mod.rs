@@ -39,16 +39,16 @@ pub struct UserCols {
 
 impl UserCols {
     pub fn with_capacity(rows: usize) -> Self {
-        let rows = rows.min(MAX_ROWS);
+        let cap = rows.min(MAX_ROWS);
         UserCols {
             n: 0,
-            ids: Vec::with_capacity(rows * 14),
-            day: Vec::with_capacity(rows),
-            sessions: Vec::with_capacity(rows),
-            events: Vec::with_capacity(rows),
-            revenue: Vec::with_capacity(rows),
-            defs: Vec::with_capacity(rows / 8 + 1),
-            top: Vec::with_capacity(rows * 4),
+            ids: Vec::with_capacity(cap * 14),
+            day: Vec::with_capacity(cap),
+            sessions: Vec::with_capacity(cap),
+            events: Vec::with_capacity(cap),
+            revenue: Vec::with_capacity(cap),
+            defs: Vec::with_capacity(cap.div_ceil(8) + 1),
+            top: Vec::with_capacity(cap * 4),
         }
     }
     pub fn len(&self) -> usize {
@@ -64,33 +64,68 @@ impl UserCols {
         self.defs.clear();
         self.top.clear();
     }
+    #[cold]
+    #[inline(never)]
+    fn grow_fixed(&mut self) {
+        let extra = self.n.max(4096);
+        self.day.reserve(extra);
+        let target = self.day.capacity();
+        if self.sessions.capacity() < target {
+            self.sessions.reserve(target - self.sessions.len());
+        }
+        if self.events.capacity() < target {
+            self.events.reserve(target - self.events.len());
+        }
+        if self.revenue.capacity() < target {
+            self.revenue.reserve(target - self.revenue.len());
+        }
+        let dneed = target.div_ceil(8) + 1;
+        if self.defs.capacity() < dneed {
+            self.defs.reserve(dneed - self.defs.len());
+        }
+    }
     #[inline(always)]
     pub fn needs_flush(&self) -> bool {
         self.n >= MAX_ROWS || self.ids.len() >= MAX_COL_BYTES || self.top.len() >= MAX_COL_BYTES
     }
     #[inline(always)]
     pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+        let n = self.n;
+        if n == self.day.capacity() {
+            self.grow_fixed();
+        }
         let ilen = id.len();
-        self.ids.reserve(4 + ilen);
+        if self.ids.capacity() - self.ids.len() < 4 + ilen {
+            self.ids.reserve(4 + ilen);
+        }
         unsafe {
             let cur = self.ids.len();
             let dst = self.ids.as_mut_ptr().add(cur);
             std::ptr::copy_nonoverlapping((ilen as u32).to_le_bytes().as_ptr(), dst, 4);
             std::ptr::copy_nonoverlapping(id.as_ptr(), dst.add(4), ilen);
             self.ids.set_len(cur + 4 + ilen);
-        }
-        self.day.push(day);
-        self.sessions.push(sessions as i64);
-        self.events.push(events as i64);
-        self.revenue.push(revenue);
-        if self.n & 7 == 0 {
-            self.defs.push(0);
-        }
-        if let Some(t) = top {
-            *unsafe { self.defs.last_mut().unwrap_unchecked() } |= 1 << (self.n & 7);
-            let tlen = t.len();
-            self.top.reserve(4 + tlen);
-            unsafe {
+
+            self.day.as_mut_ptr().add(n).write(day);
+            self.sessions.as_mut_ptr().add(n).write(sessions as i64);
+            self.events.as_mut_ptr().add(n).write(events as i64);
+            self.revenue.as_mut_ptr().add(n).write(revenue);
+            let n1 = n + 1;
+            self.day.set_len(n1);
+            self.sessions.set_len(n1);
+            self.events.set_len(n1);
+            self.revenue.set_len(n1);
+
+            let di = n >> 3;
+            if n & 7 == 0 {
+                self.defs.as_mut_ptr().add(di).write(0);
+                self.defs.set_len(di + 1);
+            }
+            if let Some(t) = top {
+                *self.defs.get_unchecked_mut(di) |= 1 << (n & 7);
+                let tlen = t.len();
+                if self.top.capacity() - self.top.len() < 4 + tlen {
+                    self.top.reserve(4 + tlen);
+                }
                 let cur = self.top.len();
                 let dst = self.top.as_mut_ptr().add(cur);
                 std::ptr::copy_nonoverlapping((tlen as u32).to_le_bytes().as_ptr(), dst, 4);
@@ -98,7 +133,7 @@ impl UserCols {
                 self.top.set_len(cur + 4 + tlen);
             }
         }
-        self.n += 1;
+        self.n = n + 1;
     }
 }
 

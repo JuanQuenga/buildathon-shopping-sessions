@@ -1,8 +1,107 @@
-//! Minimal scoped work-stealing helpers and software write-combining sinks (no external deps).
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+//! Minimal persistent worker-pool work-stealing helpers and software write-combining sinks (no external deps).
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 /// Sum of worker-thread CPU nanoseconds spent inside `run` (for stage reports).
 pub static CPU_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Persistent spin-then-park worker pool: calling thread runs worker 0, background threads run
+/// workers `1..threads`. Eliminates 11x OS thread spawn/join (`clone3` + stack mmap) per run!
+struct Job {
+    func: fn(*const u8, usize),
+    data: *const u8,
+    active_workers: usize,
+    done: AtomicUsize,
+}
+
+struct PoolShared {
+    epoch: AtomicU64,
+    job: AtomicPtr<Job>,
+    parked: AtomicUsize,
+    mu: Mutex<u64>,
+    cv: Condvar,
+}
+
+struct Pool {
+    shared: &'static PoolShared,
+    spawned: AtomicUsize,
+    spawn_mu: Mutex<()>,
+}
+
+static POOL: OnceLock<Pool> = OnceLock::new();
+static POOL_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn get_pool() -> &'static Pool {
+    POOL.get_or_init(|| {
+        let shared = Box::leak(Box::new(PoolShared {
+            epoch: AtomicU64::new(0),
+            job: AtomicPtr::new(std::ptr::null_mut()),
+            parked: AtomicUsize::new(0),
+            mu: Mutex::new(0),
+            cv: Condvar::new(),
+        }));
+        Pool {
+            shared,
+            spawned: AtomicUsize::new(0),
+            spawn_mu: Mutex::new(()),
+        }
+    })
+}
+
+fn ensure_workers(pool: &Pool, need_bg: usize) -> usize {
+    let cur = pool.spawned.load(Ordering::Acquire);
+    if cur >= need_bg {
+        return cur;
+    }
+    let _g = pool.spawn_mu.lock().unwrap();
+    let cur = pool.spawned.load(Ordering::Relaxed);
+    if cur >= need_bg {
+        return cur;
+    }
+    let init_epoch = pool.shared.epoch.load(Ordering::SeqCst);
+    for wid in (cur + 1)..=need_bg {
+        let shared = pool.shared;
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let mut seen = init_epoch;
+                loop {
+                    // Short spin catches back-to-back stages in < 1 us without burning CPU when idle.
+                    let mut spins = 0u32;
+                    let cur_ep = loop {
+                        let e = shared.epoch.load(Ordering::Acquire);
+                        if e != seen {
+                            break e;
+                        }
+                        spins += 1;
+                        if spins >= 512 {
+                            shared.parked.fetch_add(1, Ordering::SeqCst);
+                            let mut g = shared.mu.lock().unwrap();
+                            while shared.epoch.load(Ordering::SeqCst) == seen {
+                                g = shared.cv.wait(g).unwrap();
+                            }
+                            let e = shared.epoch.load(Ordering::Acquire);
+                            drop(g);
+                            shared.parked.fetch_sub(1, Ordering::AcqRel);
+                            break e;
+                        }
+                        std::hint::spin_loop();
+                    };
+                    seen = cur_ep;
+                    let jp = shared.job.load(Ordering::Acquire);
+                    let job = unsafe { &*jp };
+                    if wid < job.active_workers {
+                        (job.func)(job.data, wid);
+                    }
+                    job.done.fetch_add(1, Ordering::Release);
+                }
+            })
+            .expect("spawn pool worker");
+    }
+    pool.spawned.store(need_bg, Ordering::Release);
+    need_bg
+}
 
 /// Runs `ntasks` tasks over `threads` threads; each thread owns a state from
 /// `init(thread_index)`, and the states are returned in thread order.
@@ -22,8 +121,110 @@ where
     T: Fn(&mut S, usize) + Sync,
     F: Fn(&mut S) + Sync,
 {
-    let next = AtomicUsize::new(0);
     let threads = threads.max(1);
+    if threads == 1 {
+        let mut s = init(0);
+        for i in 0..ntasks {
+            task(&mut s, i);
+        }
+        fini(&mut s);
+        return vec![s];
+    }
+
+    // Acquire persistent global pool; fall back to thread::scope only if another test thread holds it.
+    if POOL_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return run_fini_scoped(threads, ntasks, init, task, fini);
+    }
+
+    let pool = get_pool();
+    let total_bg = ensure_workers(pool, threads - 1);
+
+    let mut out: Vec<MaybeUninit<S>> = (0..threads).map(|_| MaybeUninit::uninit()).collect();
+    let next = AtomicUsize::new(0);
+
+    struct Ctx<'a, S, I, T, F> {
+        next: &'a AtomicUsize,
+        ntasks: usize,
+        init: &'a I,
+        task: &'a T,
+        fini: &'a F,
+        out_ptr: *mut MaybeUninit<S>,
+    }
+    fn tramp<S, I, T, F>(raw: *const u8, tid: usize)
+    where
+        I: Fn(usize) -> S + Sync,
+        T: Fn(&mut S, usize) + Sync,
+        F: Fn(&mut S) + Sync,
+    {
+        let ctx = unsafe { &*(raw as *const Ctx<'_, S, I, T, F>) };
+        let c0 = thread_cpu();
+        let mut s = (ctx.init)(tid);
+        loop {
+            let i = ctx.next.fetch_add(1, Ordering::Relaxed);
+            if i >= ctx.ntasks {
+                break;
+            }
+            (ctx.task)(&mut s, i);
+        }
+        (ctx.fini)(&mut s);
+        if tid != 0 {
+            CPU_NS.fetch_add(((thread_cpu() - c0) * 1e9) as u64, Ordering::Relaxed);
+        }
+        unsafe { (*ctx.out_ptr.add(tid)).write(s) };
+    }
+
+    let ctx = Ctx {
+        next: &next,
+        ntasks,
+        init: &init,
+        task: &task,
+        fini: &fini,
+        out_ptr: out.as_mut_ptr(),
+    };
+    let job = Job {
+        func: tramp::<S, I, T, F>,
+        data: (&ctx as *const Ctx<'_, S, I, T, F>) as *const u8,
+        active_workers: threads,
+        done: AtomicUsize::new(0),
+    };
+
+    let shared = pool.shared;
+    shared.job.store(&job as *const Job as *mut Job, Ordering::Release);
+    shared.epoch.fetch_add(1, Ordering::SeqCst);
+    if shared.parked.load(Ordering::SeqCst) > 0 {
+        let _g = shared.mu.lock().unwrap();
+        shared.cv.notify_all();
+    }
+
+    // Calling thread runs worker 0 directly (zero wake latency; its CPU is accounted by Timer).
+    tramp::<S, I, T, F>(job.data, 0);
+
+    // Wait for ALL spawned background workers before releasing stack `job`/`ctx`.
+    let mut w_spins = 0u32;
+    while job.done.load(Ordering::Acquire) < total_bg {
+        if w_spins < 256 {
+            std::hint::spin_loop();
+            w_spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    shared.job.store(std::ptr::null_mut(), Ordering::Release);
+    POOL_BUSY.store(false, Ordering::Release);
+
+    out.into_iter().map(|m| unsafe { m.assume_init() }).collect()
+}
+
+fn run_fini_scoped<S: Send, I, T, F>(threads: usize, ntasks: usize, init: I, task: T, fini: F) -> Vec<S>
+where
+    I: Fn(usize) -> S + Sync,
+    T: Fn(&mut S, usize) + Sync,
+    F: Fn(&mut S) + Sync,
+{
+    let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
@@ -98,16 +299,22 @@ pub fn fadvise_range(fd: i32, off: u64, len: u64) {
     }
 }
 
-/// Anonymous memory region aligned to 2 MiB with MADV_HUGEPAGE (best effort).
+/// Anonymous memory region aligned to 2 MiB with optional MADV_HUGEPAGE.
 /// Returns (aligned pointer, raw mapping pointer, raw length) for `huge_free`.
 pub fn huge_alloc(bytes: usize) -> (*mut u8, *mut u8, usize) {
+    huge_alloc_ex(bytes, true)
+}
+
+pub fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
     const HP: usize = 2 << 20;
     let len = bytes.div_ceil(HP) * HP + HP;
     unsafe {
         let p = mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0);
         assert!(p as isize != -1 && !p.is_null(), "mmap failed");
         let a = ((p as usize + HP - 1) & !(HP - 1)) as *mut u8;
-        madvise(a, len - HP, 14);
+        if use_thp {
+            madvise(a, len - HP, 14);
+        }
         if std::env::var("INGEST_POPULATE").is_ok() {
             madvise(a, len - HP, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
         }
@@ -117,6 +324,21 @@ pub fn huge_alloc(bytes: usize) -> (*mut u8, *mut u8, usize) {
 
 pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
+}
+
+/// Map a read-only file with `MADV_SEQUENTIAL` for zero-copy scanning.
+pub fn mmap_ro(fd: i32, len: usize) -> Option<*const u8> {
+    if len == 0 {
+        return None;
+    }
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), len, 1, 2, fd, 0); // PROT_READ=1, MAP_PRIVATE=2
+        if p as isize == -1 || p.is_null() {
+            return None;
+        }
+        madvise(p, len, 2); // MADV_SEQUENTIAL=2
+        Some(p as *const u8)
+    }
 }
 
 /// One 256-byte (4 cache lines) cache-line-aligned software write-combining buffer slot.
@@ -159,7 +381,10 @@ impl<T: Copy> Sinks<T> {
     pub fn new(parts: usize, cap: usize) -> Self {
         let pl = Self::per_line();
         let cap = cap.max(pl).div_ceil(pl) * pl;
-        let (a, p, l) = huge_alloc(parts * cap * std::mem::size_of::<T>());
+        // Skip MADV_HUGEPAGE on streaming Sinks by default: avoids synchronous THP compaction stalls
+        // when kernel defrag=[madvise], while 2M-aligned mmap still gets opportunistic THP under always.
+        let use_thp = std::env::var("INGEST_SINK_THP").is_ok();
+        let (a, p, l) = huge_alloc_ex(parts * cap * std::mem::size_of::<T>(), use_thp);
         Sinks {
             base: a as *mut T,
             raw: (p, l),
@@ -238,5 +463,103 @@ impl<T: Copy> Sinks<T> {
 
     pub fn count(&self, p: usize) -> usize {
         self.len[p].min(self.cap) + self.over[p].len()
+    }
+}
+
+/// Slabs >= 64 KiB use direct anonymous `mmap`/`munmap` so freed partition streams
+/// return pages to the OS immediately instead of lingering in glibc heap arenas.
+const MMAP_SLAB_MIN: usize = 64 << 10;
+
+struct Slab {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+    is_mmap: bool,
+}
+unsafe impl Send for Slab {}
+unsafe impl Sync for Slab {}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        if self.is_mmap {
+            unsafe { munmap(self.ptr, self.cap) };
+        } else {
+            unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.cap)));
+            }
+        }
+    }
+}
+
+impl Slab {
+    fn new(cap: usize) -> Self {
+        if cap >= MMAP_SLAB_MIN {
+            let cap = cap.next_multiple_of(4096);
+            let ptr = unsafe { mmap(std::ptr::null_mut(), cap, 3, 0x22, -1, 0) };
+            assert!(ptr as isize != -1 && !ptr.is_null(), "slab mmap({cap}) failed");
+            Slab { ptr, len: 0, cap, is_mmap: true }
+        } else {
+            let raw = Box::into_raw(vec![0u8; cap].into_boxed_slice()) as *mut u8;
+            Slab { ptr: raw, len: 0, cap, is_mmap: false }
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Append-only variable-length record buffer backed by pinned mmap (or small heap) slabs.
+/// Memory never reallocates/copies on growth and is returned to the OS immediately on `Drop`.
+pub struct SlabBuf {
+    slabs: Vec<Slab>,
+    slab_cap: usize,
+    pub count: usize,
+    pub total_bytes: usize,
+}
+
+impl SlabBuf {
+    pub fn new(slab_cap: usize) -> Self {
+        SlabBuf {
+            slabs: Vec::new(),
+            slab_cap: slab_cap.max(4096),
+            count: 0,
+            total_bytes: 0,
+        }
+    }
+
+    /// Reserve `n` contiguous bytes for one record, returning a writable pointer.
+    #[inline(always)]
+    pub fn alloc_raw(&mut self, n: usize) -> *mut u8 {
+        self.count += 1;
+        self.total_bytes += n;
+        if let Some(last) = self.slabs.last_mut() {
+            if last.cap - last.len >= n {
+                let p = unsafe { last.ptr.add(last.len) };
+                last.len += n;
+                return p;
+            }
+        }
+        self.alloc_slow(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_slow(&mut self, n: usize) -> *mut u8 {
+        let cap = self.slab_cap.max(n);
+        let mut s = Slab::new(cap);
+        let p = s.ptr;
+        s.len = n;
+        self.slabs.push(s);
+        p
+    }
+
+    #[inline]
+    pub fn slabs(&self) -> impl Iterator<Item = &[u8]> {
+        self.slabs.iter().map(|s| s.as_slice())
     }
 }

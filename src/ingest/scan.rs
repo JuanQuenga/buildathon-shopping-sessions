@@ -242,6 +242,32 @@ pub fn scan_ref<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], l
 pub struct Scratch {
     seps: Vec<u32>,
     lfs: Vec<(u32, u32)>,
+    seps16: Vec<u16>,
+    lfs16: Vec<(u16, u16)>,
+}
+
+#[cfg(target_arch = "x86_64")]
+static AVX512BW_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline(always)]
+fn has_avx512bw() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::sync::atomic::Ordering;
+        let s = AVX512BW_STATE.load(Ordering::Relaxed);
+        if s != 0 {
+            return s == 2;
+        }
+        let ok = std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::env::var("INGEST_NO_AVX512").is_err();
+        AVX512BW_STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+        ok
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 thread_local! {
@@ -267,6 +293,7 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
         return;
     }
     assert!(buf.len() >= hi + PAD && N <= 15 && hi < u32::MAX as usize);
+    let use_512 = has_avx512bw();
     let mut cur = lo;
     while cur < hi {
         let tile_end = if cur + TILE >= hi {
@@ -277,9 +304,275 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
                 None => hi,
             }
         };
-        scan_tile_stage1(buf, cur, tile_end, sc);
-        scan_tile_stage2::<N, F>(buf, cur, sc, &mut f);
+        if tile_end - cur <= 65_000 {
+            #[cfg(target_arch = "x86_64")]
+            if use_512 {
+                unsafe { scan_tile_stage1_u16_avx512(buf, cur, tile_end, sc) };
+            } else {
+                scan_tile_stage1_u16_avx2(buf, cur, tile_end, sc);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = use_512;
+                scan_tile_stage1_u16_avx2(buf, cur, tile_end, sc);
+            }
+            scan_tile_stage2_u16::<N, F>(buf, cur, sc, &mut f);
+        } else {
+            scan_tile_stage1(buf, cur, tile_end, sc);
+            scan_tile_stage2::<N, F>(buf, cur, sc, &mut f);
+        }
         cur = tile_end;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn scan_tile_stage1_u16_avx512(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+    use std::arch::x86_64::*;
+    let ptr = buf.as_ptr().add(lo);
+    let tile_len = hi - lo;
+    let seps = &mut sc.seps16;
+    let lfs = &mut sc.lfs16;
+    let need_seps = tile_len + 72;
+    if seps.capacity() < need_seps {
+        seps.clear();
+        seps.reserve(need_seps);
+    }
+    let need_lfs = tile_len + 64;
+    if lfs.capacity() < need_lfs {
+        lfs.clear();
+        lfs.reserve(need_lfs);
+    }
+    let sep_base = seps.as_mut_ptr();
+    let lf_base = lfs.as_mut_ptr();
+    let mut sep_len = 0usize;
+    let mut lf_len = 0usize;
+    let mut qb = 0u32;
+    let comma = _mm512_set1_epi8(b',' as i8);
+    let nl = _mm512_set1_epi8(b'\n' as i8);
+    let qt = _mm512_set1_epi8(b'"' as i8);
+    let mut rel = 0usize;
+    while rel < tile_len {
+        let v = _mm512_loadu_si512(ptr.add(rel) as *const _);
+        let c = _mm512_cmpeq_epi8_mask(v, comma);
+        let nl_m = _mm512_cmpeq_epi8_mask(v, nl);
+        let q_m = _mm512_cmpeq_epi8_mask(v, qt);
+        let sep = c | nl_m;
+        let rem = tile_len - rel;
+        let (m, q, n) = if rem >= 64 {
+            (sep, q_m, nl_m)
+        } else {
+            let valid = below(rem as u32);
+            (sep & valid, q_m & valid, nl_m & valid)
+        };
+        let mut m0 = m as u32;
+        let mut m1 = (m >> 32) as u32;
+        let c0 = m0.count_ones() as usize;
+        let c1 = m1.count_ones() as usize;
+        let b0 = rel as u16;
+        let b1 = b0.wrapping_add(32);
+        let o0 = sep_base.add(sep_len);
+        let o1 = o0.add(c0);
+        for k in 0..4 {
+            *o0.add(k) = b0.wrapping_add(m0.trailing_zeros() as u16);
+            m0 &= m0.wrapping_sub(1);
+        }
+        if m0 != 0 {
+            let mut o = o0.add(4);
+            while m0 != 0 {
+                *o = b0.wrapping_add(m0.trailing_zeros() as u16);
+                o = o.add(1);
+                m0 &= m0.wrapping_sub(1);
+            }
+        }
+        for k in 0..4 {
+            *o1.add(k) = b1.wrapping_add(m1.trailing_zeros() as u16);
+            m1 &= m1.wrapping_sub(1);
+        }
+        if m1 != 0 {
+            let mut o = o1.add(4);
+            while m1 != 0 {
+                *o = b1.wrapping_add(m1.trailing_zeros() as u16);
+                o = o.add(1);
+                m1 &= m1.wrapping_sub(1);
+            }
+        }
+        sep_len += c0 + c1;
+
+        let mut nm = n;
+        while nm != 0 {
+            let i = nm.trailing_zeros();
+            *lf_base.add(lf_len) = (b0 + i as u16, (qb + (q & below_lt64(i)).count_ones()) as u16);
+            lf_len += 1;
+            nm &= nm - 1;
+        }
+        qb += q.count_ones();
+        rel += 64;
+    }
+    seps.set_len(sep_len);
+    lfs.set_len(lf_len);
+}
+
+#[inline(always)]
+fn scan_tile_stage1_u16_avx2(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+    let ptr = unsafe { buf.as_ptr().add(lo) };
+    let tile_len = hi - lo;
+    let seps = &mut sc.seps16;
+    let lfs = &mut sc.lfs16;
+    let need_seps = tile_len + 72;
+    if seps.capacity() < need_seps {
+        seps.clear();
+        seps.reserve(need_seps);
+    }
+    let need_lfs = tile_len + 64;
+    if lfs.capacity() < need_lfs {
+        lfs.clear();
+        lfs.reserve(need_lfs);
+    }
+    let sep_base = seps.as_mut_ptr();
+    let lf_base = lfs.as_mut_ptr();
+    let mut sep_len = 0usize;
+    let mut lf_len = 0usize;
+    let mut qb = 0u32;
+    let mut rel = 0usize;
+    while rel < tile_len {
+        let (sep, q, nl) = masks(unsafe { ptr.add(rel) });
+        let rem = tile_len - rel;
+        let (m, q, n) = if rem >= 64 {
+            (sep, q, nl)
+        } else {
+            let valid = below(rem as u32);
+            (sep & valid, q & valid, nl & valid)
+        };
+        let mut m0 = m as u32;
+        let mut m1 = (m >> 32) as u32;
+        let c0 = m0.count_ones() as usize;
+        let c1 = m1.count_ones() as usize;
+        let b0 = rel as u16;
+        let b1 = b0.wrapping_add(32);
+        unsafe {
+            let o0 = sep_base.add(sep_len);
+            let o1 = o0.add(c0);
+            for k in 0..4 {
+                *o0.add(k) = b0.wrapping_add(m0.trailing_zeros() as u16);
+                m0 &= m0.wrapping_sub(1);
+            }
+            if m0 != 0 {
+                let mut o = o0.add(4);
+                while m0 != 0 {
+                    *o = b0.wrapping_add(m0.trailing_zeros() as u16);
+                    o = o.add(1);
+                    m0 &= m0.wrapping_sub(1);
+                }
+            }
+            for k in 0..4 {
+                *o1.add(k) = b1.wrapping_add(m1.trailing_zeros() as u16);
+                m1 &= m1.wrapping_sub(1);
+            }
+            if m1 != 0 {
+                let mut o = o1.add(4);
+                while m1 != 0 {
+                    *o = b1.wrapping_add(m1.trailing_zeros() as u16);
+                    o = o.add(1);
+                    m1 &= m1.wrapping_sub(1);
+                }
+            }
+        }
+        sep_len += c0 + c1;
+
+        let mut nm = n;
+        while nm != 0 {
+            let i = nm.trailing_zeros();
+            unsafe {
+                *lf_base.add(lf_len) = (b0 + i as u16, (qb + (q & below_lt64(i)).count_ones()) as u16);
+            }
+            lf_len += 1;
+            nm &= nm - 1;
+        }
+        qb += q.count_ones();
+        rel += 64;
+    }
+    unsafe {
+        seps.set_len(sep_len);
+        lfs.set_len(lf_len);
+    }
+}
+
+#[inline(always)]
+fn scan_tile_stage2_u16<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
+    buf: &[u8],
+    lo: usize,
+    sc: &Scratch,
+    f: &mut F,
+) {
+    let tile_ptr = unsafe { buf.as_ptr().add(lo) };
+    let lo32 = lo as u32;
+    let seps_sl = &sc.seps16[..];
+    let lfs_sl = &sc.lfs16[..];
+    let sep_len = seps_sl.len();
+    let mut k = 0usize;
+    let mut row_start = 0u32;
+    let mut q_prev = 0u32;
+    if lo > 0 {
+        for &(lf16, qc16) in lfs_sl {
+            let lf = lf16 as u32;
+            let qc = qc16 as u32;
+            if k + N <= sep_len && unsafe { *seps_sl.get_unchecked(k + N - 1) } as u32 == lf {
+                let mut fields = [(0u32, 0u32); N];
+                let mut wrapped = 0u32;
+                let mut s = row_start;
+                for j in 0..N {
+                    let e = unsafe { *seps_sl.get_unchecked(k + j) } as u32;
+                    let b0 = unsafe { *tile_ptr.add(s as usize) };
+                    let b1 = unsafe { *tile_ptr.offset(e as isize - 1) };
+                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
+                    wrapped += w;
+                    fields[j] = (lo32 + s + w, lo32 + e - w);
+                    s = e + 1;
+                }
+                if qc - q_prev == 2 * wrapped {
+                    f(buf, &fields);
+                }
+                k += N;
+            } else {
+                while unsafe { *seps_sl.get_unchecked(k) } as u32 != lf {
+                    k += 1;
+                }
+                k += 1;
+            }
+            row_start = lf + 1;
+            q_prev = qc;
+        }
+    } else {
+        for &(lf16, qc16) in lfs_sl {
+            let lf = lf16 as u32;
+            let qc = qc16 as u32;
+            if k + N <= sep_len && unsafe { *seps_sl.get_unchecked(k + N - 1) } as u32 == lf {
+                let mut fields = [(0u32, 0u32); N];
+                let mut wrapped = 0u32;
+                let mut s = row_start;
+                for j in 0..N {
+                    let e = unsafe { *seps_sl.get_unchecked(k + j) } as u32;
+                    let b0 = unsafe { *tile_ptr.add(s as usize) };
+                    let b1 = unsafe { *tile_ptr.add(e.saturating_sub(1) as usize) };
+                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
+                    wrapped += w;
+                    fields[j] = (s + w, e - w);
+                    s = e + 1;
+                }
+                if qc - q_prev == 2 * wrapped {
+                    f(buf, &fields);
+                }
+                k += N;
+            } else {
+                while unsafe { *seps_sl.get_unchecked(k) } as u32 != lf {
+                    k += 1;
+                }
+                k += 1;
+            }
+            row_start = lf + 1;
+            q_prev = qc;
+        }
     }
 }
 

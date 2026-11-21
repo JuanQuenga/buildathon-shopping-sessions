@@ -1,11 +1,14 @@
-//! Bytes on disk -> `Loaded`. Owner: ingest agent. See docs/ingest.md.
+//! Bytes on disk -> `Loaded` or direct Parquet output. Owner: ingest agent. See docs/ingest.md.
 //!
-//! `fast` is the parallel exact path; it returns `None` (and we fall back to the
-//! generic `slow` path) whenever the input contains an id it cannot carry exactly
-//! (> 15 bytes). `INGEST_SLOW=1` forces the slow path; `INGEST_DUMP=<file>` writes
-//! a canonical text dump of the result (for differential checks).
+//! `fast` is the compact parallel exact path (`u64`/`u128` inline keys, <=256 categories, <=42d
+//! window). Whenever an input exceeds `fast`'s compact limits, `run_pipeline` automatically runs
+//! `generic::run_to_output` — a parallel, memory-bounded exact path supporting arbitrary ID lengths,
+//! category counts, and window spans. `INGEST_GENERIC=1` forces the parallel generic path;
+//! `INGEST_SLOW=1` forces single-threaded `slow::load` (in-repo differential oracle);
+//! `INGEST_DUMP=<file>` writes a canonical text dump of `Loaded`.
 pub mod csv;
 pub mod fast;
+pub mod generic;
 pub mod key;
 pub mod keys;
 pub mod par;
@@ -20,17 +23,23 @@ use crate::types::*;
 use std::io::Write;
 use std::path::Path;
 
-/// End-to-end pipeline entry point: uses the fused fast path (disk -> Parquet directly,
-/// no intermediate `Loaded` materialization) unless `INGEST_SLOW=1`, `INGEST_DUMP` is set,
-/// or the fast path reports an input outside its compact representation (generic fallback).
+/// End-to-end pipeline entry point: uses the fused fast path (disk -> Parquet directly)
+/// when compact representation limits hold, falling back to the parallel memory-bounded
+/// generic path (`generic::run_to_output`) otherwise. `INGEST_SLOW=1` or `INGEST_DUMP`
+/// routes through `Loaded` + `aggregate::run` for differential verification.
 pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) {
     let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
+    let generic_forced = std::env::var("INGEST_GENERIC").map(|v| v == "1").unwrap_or(false);
     let dump_path = std::env::var("INGEST_DUMP").ok();
     if !slow_forced && dump_path.is_none() {
-        if fast::run_to_output(data_dir, output_dir, threads) {
+        if !generic_forced && fast::run_to_output(data_dir, output_dir, threads) {
             return;
         }
-        eprintln!("[ingest] fast path not applicable (long id): using generic path");
+        if !generic_forced {
+            eprintln!("[ingest] fast path not applicable: using parallel generic path");
+        }
+        generic::run_to_output(data_dir, output_dir, threads);
+        return;
     }
     let loaded = if slow_forced {
         slow::load(data_dir)

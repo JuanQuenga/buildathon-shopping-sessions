@@ -122,6 +122,15 @@ fn fts(dt: &DateTable, b: &[u8], f: (u32, u32)) -> Option<i64> {
 fn fkey<K: Key>(b: &[u8], f: (u32, u32)) -> Option<K> {
     unsafe { K::enc(fptr(b, f), flen(f)) }
 }
+#[inline(always)]
+fn key_need(f: (u32, u32)) -> Need {
+    if flen(f) > super::key::MAX_INLINE { Need::Slow } else { Need::Wide }
+}
+
+#[derive(Clone, Copy)]
+struct MappedFile(*const u8, usize);
+unsafe impl Send for MappedFile {}
+unsafe impl Sync for MappedFile {}
 
 /// Everything independent of the key width.
 struct Ctx {
@@ -134,11 +143,87 @@ struct Ctx {
     camp: IdLookup,
     files: Vec<FileInfo>,
     handles: Vec<File>,
+    mmaps: Vec<Option<MappedFile>>,
     pref_stop: Arc<AtomicBool>,
     link_chunks: Vec<Chunk>,
     main_chunks: Vec<Chunk>,
     event_bytes: u64,
     click_bytes: u64,
+    parse_threads: usize,
+    p1_bits_override: Option<u32>,
+}
+
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        self.pref_stop.store(true, Ordering::Relaxed);
+        for mf in &self.mmaps {
+            if let Some(MappedFile(p, len)) = *mf {
+                par::huge_free(p as *mut u8, len);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn scan_chunk_ctx<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
+    ctx: &Ctx,
+    c: Chunk,
+    buf: &mut Vec<u8>,
+    f: F,
+) {
+    let fi_idx = c.file as usize;
+    if let Some(MappedFile(ptr, flen)) = ctx.mmaps[fi_idx] {
+        let data = unsafe { std::slice::from_raw_parts(ptr, flen) };
+        let lo = if c.start == 0 {
+            match scan::memchr(b'\n', data) {
+                Some(p) => p + 1,
+                None => return,
+            }
+        } else {
+            let s = (c.start - 1) as usize;
+            match scan::memchr(b'\n', &data[s..]) {
+                Some(p) => s + p + 1,
+                None => return,
+            }
+        };
+        let own_end = c.end as usize;
+        if lo >= own_end {
+            return;
+        }
+        let (hi, has_lf) = match scan::memchr(b'\n', &data[own_end - 1..]) {
+            Some(p) => (own_end - 1 + p + 1, true),
+            None => (data.len(), false),
+        };
+        if lo >= hi {
+            return;
+        }
+        if has_lf && hi + scan::PAD <= data.len() && (hi - lo) < (u32::MAX as usize - 256) {
+            let base = lo.saturating_sub(1);
+            scan::scan::<N, F>(&data[base..hi + scan::PAD], lo - base, hi - base, f);
+        } else {
+            let len = hi - lo;
+            let extra = usize::from(!has_lf);
+            buf.clear();
+            buf.reserve(len + extra + scan::PAD + 1);
+            buf.extend_from_slice(&data[lo..hi]);
+            if !has_lf {
+                buf.push(b'\n');
+            }
+            let end_pos = buf.len();
+            buf.resize(end_pos + scan::PAD, 0);
+            scan::scan::<N, F>(buf, 0, end_pos, f);
+        }
+        return;
+    }
+    let fi = &ctx.files[fi_idx];
+    let (lo, hi) = scan::read_chunk(&ctx.handles[fi_idx], fi.len, c, buf);
+    if lo < hi {
+        scan::scan::<N, F>(buf, lo, hi, f);
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
 }
 
 fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
@@ -160,8 +245,25 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         }
     }
     let handles: Vec<File> = files.iter().map(|f| File::open(&f.path).expect("open csv")).collect();
+    let total_csv_bytes: u64 = files.iter().map(|f| f.len).sum();
+    let use_mmap = total_csv_bytes <= (10u64 << 30) && std::env::var("INGEST_PREAD").is_err();
+    let mmaps: Vec<Option<MappedFile>> = if use_mmap {
+        use std::os::fd::AsRawFd;
+        handles
+            .iter()
+            .zip(files.iter())
+            .map(|(h, f)| par::mmap_ro(h.as_raw_fd(), f.len as usize).map(|p| MappedFile(p, f.len as usize)))
+            .collect()
+    } else {
+        vec![None; files.len()]
+    };
     let pref_stop = Arc::new(AtomicBool::new(false));
-    if std::env::var("INGEST_NO_PREFETCH").is_err() {
+    let pref_threads = if std::env::var("INGEST_NO_PREFETCH").is_ok() {
+        0
+    } else {
+        env_usize("INGEST_PREFETCH").unwrap_or(4).min(8)
+    };
+    if pref_threads > 0 {
         let mut segs: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
         let seg_sz: u64 = 16 << 20;
         for f in files.iter().filter(|f| f.kind == Kind::Links).chain(files.iter().filter(|f| f.kind != Kind::Links)) {
@@ -172,7 +274,7 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
                 off += len;
             }
         }
-        let n_pref = segs.len().min(4);
+        let n_pref = segs.len().min(pref_threads);
         if n_pref > 0 {
             let segs = Arc::new(segs);
             let next = Arc::new(AtomicUsize::new(0));
@@ -209,11 +311,15 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
             }
         }
     }
-    let chunks = scan::plan(&files, CHUNK);
+    let default_chunk = if use_mmap { 512 << 10 } else { CHUNK };
+    let chunk_bytes = env_usize("INGEST_CHUNK_KB").map(|kb| (kb.clamp(32, 4096) as u64) << 10).unwrap_or(default_chunk);
+    let chunks = scan::plan(&files, chunk_bytes);
     let link_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
     let main_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind != Kind::Links).collect();
     let event_bytes = files.iter().filter(|f| f.kind == Kind::Events).map(|f| f.len).sum();
     let click_bytes = files.iter().filter(|f| f.kind == Kind::Clicks).map(|f| f.len).sum();
+    let parse_threads = env_usize("INGEST_PARSE_THREADS").unwrap_or(0);
+    let p1_bits_override = env_usize("INGEST_P1_BITS").map(|b| (b as u32).clamp(6, 12));
     let ctx = Ctx {
         ws,
         we,
@@ -224,11 +330,14 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         camp,
         files,
         handles,
+        mmaps,
         pref_stop,
         link_chunks,
         main_chunks,
         event_bytes,
         click_bytes,
+        parse_threads,
+        p1_bits_override,
     };
     tm.lap("small");
     Some(ctx)
@@ -243,14 +352,20 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) -> bool
     let Some(ctx) = build_ctx(data_dir, &mut tm) else {
         return false;
     };
-    match run_fused::<u64>(&ctx, output_dir, threads, &mut tm) {
+    let ok = match run_fused::<u64>(&ctx, output_dir, threads, &mut tm) {
         Ok(()) => true,
         Err(Need::Wide) => {
             eprintln!("[ingest] compact keys not applicable: retrying with wide keys");
             run_fused::<u128>(&ctx, output_dir, threads, &mut tm).is_ok()
         }
         Err(Need::Slow) => false,
+    };
+    if ok {
+        // Prefetch threads were already stopped after `parse`; skip `munmap` TLB shootdowns right before exit(0).
+        ctx.pref_stop.store(true, Ordering::Relaxed);
+        std::mem::forget(ctx);
     }
+    ok
 }
 
 pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
@@ -289,14 +404,14 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
                 return;
             }
             let c = ctx.link_chunks[i];
-            let (lo, hi) = scan::read_chunk(&ctx.handles[c.file as usize], ctx.files[c.file as usize].len, c, buf);
-            scan::scan::<2, _>(buf, lo, hi, |b, f| {
+            scan_chunk_ctx::<2, _>(ctx, c, buf, |b, f| {
                 if flen(f[0]) == 0 || flen(f[1]) == 0 {
                     return;
                 }
                 match (fkey::<K>(b, f[0]), fkey::<K>(b, f[1])) {
                     (Some(a), Some(c)) => pairs.push((a, c)),
-                    _ => flag.set(Need::Wide),
+                    (None, _) => flag.set(key_need(f[0])),
+                    (_, None) => flag.set(key_need(f[1])),
                 }
             });
         },
@@ -315,14 +430,15 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
     // ---------------- Events + clicks parse ----------------
     let est_ev = (ctx.event_bytes / 75) as usize + 1024;
     let est_ck = (ctx.click_bytes / 40) as usize + 1024;
+    let parse_threads = if ctx.parse_threads > 0 { ctx.parse_threads.clamp(1, MAX_THREADS) } else { threads };
     // Dynamic partition counts: keep SWCB (p1 * 256B = 128-512 KB) + 256 KB chunk buffer in L2,
     // AND keep dedup u32 table (128-256 KB) deep in L2.
-    let p1_bits: u32 = if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 10 } else { 11 };
+    let p1_bits: u32 = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 10 } else { 11 });
     let p1: usize = 1 << p1_bits;
     let p2_bits: u32 = if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 10 };
     let p2: usize = 1 << p2_bits;
-    let cap_a = est_ev * 5 / 4 / threads / p1 + 32;
-    let cap_c = est_ck * 5 / 4 / threads / p2 + 32;
+    let cap_a = est_ev * 112 / 100 / parse_threads / p1 + 24;
+    let cap_c = est_ck * 112 / 100 / parse_threads / p2 + 24;
 
     #[derive(Clone, Copy)]
     struct PendingClick<K: Key> {
@@ -341,7 +457,7 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
         buf: Vec<u8>,
     }
     let states: Vec<ParseState<K>> = par::run_fini(
-        threads,
+        parse_threads,
         ctx.main_chunks.len(),
         |_| ParseState {
             ev: Sinks::new(p1, cap_a),
@@ -357,67 +473,64 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
             let c = ctx.main_chunks[i];
             let fi = &ctx.files[c.file as usize];
             let mut buf = std::mem::take(&mut st.buf);
-            let (lo, hi) = scan::read_chunk(&ctx.handles[c.file as usize], fi.len, c, &mut buf);
-            if lo < hi {
-                match fi.kind {
-                    Kind::Events => scan::scan::<7, _>(&buf, lo, hi, |b, f| {
-                        if let Err(n) = parse_event::<ALL_CAT, K>(dt, b, f, ws, we, &ctx.prod, p1_bits, &mut st.ev) {
-                            flag.set(n);
-                        }
-                    }),
-                    Kind::Clicks => {
-                        let ck_base = ws - WEEK_MS;
-                        let has_links = links.has_links;
-                        scan::scan::<4, _>(&buf, lo, hi, |b, f| {
-                            if flen(f[0]) == 0 || flen(f[1]) == 0 {
-                                return;
-                            }
-                            let campaign = unsafe { ctx.camp.get(fptr(b, f[2]), flen(f[2])) };
-                            if campaign == INVALID_CAMP {
-                                return;
-                            }
-                            let t = match fts(dt, b, f[3]) {
-                                Some(t) if t >= ck_base && t < we => t,
-                                _ => return,
-                            };
-                            let cid: K = match fkey(b, f[0]) {
-                                Some(v) => v,
-                                None => {
-                                    flag.set(Need::Wide);
-                                    return;
-                                }
-                            };
-                            let user: K = match fkey(b, f[1]) {
-                                Some(v) => v,
-                                None => {
-                                    flag.set(Need::Wide);
-                                    return;
-                                }
-                            };
-                            let uh = user.h();
-                            let ts_rel = (t - ck_base) as u32;
-                            if has_links {
-                                links.prefetch_map_h(uh);
-                                let slot = st.ck_cnt & (CK_RING - 1);
-                                if st.ck_cnt >= CK_RING {
-                                    let pc = unsafe { *st.ck_ring.get_unchecked(slot) };
-                                    let (person, ph) = links.canonical_h_hash(pc.user, pc.uh);
-                                    let q = (ph >> (64 - p2_bits)) as usize;
-                                    st.ck.push(q, RecC { person, cid: pc.cid, ts: pc.ts, campaign: pc.campaign });
-                                }
-                                unsafe {
-                                    *st.ck_ring.get_unchecked_mut(slot) =
-                                        PendingClick { user, uh, cid, ts: ts_rel, campaign };
-                                }
-                                st.ck_cnt += 1;
-                            } else {
-                                let q = (uh >> (64 - p2_bits)) as usize;
-                                st.ck.push(q, RecC { person: user, cid, ts: ts_rel, campaign });
-                            }
-                        });
+            match fi.kind {
+                Kind::Events => scan_chunk_ctx::<7, _>(ctx, c, &mut buf, |b, f| {
+                    if let Err(n) = parse_event::<ALL_CAT, K>(dt, b, f, ws, we, &ctx.prod, p1_bits, &mut st.ev) {
+                        flag.set(n);
                     }
-                    Kind::Links => unreachable!(),
+                }),
+                Kind::Clicks => {
+                    let ck_base = ws - WEEK_MS;
+                    let has_links = links.has_links;
+                    scan_chunk_ctx::<4, _>(ctx, c, &mut buf, |b, f| {
+                        if flen(f[0]) == 0 || flen(f[1]) == 0 {
+                            return;
+                        }
+                        let campaign = unsafe { ctx.camp.get(fptr(b, f[2]), flen(f[2])) };
+                        if campaign == INVALID_CAMP {
+                            return;
+                        }
+                        let t = match fts(dt, b, f[3]) {
+                            Some(t) if t >= ck_base && t < we => t,
+                            _ => return,
+                        };
+                        let cid: K = match fkey(b, f[0]) {
+                            Some(v) => v,
+                            None => {
+                                flag.set(key_need(f[0]));
+                                return;
+                            }
+                        };
+                        let user: K = match fkey(b, f[1]) {
+                            Some(v) => v,
+                            None => {
+                                flag.set(key_need(f[1]));
+                                return;
+                            }
+                        };
+                        let uh = user.h();
+                        let ts_rel = (t - ck_base) as u32;
+                        if has_links {
+                            links.prefetch_map_h(uh);
+                            let slot = st.ck_cnt & (CK_RING - 1);
+                            if st.ck_cnt >= CK_RING {
+                                let pc = unsafe { *st.ck_ring.get_unchecked(slot) };
+                                let (person, ph) = links.canonical_h_hash(pc.user, pc.uh);
+                                let q = (ph >> (64 - p2_bits)) as usize;
+                                st.ck.push(q, RecC { person, cid: pc.cid, ts: pc.ts, campaign: pc.campaign });
+                            }
+                            unsafe {
+                                *st.ck_ring.get_unchecked_mut(slot) =
+                                    PendingClick { user, uh, cid, ts: ts_rel, campaign };
+                            }
+                            st.ck_cnt += 1;
+                        } else {
+                            let q = (uh >> (64 - p2_bits)) as usize;
+                            st.ck.push(q, RecC { person: user, cid, ts: ts_rel, campaign });
+                        }
+                    });
                 }
+                Kind::Links => unreachable!(),
             }
             st.buf = buf;
         },
@@ -439,8 +552,8 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
         return Err(n);
     }
     ctx.pref_stop.store(true, Ordering::Relaxed);
-    let mut ev_sinks: Vec<Sinks<RecA<K>>> = Vec::with_capacity(threads);
-    let mut ck_sinks: Vec<Sinks<RecC<K>>> = Vec::with_capacity(threads);
+    let mut ev_sinks: Vec<Sinks<RecA<K>>> = Vec::with_capacity(parse_threads);
+    let mut ck_sinks: Vec<Sinks<RecC<K>>> = Vec::with_capacity(parse_threads);
     for s in states {
         ev_sinks.push(s.ev);
         ck_sinks.push(s.ck);
@@ -449,7 +562,7 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
 
     // ---------------- Event dedup ----------------
     let ne_raw: usize = (0..p1).map(|p| ev_sinks.iter().map(|s| s.count(p)).sum::<usize>()).sum();
-    let cap_b = ne_raw * 5 / 4 / threads / p2 + 64;
+    let cap_b = ne_raw * 112 / 100 / threads / p2 + 32;
     struct DedupState<K: Key> {
         t32: Vec<u32>,
         t64: Vec<u64>,
@@ -1016,7 +1129,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
     let q_order = &q_order;
     let ev_cnt_part = &ev_cnt_part;
     let ud_ref = &ud;
-    let est_user_rows = ne / threads / 4 + 1024;
+    let est_user_rows = ne / threads / 8 + 1024;
     let workers: Vec<FusedWorker<'_, K>> = par::run_fini(
         threads,
         p2,
@@ -1273,8 +1386,9 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             w.written = w.writer.finish();
         },
     );
-    drop(b_sinks);
-    drop(ck_sinks);
+    // Skip unmapping b_sinks/ck_sinks right before exit(0) (avoids 8-core munmap TLB shootdowns).
+    std::mem::forget(b_sinks);
+    std::mem::forget(ck_sinks);
     let np: usize = workers.iter().map(|w| w.np).sum();
     let nc: usize = workers.iter().map(|w| w.nc).sum();
     let user_rows_written: usize = workers.iter().map(|w| w.written).sum();
@@ -1511,7 +1625,7 @@ fn parse_event<const ALL_CAT: bool, K: Key>(
     if flen(f[0]) == 0 {
         return Ok(());
     }
-    let eid: K = fkey(b, f[0]).ok_or(Need::Wide)?;
+    let eid: K = fkey(b, f[0]).ok_or_else(|| key_need(f[0]))?;
     // Fast path: ingest_ts is guaranteed valid F1 (whole seconds).
     let (ingest, ingest_ms): (u32, Option<i64>) = match unsafe { dt.parse_f1_sec(fptr(b, f[3]), flen(f[3])) } {
         Some(sec) if sec >= 0 && sec < (u32::MAX as i64 - 1) => ((sec + 1) as u32, Some(sec * 1000)),
@@ -1568,7 +1682,7 @@ fn parse_event<const ALL_CAT: bool, K: Key>(
         } else {
             break 'v;
         };
-        rec.user = fkey(b, f[1]).ok_or(Need::Wide)?;
+        rec.user = fkey(b, f[1]).ok_or_else(|| key_need(f[1]))?;
         rec.ts = (t - ws) as u32;
         let cat = if ALL_CAT || cents != 0 {
             unsafe { prod.get(fptr(b, f[5]), flen(f[5])) }
@@ -1584,7 +1698,9 @@ fn parse_event<const ALL_CAT: bool, K: Key>(
 
 /// Linked-id resolution: id key -> canonical id key (only ids whose canonical differs).
 /// Stored in ONE 2 MiB huge-page-backed flat partitioned table (zero `maps[p]` pointer
-/// indirection, ~100% 2M dTLB hit rate even at 128 MB / 60M events!).
+/// indirection, ~100% 2M dTLB hit rate even at 128 MB / 60M events!). Direct ring-32
+/// prefetch beats a Bloom filter because ~55% of user IDs are linked (hits would suffer
+/// unprefetched DRAM misses behind a Bloom check).
 struct Links<K: Key> {
     has_links: bool,
     base: *mut (K, K),
@@ -1604,7 +1720,13 @@ impl<K: Key> Drop for Links<K> {
 
 impl<K: Key> Links<K> {
     fn empty() -> Links<K> {
-        Links { has_links: false, base: std::ptr::null_mut(), raw: (std::ptr::null_mut(), 0), part_bits: 0, part_mask: 0 }
+        Links {
+            has_links: false,
+            base: std::ptr::null_mut(),
+            raw: (std::ptr::null_mut(), 0),
+            part_bits: 0,
+            part_mask: 0,
+        }
     }
 
     fn build(pairs: &[Vec<(K, K)>], threads: usize) -> Links<K> {

@@ -29,7 +29,7 @@ for mode in "${modes[@]}"; do
       -e NCPU=8 -e MEM_GB="${MEM%g}" "$image" 2>"$log" >/dev/null || rc=$?
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1-$t0:.3f}')")
-    stages=$(grep -E '^\[(stage|ingest|main)\]' "$log" | grep -vE 'links=|persons=' | sed -E 's/^\[[a-z]+\] *//; s/ +/=/' | awk '{print $1}' | paste -sd' ')
+    stages=$(grep -E '^\[(stage|ingest|generic|main)\]' "$log" | grep -vE 'links=|persons=' | sed -E 's/^\[[a-z]+\] *//; s/ +/=/' | awk '{print $1}' | paste -sd' ')
     rss=$(grep -oE 'peak_rss_mb=[0-9]+' "$log" || true)
     echo "$(basename "$data") $mode run$i rc=$rc wall=${wall}s $rss | $stages"
     if [ "${CHECK:-0}" = 1 ] && [ "$i" = "$runs" ]; then

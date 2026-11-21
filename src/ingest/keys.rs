@@ -82,6 +82,24 @@ static LIVE_MASKS: LiveMasks = LiveMasks([
     [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0],
 ]);
 
+static DEC_LUT: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut c = 1usize;
+    while c <= 10 {
+        t[c] = (c as u8) + 0x2F;
+        c += 1;
+    }
+    while c <= 36 {
+        t[c] = (c as u8) + 0x36;
+        c += 1;
+    }
+    while c <= 62 {
+        t[c] = (c as u8) + 0x3C;
+        c += 1;
+    }
+    t
+};
+
 impl Key for u64 {
     #[inline(always)]
     unsafe fn enc(p: *const u8, len: usize) -> Option<u64> {
@@ -126,20 +144,13 @@ impl Key for u64 {
     }
     #[inline(always)]
     fn unpack_buf(self, dst: &mut [u8; 16]) -> usize {
+        let mut x = self << 4;
         let mut n = 0usize;
-        for i in 0..10 {
-            let c = ((self >> (54 - 6 * i)) & 63) as u8;
-            if c == 0 {
-                break;
-            }
-            dst[n] = if c <= 10 {
-                c + 0x2F
-            } else if c <= 36 {
-                c + 0x36
-            } else {
-                c + 0x3C
-            };
+        while x != 0 {
+            let c = (x >> 58) as usize;
+            unsafe { *dst.get_unchecked_mut(n) = *DEC_LUT.get_unchecked(c) };
             n += 1;
+            x <<= 6;
         }
         n
     }
