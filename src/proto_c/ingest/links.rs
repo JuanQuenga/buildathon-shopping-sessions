@@ -1,6 +1,6 @@
 use super::{par, read, scan, Chunks, ReadBuffers, Result, PARTITIONS};
 use crate::proto_c::arena::{Bucket, Region};
-use crate::proto_c::packed::{self, hash, ID_BITS, ID_MASK};
+use crate::proto_c::packed::{self, hash, ID_BITS, ID_MASK, LOW_HASH_BITS, PERSON_BITS, PERSON_MASK};
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -44,6 +44,13 @@ impl Shard {
     }
 
     #[inline(always)]
+    fn perm_group(self, perm35: u64) -> usize {
+        let groups = (self.cap >> 3) as u64;
+        let mix = perm35.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32;
+        self.start + ((((mix * groups) >> 32) as usize) << 3)
+    }
+
+    #[inline(always)]
     fn next(self, index: usize) -> usize {
         if index + 1 == self.start + self.cap {
             self.start
@@ -61,6 +68,64 @@ pub struct Links<'a> {
 }
 
 impl Links<'_> {
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn shard_empty(&self, q: usize) -> bool {
+        self.by_raw[q].cap == 0
+    }
+
+    #[inline(always)]
+    pub fn prefetch_perm(&self, q: usize, perm35: u64) -> usize {
+        let shard = unsafe { *self.by_raw.get_unchecked(q) };
+        let group = shard.perm_group(perm35);
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(group).cast()) };
+        group
+    }
+
+    /// Resolve a 35-bit permuted person key inside raw shard `q` directly to
+    /// `(canonical_q, canonical_perm35)` using an 8-wide 64B cache-line AVX2 probe.
+    #[inline(always)]
+    pub fn resolve_perm_slot(&self, q: usize, perm35: u64, mut i: usize) -> Option<(usize, u64)> {
+        use std::arch::x86_64::*;
+        let shard = unsafe { *self.by_raw.get_unchecked(q) };
+        let end = shard.start + shard.cap;
+        unsafe {
+            let needle = _mm256_set1_epi64x(perm35 as i64);
+            let mask35 = _mm256_set1_epi64x(PERSON_MASK as i64);
+            let zero = _mm256_setzero_si256();
+            loop {
+                let ptr = self.table.as_ptr().add(i).cast::<__m256i>();
+                let v0 = _mm256_load_si256(ptr);
+                let v1 = _mm256_load_si256(ptr.add(1));
+                let z0 = _mm256_cmpeq_epi64(v0, zero);
+                let z1 = _mm256_cmpeq_epi64(v1, zero);
+                let eq0 = _mm256_andnot_si256(z0, _mm256_cmpeq_epi64(_mm256_and_si256(v0, mask35), needle));
+                let eq1 = _mm256_andnot_si256(z1, _mm256_cmpeq_epi64(_mm256_and_si256(v1, mask35), needle));
+                let h0 = _mm256_movemask_pd(_mm256_castsi256_pd(eq0)) as u32;
+                let h1 = _mm256_movemask_pd(_mm256_castsi256_pd(eq1)) as u32;
+                let hits = h0 | (h1 << 4);
+                if hits != 0 {
+                    let lane = hits.trailing_zeros() as usize;
+                    let slot = *self.table.get_unchecked(i + lane);
+                    let idx = ((slot >> PERSON_BITS) - 1) as usize;
+                    let c = *self.canonical.get_unchecked(idx);
+                    return Some(((c >> PERSON_BITS) as usize, c & PERSON_MASK));
+                }
+                if _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(z0, z1))) != 0 {
+                    return None;
+                }
+                i += 8;
+                if i == end {
+                    i = shard.start;
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn possible(&self, h: u64) -> bool {
         if self.bloom.is_empty() {
@@ -343,7 +408,12 @@ pub fn build<'a>(
     let mut mapped_count = 0;
     for (p, roots, mapped) in root_counts.into_iter().flatten() {
         roots_by_part[p] = roots;
-        by_raw[p].cap = (mapped * 5).div_ceil(3).next_multiple_of(8);
+        // Keep <= 55% load across 8-slot (64B) AVX2 groups; >= 1 empty slot guaranteed.
+        by_raw[p].cap = if mapped == 0 {
+            0
+        } else {
+            (mapped * 2 + 1).next_multiple_of(8)
+        };
         mapped_count += mapped;
     }
 
@@ -378,9 +448,10 @@ pub fn build<'a>(
             let mut idx = root_start[p];
             for i in start..end {
                 if parent[i].load(Relaxed) as usize == i {
-                    // Each shard owns its source and dictionary ranges.
+                    // Store pre-permuted 43-bit canonical key: (canon_q << 35) | canon_perm35.
+                    let perm43 = hash(keys[i]) >> LOW_HASH_BITS;
                     unsafe {
-                        canonical_write.write(idx, keys[i]);
+                        canonical_write.write(idx, perm43);
                         index_write.write(i, idx as u32);
                     }
                     idx += 1;
@@ -407,30 +478,29 @@ pub fn build<'a>(
                 if root == i {
                     continue;
                 }
-                let h = hash(keys[i]);
-                let mut slot = shard.slot(h);
-                while slots[slot - shard.start] != 0 {
-                    slot = shard.next(slot);
+                let perm35 = packed::record_person(keys[i], hash(keys[i]));
+                let mut g = shard.perm_group(perm35) - shard.start;
+                'ins: loop {
+                    for lane in 0..8 {
+                        if slots[g + lane] == 0 {
+                            // dict_index + 1 is always non-zero, so 0 unambiguously marks an empty slot.
+                            slots[g + lane] = perm35 | ((u64::from(dict_index[root]) + 1) << PERSON_BITS);
+                            break 'ins;
+                        }
+                    }
+                    g += 8;
+                    if g == shard.cap {
+                        g = 0;
+                    }
                 }
-                slots[slot - shard.start] = keys[i] | (u64::from(dict_index[root]) << ID_BITS);
             }
         },
     );
 
-    let bloom_len = if mapped_count == 0 { 0 } else { BLOOM_WORDS };
-    let bloom = persistent
-        .slice(bloom_len, 0u64)
-        .ok_or("blocked Bloom filter arena exhausted")?;
-    for &slot in table.iter() {
-        if slot == 0 {
-            continue;
-        }
-        let (i, bits) = bloom_bits(hash(slot & ID_MASK), bloom_len);
-        bloom[i] |= bits;
-    }
+    let bloom = &[];
     eprintln!(
-        "[links] edges={edges} linked_ids={} mapped={mapped_count} table_bytes={} canonical_bytes={} bloom_bytes={}",
-        counts_by_part.iter().sum::<usize>(), table.len() * 8, canonical.len() * 8, bloom.len() * 8
+        "[links] edges={edges} linked_ids={} mapped={mapped_count} table_bytes={} canonical_bytes={} bloom_bytes=0",
+        counts_by_part.iter().sum::<usize>(), table.len() * 8, canonical.len() * 8
     );
     timer.lap("links-uf");
     Ok(Links {

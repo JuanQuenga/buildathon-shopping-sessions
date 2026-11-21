@@ -200,11 +200,9 @@ pub fn run(data_dir: &Path, out: &Path, threads: usize, inline: bool) -> Result<
         );
         timer.lap("populate");
     }
-    let rows::Parsed { live, tokens } = if inline {
-        rows::parse::<true>(&ctx, &chunks, &buffers, &links, &records, &phase, threads)?
-    } else {
-        rows::parse::<false>(&ctx, &chunks, &buffers, &links, &records, &phase, threads)?
-    };
+    let _ = inline;
+    let rows::Parsed { live, tokens } =
+        rows::parse(&ctx, &chunks, &buffers, &records, &phase, threads)?;
     if populate == "cursor" {
         let tokens = phase.stop_cursor_population();
         let rows = records.stop_cursor_population();
@@ -227,38 +225,28 @@ pub fn run(data_dir: &Path, out: &Path, threads: usize, inline: bool) -> Result<
     timer.lap("dedup");
     phase.rewind();
 
-    let relocated = if inline {
-        Vec::new()
+    let (relocated, dead_clicks) = if links.is_empty() {
+        (Vec::new(), None)
     } else {
-        let linked_events = live
-            .iter()
-            .map(|w| {
-                w.events[PARTITIONS..]
-                    .iter()
-                    .map(|b| b.len())
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let linked_clicks = live
-            .iter()
-            .map(|w| {
-                w.clicks[PARTITIONS..]
-                    .iter()
-                    .map(|b| b.len())
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let rows = rows::relocate(&live, &dead, &links, &phase, threads)?;
-        eprintln!("[relocate] bloom_events={linked_events} bloom_clicks={linked_clicks}");
+        let (rows, dc) = rows::relocate(&live, &dead, &links, &phase, &persistent, threads)?;
         timer.lap("relocate");
-        rows
+        (rows, Some(dc))
     };
     eprintln!(
         "[arena] links_scratch_bytes={link_scratch} token_bytes={token_bytes} token_and_dedup_bytes={token_and_dedup_bytes} token_loc_overflows={loc_overflows} records_bytes={} persistent_bytes={} relocated_bytes={}",
         records.used(), persistent.used(), phase.used()
     );
     group::run(
-        &ctx, &live, &dead, &relocated, &phase, out, ne_raw, threads, &mut timer,
+        &ctx,
+        &live,
+        &dead,
+        dead_clicks.as_ref(),
+        &relocated,
+        &phase,
+        out,
+        ne_raw,
+        threads,
+        &mut timer,
     )?;
     eprintln!("[arena] group_phase_high_water_bytes={}", phase.used());
     eprintln!("[ingest] path=proto-c");

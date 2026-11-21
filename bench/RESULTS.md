@@ -2,17 +2,17 @@
 
 ## Please submit
 
-- **Tag**: `candidate-13a` (HEAD on `main`, glibc bookworm) — **Prototype C (`src/proto_c/`) narrow deferred 10/8/16-byte packed-record fast path + airtight automatic fallback to `candidate-12c` (`u64`/`u128`/`generic.rs`/`slow.rs`)**.
-  - **What it changes vs `candidate-12c` (`fc40c43`)**:
-    1. Reversible 43-bit Feistel hash splits dense base-37 IDs across `p1=512`/`p2=256` partitions → **10 B `Tok10`**, **8 B `RecB8`**, **16 B `RecC`** in a single unified arena; 1.5 MiB Blocked Bloom defers link relocation and reuses `Tok` pages for relocation, grouping, and Parquet output (`relocate = 0` faults, `group+agg = 56` faults at 4 KiB!).
-    2. Conservative automatic fallback before creating output on any compact-limit violation (long/non-prefix/mixed-case IDs, `>256` categories, `>2048` campaigns, `>1M` links, unparseable ingest, window/ingest/bucket limits, or differing equal-ingest event ties → exact-order `slow::load`).
-  - **Docker `ss-test:c13a` (`--network none --read-only --user 1000:1000 --memory=8g`, `seed20-20m`, 8T on `0-3,8-11`)**:
-    - Default THP: **`Peak RSS = 516 MiB`** (`529,380 KiB`), `minflt = 113,493`, exact `MATCH`.
-    - Pure 4 KiB (`PROTO_C_PAGE_MODE=4k`): **`Peak RSS = 518 MiB`** (`530,524 KiB`, **−436 MiB vs `12b`**), **`minflt = 132,706`** (**−122k 4 KiB pages vs `12b`**), `user = 4.333 s`, `wall = 0.999 s`, exact `MATCH`.
-  - **11-point model prediction**: **`~0.54–0.59 s`** even with current untuned `4.33 s` user CPU (`−122k` pages × `2.22 µs` = `−271 ms` offset by `+1.3 s` user CPU = `+106 ms` → net `−165 ms` vs `12b`). Follow-up `13b` (cutting `4.33 → ~2.8 s` user CPU) projects **`~0.41–0.46 s`**.
-  - **Verification**: 60/60 release unit tests (**0 warnings**), 36/36 official fixtures, 32/32 adversarial suites, `dev` + 1M seeds + `seed20-20m` (Polars + PyArrow + DuckDB), forced `INGEST_GENERIC=1`, all four 60M datasets (`seed60-60m`, `seed60-longids`, `seed60-5kcat`, `seed60-90d`, all exact `MATCH` and strictly `< 7.5 GiB` RSS), and Docker `dev` + `seed20-20m` (default & 4k) exact `MATCH`.
+- **Tag**: `candidate-13b` (HEAD on `main`, glibc bookworm) — **Prototype C CPU & L2-cache overhaul on `candidate-13a` (`cd34094`) base** (`parse` −36% user, `cache-misses:u` −45%, Peak RSS −6 MiB to `512 MiB`).
+  - **What it changes vs `candidate-13a` (`cd34094`)**:
+    1. Removed `1.5 MiB` Bloom lookup from `parse`; halved event/click buckets `512 → 256`; shrank per-worker SWCBs `480 → 192 KiB` via typed `WriteLine<64>` (`RecB8`/`RecC`) + `WriteLine<320>` (`Tok10`); split cold `event_extras`; cached `Bucket.cur`.
+    2. Pre-permuted `Links` table (8-slot 64 B AVX2 cache-line probe, zero `restore_person`/`hash(raw)`/`hash(canon)` in `relocate`) + `DeadClicks` (0.6 MiB) + 8-wide prefetch moving only linked rows.
+  - **Measured A/B vs `candidate-13a` (`seed20-20m`, `4k` pages, 8T on `0-3,8-11`)**:
+    - Native `perf stat`: `parse user` `2.25–3.15 → 1.55 s` (**−31–51%**), `dedup user` `0.34 → 0.21 s` (**−38%**), `cycles:u` `18.0–22.0B → 14.7B` (**−20–33%**), `cache-misses:u` `99.6–110.3M → 56.5M` (**−45%**), Peak RSS `516–518 → 510–511 MiB`.
+    - Docker `ss-test:c13b` (`4k`): **`Peak RSS = 512 MiB`**, `minflt = 136,171`, `user = 3.448 s` (down from `4.333 s`, **−885 ms**), `dev` = `83 MiB` (`1,031` faults), exact `MATCH`.
+  - **11-point model prediction**: **`~0.47–0.52 s`** (vs `13a` predicted `0.54–0.59 s`; `−72 ms` from user CPU + −6 MiB RSS).
+  - **Verification**: 60/60 release unit tests (**0 warnings**), 36/36 official fixtures, 32/32 adversarial suites, `dev` + 1M + `seed20-20m` (Polars/PyArrow/DuckDB), `INGEST_GENERIC=1`, all four 60M datasets (`< 7.5 GiB` RSS), Docker `dev` + `seed20-20m` (default & `4k`) exact `MATCH`.
 
-- **Previous queued**: `candidate-12c` (`fc40c43`) — armed for 12:01 PM slot.
+- **Previous queued**: `candidate-13a` (`cd34094`, 12:01:55 PM), `candidate-12c` (`fc40c43`, ~12:16 PM).
 
 ## Official scores
 

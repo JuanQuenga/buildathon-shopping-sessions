@@ -426,6 +426,7 @@ pub fn run(
     ctx: &ParseRows,
     input: &[Rows<'_>],
     dead: &Dead<'_>,
+    dead_clicks: Option<&Dead<'_>>,
     relocated: &[Rows<'_>],
     region: &Region<'_>,
     output_dir: &Path,
@@ -447,9 +448,12 @@ pub fn run(
         if *count > 0 {
             click_cnt_part[q] = input
                 .iter()
-                .chain(relocated)
-                .map(|w| w.clicks[q].len())
-                .sum::<usize>();
+                .enumerate()
+                .map(|(tid, w)| {
+                    w.clicks[q].len() - dead_clicks.map_or(0, |dc| dc.count(tid, q))
+                })
+                .sum::<usize>()
+                + relocated.iter().map(|w| w.clicks[q].len()).sum::<usize>();
         }
     }
     let ne = ev_cnt_part.iter().sum::<usize>();
@@ -587,19 +591,33 @@ pub fn run(
                 w.cl_raw.clear();
                 w.ck_cnt.clear();
                 w.ck_cnt.resize(np, 0);
-                for rows in input.iter().chain(relocated) {
-                    for &r in rows.clicks[q].rows() {
-                        if let Some(id) = w.map.get(r.person()) {
-                            w.cl_raw.push((
-                                id,
-                                CompactClick {
-                                    ts: r.ts(),
-                                    campaign: r.campaign(),
-                                    cid: r.cid(),
-                                },
-                            ));
-                            w.ck_cnt[id as usize] += 1;
+                let mut visit_ck = |r: crate::proto_c::packed::RecC| {
+                    if let Some(id) = w.map.get(r.person()) {
+                        w.cl_raw.push((
+                            id,
+                            CompactClick {
+                                ts: r.ts(),
+                                campaign: r.campaign(),
+                                cid: r.cid(),
+                            },
+                        ));
+                        w.ck_cnt[id as usize] += 1;
+                    }
+                };
+                if let Some(dc) = dead_clicks {
+                    for (tid, rows) in input.iter().enumerate() {
+                        dc.for_live_clicks(rows, tid, q, &mut visit_ck);
+                    }
+                } else {
+                    for rows in input {
+                        for &r in rows.clicks[q].rows() {
+                            visit_ck(r);
                         }
+                    }
+                }
+                for rows in relocated {
+                    for &r in rows.clicks[q].rows() {
+                        visit_ck(r);
                     }
                 }
                 let ncl_raw = w.cl_raw.len();

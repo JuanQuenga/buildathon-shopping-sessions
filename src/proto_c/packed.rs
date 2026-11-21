@@ -24,8 +24,8 @@ const _: () = assert!(UPPER_EXTENT + SUB36[8] - 1 <= ID_MASK);
 // Odd multiplication modulo 2^43 and XOR right shifts are reversible.
 const H1: u64 = 0xd6e8_feb8_6659_fd93;
 const H2: u64 = 0xa5a3_564e_27f8_862d;
-const LOW_HASH_BITS: u32 = 64 - ID_BITS;
-const PERSON_BITS: u32 = ID_BITS - 8;
+pub const LOW_HASH_BITS: u32 = 64 - ID_BITS;
+pub const PERSON_BITS: u32 = ID_BITS - 8;
 pub const PERSON_MASK: u64 = (1 << PERSON_BITS) - 1;
 #[cfg(any(test, feature = "narrow"))]
 const TOKEN_BITS: u32 = ID_BITS - 9;
@@ -468,10 +468,10 @@ unsafe impl crate::proto_c::arena::StreamRecord for StoredTok {
     const FLUSH_ROWS: usize = if cfg!(feature = "narrow") { 32 } else { 16 };
 }
 unsafe impl crate::proto_c::arena::StreamRecord for StoredEvent {
-    const FLUSH_ROWS: usize = 16;
+    const FLUSH_ROWS: usize = if cfg!(feature = "narrow") { 8 } else { 16 };
 }
 unsafe impl crate::proto_c::arena::StreamRecord for RecC {
-    const FLUSH_ROWS: usize = 8;
+    const FLUSH_ROWS: usize = 4;
 }
 
 #[cfg(test)]

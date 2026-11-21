@@ -201,6 +201,7 @@ pub const BLOCK: usize = 1 << BLOCK_BITS;
 
 pub struct Bucket<'a, T: Copy, const SIZE: usize = BLOCK> {
     blocks: Vec<NonNull<T>>,
+    cur: *mut T,
     len: usize,
     initialized: usize,
     owner: PhantomData<&'a mut [T]>,
@@ -215,6 +216,7 @@ impl<T: Copy, const SIZE: usize> Default for Bucket<'_, T, SIZE> {
     fn default() -> Self {
         Self {
             blocks: Vec::new(),
+            cur: std::ptr::null_mut(),
             len: 0,
             initialized: 0,
             owner: PhantomData,
@@ -240,9 +242,8 @@ impl<'a, T: Copy, const SIZE: usize> Bucket<'a, T, SIZE> {
         if offset == 0 && !self.add_block(region) {
             return None;
         }
-        let block = unsafe { *self.blocks.last().unwrap_unchecked() };
-        self.len += 1;
-        Some((index, unsafe { block.as_ptr().add(offset) }))
+        self.len = index + 1;
+        Some((index, unsafe { self.cur.add(offset) }))
     }
 
     #[cold]
@@ -250,6 +251,7 @@ impl<'a, T: Copy, const SIZE: usize> Bucket<'a, T, SIZE> {
         let Some(block) = region.alloc(SIZE) else {
             return false;
         };
+        self.cur = block.as_ptr();
         self.blocks.push(block);
         true
     }
@@ -281,17 +283,17 @@ impl<'a, T: Copy, const SIZE: usize> Bucket<'a, T, SIZE> {
 }
 
 #[repr(align(64))]
-pub struct WriteLine([MaybeUninit<u8>; 320]);
+pub struct WriteLine<const BYTES: usize>([MaybeUninit<u8>; BYTES]);
 
-impl Default for WriteLine {
+impl<const BYTES: usize> Default for WriteLine<BYTES> {
     fn default() -> Self {
-        Self([MaybeUninit::uninit(); 320])
+        Self([MaybeUninit::uninit(); BYTES])
     }
 }
 
 /// # Safety
 /// T's representation must have no padding. FLUSH_ROWS must divide a
-/// bucket's block size and cover a multiple of 64 bytes, at most 320 bytes.
+/// bucket's block size and cover a multiple of 64 bytes.
 pub unsafe trait StreamRecord: Copy {
     const FLUSH_ROWS: usize;
 }
@@ -301,34 +303,34 @@ impl<'a, T: StreamRecord, const SIZE: usize> Bucket<'a, T, SIZE> {
     /// Each active bucket must have a line of its own from the first push
     /// through its final flush. The caller fences before handing it to readers.
     #[inline(always)]
-    pub unsafe fn push_staged(
+    pub unsafe fn push_staged<const BYTES: usize>(
         &mut self,
         region: &'a Region<'_>,
         value: T,
-        line: &mut WriteLine,
+        line: &mut WriteLine<BYTES>,
     ) -> Option<usize> {
         if !cfg!(feature = "swcb") {
             return self.push(region, value);
         }
         debug_assert_eq!(SIZE % T::FLUSH_ROWS, 0);
+        debug_assert_eq!(T::FLUSH_ROWS * size_of::<T>(), BYTES);
         let index = self.len;
         let in_block = index & (SIZE - 1);
         if in_block == 0 && !self.add_block(region) {
             return None;
         }
-        self.len += 1;
+        self.len = index + 1;
         let entry = index & (T::FLUSH_ROWS - 1);
         let data = line.0.as_mut_ptr().cast::<T>();
         unsafe { data.add(entry).write(value) };
         if entry + 1 == T::FLUSH_ROWS {
             use std::arch::x86_64::*;
-            let block = unsafe { self.blocks.last().unwrap_unchecked() };
-            let to = unsafe { block.as_ptr().add(in_block - entry) }.cast::<__m256i>();
+            let to = unsafe { self.cur.add(in_block - entry) }.cast::<__m256i>();
             let from = data.cast::<__m256i>();
-            for lane in 0..T::FLUSH_ROWS * size_of::<T>() / 32 {
+            for lane in 0..(BYTES / 32) {
                 unsafe { _mm256_stream_si256(to.add(lane), _mm256_load_si256(from.add(lane))) };
             }
-            self.initialized = self.len;
+            self.initialized = index + 1;
         }
         Some(index)
     }
@@ -336,13 +338,13 @@ impl<'a, T: StreamRecord, const SIZE: usize> Bucket<'a, T, SIZE> {
     /// # Safety
     /// line must be the same staging line used for every pending row, which
     /// has been filled with initialized T values.
-    pub unsafe fn finish_staged(&mut self, line: &WriteLine) {
+    pub unsafe fn finish_staged<const BYTES: usize>(&mut self, line: &WriteLine<BYTES>) {
         let remaining = self.len - self.initialized;
         if remaining == 0 {
             return;
         }
         let first = self.initialized & (SIZE - 1);
-        let dst = unsafe { self.blocks.last().unwrap_unchecked().as_ptr().add(first) };
+        let dst = unsafe { self.cur.add(first) };
         unsafe { std::ptr::copy_nonoverlapping(line.0.as_ptr().cast::<T>(), dst, remaining) };
         self.initialized = self.len;
     }
