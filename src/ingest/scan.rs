@@ -289,10 +289,9 @@ pub fn scanner() -> Scanner {
             && std::arch::is_x86_feature_detected!("avx512bw")
         {
             match std::env::var("INGEST_SCANNER").as_deref() {
-                Ok("avx2") => return Scanner::Avx2,
                 Ok("avx512") => return Scanner::Avx512Bw512,
-                _ if std::arch::is_x86_feature_detected!("avx512vl") => return Scanner::Avx512Vl256,
-                _ => return Scanner::Avx512Bw512,
+                Ok("avx512vl") if std::arch::is_x86_feature_detected!("avx512vl") => return Scanner::Avx512Vl256,
+                _ => return Scanner::Avx2,
             }
         }
         Scanner::Avx2

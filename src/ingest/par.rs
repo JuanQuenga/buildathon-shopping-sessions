@@ -378,19 +378,53 @@ pub fn is_file_cached(fd: i32, len: u64) -> Option<bool> {
     }
 }
 
+fn thp_mode(setting: &str) -> String {
+    std::fs::read_to_string(setting)
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .find_map(|mode| Some(mode.strip_prefix('[')?.strip_suffix(']')?.to_owned()))
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn thp_enabled() -> &'static str {
+    static ENABLED: OnceLock<String> = OnceLock::new();
+    ENABLED.get_or_init(|| thp_mode("/sys/kernel/mm/transparent_hugepage/enabled"))
+}
+
+fn sink_thp() -> bool {
+    static USE_THP: OnceLock<bool> = OnceLock::new();
+    *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => !matches!(thp_enabled(), "always" | "never") && probe_sink_thp(),
+    })
+}
+
+fn probe_sink_thp() -> bool {
+    let bytes = 8 * HUGE_PAGE_BYTES;
+    let Some((aligned, raw, len)) = map_aligned(bytes) else {
+        return false;
+    };
+    let fast = unsafe {
+        if madvise(aligned, bytes, 14) == 0 {
+            let start = Instant::now();
+            for offset in (0..bytes).step_by(HUGE_PAGE_BYTES) {
+                aligned.add(offset).write_volatile(1);
+            }
+            start.elapsed() < std::time::Duration::from_millis(8)
+        } else {
+            false
+        }
+    };
+    huge_free(raw, len);
+    fast
+}
+
 pub fn diagnose(threads: usize, cache: Option<bool>, prefetch: usize) {
     static REPORTED: Once = Once::new();
     REPORTED.call_once(|| {
-        fn thp_mode(setting: &str) -> String {
-            std::fs::read_to_string(setting)
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .find_map(|mode| Some(mode.strip_prefix('[')?.strip_suffix(']')?.to_owned()))
-                })
-                .unwrap_or_else(|| "unknown".to_owned())
-        }
-
         let cache = match cache {
             Some(true) => "warm",
             Some(false) => "cold",
@@ -398,9 +432,10 @@ pub fn diagnose(threads: usize, cache: Option<bool>, prefetch: usize) {
         };
         let scanner = scan::scanner().name();
         eprintln!(
-            "[diag] threads={threads} cache={cache} thp={}/{} scanner={scanner} prefetch={prefetch}",
-            thp_mode("/sys/kernel/mm/transparent_hugepage/enabled"),
+            "[diag] threads={threads} cache={cache} thp={}/{} scanner={scanner} prefetch={prefetch} sink_thp={}",
+            thp_enabled(),
             thp_mode("/sys/kernel/mm/transparent_hugepage/defrag"),
+            u8::from(sink_thp()),
         );
     });
 }
@@ -496,21 +531,32 @@ pub fn huge_alloc(bytes: usize) -> (*mut u8, *mut u8, usize) {
     huge_alloc_ex(bytes, true)
 }
 
-pub fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
-    const HP: usize = 2 << 20;
-    let len = bytes.div_ceil(HP) * HP + HP;
+const HUGE_PAGE_BYTES: usize = 2 << 20;
+
+fn map_aligned(bytes: usize) -> Option<(*mut u8, *mut u8, usize)> {
+    let hp = HUGE_PAGE_BYTES;
+    let len = bytes.div_ceil(hp) * hp + hp;
     unsafe {
-        let p = mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0);
-        assert!(p as isize != -1 && !p.is_null(), "mmap failed");
-        let a = ((p as usize + HP - 1) & !(HP - 1)) as *mut u8;
+        let raw = mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0);
+        if raw as isize == -1 || raw.is_null() {
+            return None;
+        }
+        let aligned = raw.add(raw.align_offset(hp));
+        Some((aligned, raw, len))
+    }
+}
+
+pub fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
+    let (a, p, len) = map_aligned(bytes).expect("mmap failed");
+    unsafe {
         if use_thp {
-            madvise(a, len - HP, 14);
+            madvise(a, len - HUGE_PAGE_BYTES, 14);
         }
         if std::env::var("INGEST_POPULATE").is_ok() {
-            madvise(a, len - HP, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
+            madvise(a, len - HUGE_PAGE_BYTES, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
         }
-        (a, p, len)
     }
+    (a, p, len)
 }
 
 pub fn huge_free(raw: *mut u8, len: usize) {
@@ -556,10 +602,7 @@ impl<T: Copy> Sinks<T> {
     pub fn new(parts: usize, cap: usize) -> Self {
         let pl = Self::per_line();
         let cap = cap.max(pl).div_ceil(pl) * pl;
-        // Skip MADV_HUGEPAGE on streaming Sinks by default: avoids synchronous THP compaction stalls
-        // when kernel defrag=[madvise], while 2M-aligned mmap still gets opportunistic THP under always.
-        let use_thp = std::env::var("INGEST_SINK_THP").is_ok();
-        let (a, p, l) = huge_alloc_ex(parts * cap * std::mem::size_of::<T>(), use_thp);
+        let (a, p, l) = huge_alloc_ex(parts * cap * std::mem::size_of::<T>(), sink_thp());
         Sinks {
             base: a as *mut T,
             raw: (p, l),
@@ -574,6 +617,12 @@ impl<T: Copy> Sinks<T> {
     /// copy it to the overflow vector.
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
+        self.push_idx(p, x);
+    }
+
+    /// Append and return the logical index, including records in overflow.
+    #[inline(always)]
+    pub fn push_idx(&mut self, p: usize, x: T) -> usize {
         let pl = Self::per_line();
         let l = unsafe { *self.len.get_unchecked(p) };
         let slot = l & (pl - 1);
@@ -584,6 +633,7 @@ impl<T: Copy> Sinks<T> {
         if (nl & (pl - 1)) == 0 {
             self.flush_full(p, nl, line_ptr);
         }
+        l
     }
 
     #[cold]
