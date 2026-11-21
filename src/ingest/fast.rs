@@ -86,12 +86,15 @@ struct RecC<K: Key> {
     campaign: u32,
 }
 
-struct Timer(Instant);
+struct Timer(Instant, f64);
 impl Timer {
     fn lap(&mut self, name: &str) {
         let now = Instant::now();
-        eprintln!("[ingest] {name:<12} {:.3}s", (now - self.0).as_secs_f64());
+        let main_cpu = par::thread_cpu();
+        let cpu = par::CPU_NS.swap(0, Ordering::Relaxed) as f64 * 1e-9 + (main_cpu - self.1);
+        eprintln!("[ingest] {name:<12} {:.3}s cpu {:.3}s", (now - self.0).as_secs_f64(), cpu);
         self.0 = now;
+        self.1 = par::thread_cpu();
     }
 }
 
@@ -134,7 +137,7 @@ struct Ctx {
 
 pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
     let threads = threads.clamp(1, MAX_THREADS);
-    let mut tm = Timer(Instant::now());
+    let mut tm = Timer(Instant::now(), par::thread_cpu());
     let (ws, we) = small::read_manifest(data_dir);
     let products = small::read_products(data_dir);
     let (campaigns, campaign_map) = small::read_campaigns(data_dir);
@@ -152,6 +155,20 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
         }
     }
     let handles: Vec<File> = files.iter().map(|f| File::open(&f.path).expect("open csv")).collect();
+    if std::env::var("INGEST_NO_PREFETCH").is_err() {
+        let mut order: Vec<(std::path::PathBuf, u64)> = Vec::new();
+        for f in files.iter().filter(|f| f.kind == Kind::Links).chain(files.iter().filter(|f| f.kind != Kind::Links)) {
+            order.push((f.path.clone(), f.len));
+        }
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            for (path, len) in order {
+                if let Ok(h) = File::open(&path) {
+                    par::fadvise_willneed(h.as_raw_fd(), len);
+                }
+            }
+        });
+    }
     let chunks = scan::plan(&files, CHUNK);
     let link_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
     // Largest files first is irrelevant (uniform chunks); keep file order.
@@ -269,6 +286,9 @@ fn run<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<Loaded, Need
 
     // ---------------- Event dedup ----------------
     let ne_raw: usize = (0..P1).map(|p| ev_sinks.iter().map(|s| s.count(p)).sum::<usize>()).sum();
+    if (0..P1).any(|p| ev_sinks.iter().any(|s| s.count(p) >= 1 << 27)) {
+        return Err(Need::Slow); // record index encoding limit (never near in practice)
+    }
     let cap_b = ne_raw * 5 / 4 / threads / P2 + 64;
     let b_sinks: Vec<Sinks<RecB<K>>> = par::run(
         threads,
@@ -816,6 +836,18 @@ pub fn bench_rows(path: &Path, data_dir: &Path) {
     let lo = data.iter().position(|&b| b == b'\n').unwrap() + 1;
     let mb = (hi - lo) as f64 / 1e6;
     let mut sinks: Sinks<RecA<u64>> = Sinks::new(P1, 4_000_000 / P1 * 2);
+    let mut pieces_g = Vec::new();
+    {
+        let mut st = lo;
+        while st < hi {
+            let mut e = (st + (1 << 20)).min(hi);
+            while e < hi && buf[e - 1] != b'\n' {
+                e += 1;
+            }
+            pieces_g.push((st, e));
+            st = e;
+        }
+    }
     for round in 0..2 {
         let mut line = String::new();
         let mut rows = 0usize;
@@ -825,7 +857,18 @@ pub fn bench_rows(path: &Path, data_dir: &Path) {
             }
             let t = par::thread_cpu();
             let mut acc = 0i64;
-            scan::scan::<7, _>(&buf, lo, hi, |b, f| {
+            let mut pieces = Vec::new();
+            let mut st = lo;
+            while st < hi {
+                let mut e = (st + (1 << 20)).min(hi);
+                while e < hi && buf[e - 1] != b'\n' {
+                    e += 1;
+                }
+                pieces.push((st, e));
+                st = e;
+            }
+            for &(plo, phi) in &pieces {
+            scan::scan::<7, _>(&buf, plo, phi, |b, f| {
                 rows += (stage == 0) as usize;
                 match stage {
                     0 => acc += f[1].0 as i64,
@@ -837,9 +880,33 @@ pub fn bench_rows(path: &Path, data_dir: &Path) {
                     }
                 }
             });
+            }
             let d = par::thread_cpu() - t;
             line += &format!(" s{stage} {:.1}ns/row ({:.0}MB/s){}", d * 1e9 / rows.max(1) as f64, mb / d, if acc == 1 { "!" } else { "" });
         }
+        let t = par::thread_cpu();
+        let mut x = 0u64;
+        for c in buf.chunks_exact(8) {
+            x = x.wrapping_add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let d = par::thread_cpu() - t;
+        let t2 = par::thread_cpu();
+        let mut y = 0u64;
+        for &(plo, phi) in pieces_g.iter() {
+            scan::scan::<7, _>(&buf, plo, phi, |_, f| y += f[1].0 as u64);
+        }
+        let d2 = par::thread_cpu() - t2;
+        let t3 = par::thread_cpu();
+        let mut z = 0u64;
+        let mut tmp = vec![0u8; 1 << 21];
+        for &(plo, phi) in pieces_g.iter() {
+            tmp[..phi - plo].copy_from_slice(&buf[plo..phi]);
+            for _ in 0..4 {
+                scan::scan::<7, _>(&tmp, 0, phi - plo, |_, f| z += f[1].0 as u64);
+            }
+        }
+        let d3 = par::thread_cpu() - t3;
+        line += &format!(" | sum {:.0}MB/s ({x}) scan-only {:.0}MB/s ({y}) scan-L2x4 {:.0}MB/s ({z})", mb / d, mb / d2, 4.0 * mb / d3);
         eprintln!("round {round} rows {rows}:{line}");
     }
 }

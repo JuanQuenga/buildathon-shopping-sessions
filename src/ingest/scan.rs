@@ -169,7 +169,7 @@ fn below(i: u32) -> u64 {
 /// bytes in the row equals 2 x (number of wrapped fields): then every quote is
 /// one of the wrapping pairs and no other quote exists anywhere.
 #[inline(always)]
-pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, mut f: F) {
+pub fn scan_ref<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, mut f: F) {
     if lo >= hi {
         return;
     }
@@ -219,6 +219,107 @@ pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: u
     }
 }
 
+#[derive(Default)]
+pub struct Scratch {
+    seps: Vec<u32>,
+    lfs: Vec<(u32, u32)>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Same contract as `scan_ref`, in two stages: (1) flatten all separator
+/// positions (commas and LFs) of the range with unconditional writes, and record
+/// for every LF the running quote count; (2) walk rows: a row is well-formed in
+/// count iff its N-th separator is its own LF.
+#[inline(always)]
+pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, f: F) {
+    SCRATCH.with(|s| scan_with::<N, F>(buf, lo, hi, &mut s.borrow_mut(), f))
+}
+
+#[inline(always)]
+pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    sc: &mut Scratch,
+    mut f: F,
+) {
+    if lo >= hi {
+        return;
+    }
+    assert!(buf.len() >= hi + PAD && N <= 15 && hi < u32::MAX as usize);
+    let ptr = buf.as_ptr();
+    let seps = &mut sc.seps;
+    let lfs = &mut sc.lfs;
+    seps.clear();
+    lfs.clear();
+    let mut qb = 0u32;
+    let mut base = lo;
+    let mut len = 0usize;
+    while base < hi {
+        if seps.capacity() < len + 72 {
+            unsafe { seps.set_len(len) };
+            seps.reserve(len + 72 + (hi - base) / 4);
+        }
+        let (sep, q, nl) = masks(unsafe { ptr.add(base) });
+        let valid = below((hi - base) as u32);
+        let mut m = sep & valid;
+        let q = q & valid;
+        let cnt = m.count_ones() as usize;
+        let out = unsafe { seps.as_mut_ptr().add(len) };
+        let b32 = base as u32;
+        let mut i = 0;
+        while i < cnt {
+            for k in 0..8 {
+                unsafe { *out.add(i + k) = b32.wrapping_add(m.trailing_zeros()) };
+                m &= m.wrapping_sub(1);
+            }
+            i += 8;
+        }
+        len += cnt;
+        let mut n = nl & valid;
+        while n != 0 {
+            let i = n.trailing_zeros();
+            lfs.push((b32 + i, qb + (q & below(i)).count_ones()));
+            n &= n - 1;
+        }
+        qb += q.count_ones();
+        base += 64;
+    }
+    unsafe { seps.set_len(len) };
+    let seps = &seps[..];
+    let mut k = 0usize;
+    let mut row_start = lo as u32;
+    let mut q_prev = 0u32;
+    for &(lf, qc) in lfs.iter() {
+        if k + N <= len && unsafe { *seps.get_unchecked(k + N - 1) } == lf {
+            let mut fields = [(0u32, 0u32); N];
+            let mut wrapped = 0u32;
+            let mut s = row_start;
+            for j in 0..N {
+                let e = unsafe { *seps.get_unchecked(k + j) };
+                let w = e >= s + 2 && unsafe { *ptr.add(s as usize) == b'"' && *ptr.add(e as usize - 1) == b'"' };
+                wrapped += w as u32;
+                fields[j] = (s + w as u32, e - w as u32);
+                s = e + 1;
+            }
+            if qc - q_prev == 2 * wrapped {
+                f(buf, &fields);
+            }
+            k += N;
+        } else {
+            while seps[k] != lf {
+                k += 1;
+            }
+            k += 1;
+        }
+        row_start = lf + 1;
+        q_prev = qc;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +331,39 @@ mod tests {
         scan::<N, _>(&buf, 0, hi, |b, f| out.push(f.iter().map(|&(s, e)| b[s as usize..e as usize].to_vec()).collect()));
         out
     }
+    #[test]
+    fn two_stage_matches_reference_random() {
+        let mut rng = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alpha = b"ab,\"\n \r";
+        for round in 0..300 {
+            let n = (next() % 3000) as usize;
+            let mut text: Vec<u8> = (0..n).map(|_| {
+                let r = next() % 100;
+                if r < 70 { b'x' } else { alpha[(next() % alpha.len() as u64) as usize] }
+            }).collect();
+            if round % 2 == 0 { text.push(b'\n'); }
+            let hi = match text.iter().rposition(|&b| b == b'\n') { Some(p) => p + 1, None => continue };
+            let mut buf = text.clone();
+            buf.resize(text.len() + PAD + 1, 0);
+            let lo = (next() % 3) as usize;
+            let lo = lo.min(hi);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan_ref::<3, _>(&buf, lo, hi, |_, f| a.push(*f));
+            scan::<3, _>(&buf, lo, hi, |_, f| b.push(*f));
+            assert_eq!(a, b);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan_ref::<1, _>(&buf, lo, hi, |_, f| a.push(*f));
+            scan::<1, _>(&buf, lo, hi, |_, f| b.push(*f));
+            assert_eq!(a, b);
+        }
+    }
+
     #[test]
     fn scanner_matches_csv_split() {
         let mut text = Vec::new();

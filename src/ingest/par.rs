@@ -1,5 +1,8 @@
 //! Minimal scoped work-stealing helpers (no external deps).
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Sum of worker-thread CPU nanoseconds spent inside `run` (for stage reports).
+pub static CPU_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Runs `ntasks` tasks over `threads` threads; each thread owns a state from
 /// `init(thread_index)`, and the states are returned in thread order.
@@ -15,6 +18,7 @@ where
             .map(|t| {
                 let (next, init, task) = (&next, &init, &task);
                 sc.spawn(move || {
+                    let c0 = thread_cpu();
                     let mut s = init(t);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -23,6 +27,7 @@ where
                         }
                         task(&mut s, i);
                     }
+                    CPU_NS.fetch_add(((thread_cpu() - c0) * 1e9) as u64, Ordering::Relaxed);
                     s
                 })
             })
@@ -66,11 +71,23 @@ pub fn thread_cpu() -> f64 {
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
+}
+
+/// Start asynchronous readahead of a whole file, in 64 MiB steps.
+pub fn fadvise_willneed(fd: i32, len: u64) {
+    let step = 64u64 << 20;
+    let mut off = 0;
+    while off < len {
+        unsafe { posix_fadvise(fd, off as i64, step.min(len - off) as i64, 3) };
+        off += step;
+    }
 }
 
 /// Anonymous memory region aligned to 2 MiB with MADV_HUGEPAGE (best effort).
-/// Never unmapped: the process exits without destructors.
-pub fn huge_alloc(bytes: usize) -> *mut u8 {
+/// Returns (aligned pointer, raw mapping pointer, raw length) for `huge_free`.
+pub fn huge_alloc(bytes: usize) -> (*mut u8, *mut u8, usize) {
     const HP: usize = 2 << 20;
     let len = bytes.div_ceil(HP) * HP + HP;
     unsafe {
@@ -78,14 +95,22 @@ pub fn huge_alloc(bytes: usize) -> *mut u8 {
         assert!(p as isize != -1 && !p.is_null(), "mmap failed");
         let a = ((p as usize + HP - 1) & !(HP - 1)) as *mut u8;
         madvise(a, len - HP, 14);
-        a
+        if std::env::var("INGEST_POPULATE").is_ok() {
+            madvise(a, len - HP, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
+        }
+        (a, p, len)
     }
+}
+
+pub fn huge_free(raw: *mut u8, len: usize) {
+    unsafe { munmap(raw, len) };
 }
 
 /// Fixed-capacity per-partition append regions inside one huge-page arena,
 /// with a heap overflow vector per partition.
 pub struct Sinks<T: Copy> {
     base: *mut T,
+    raw: (*mut u8, usize),
     cap: usize,
     pub len: Vec<usize>,
     pub over: Vec<Vec<T>>,
@@ -93,11 +118,17 @@ pub struct Sinks<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Sinks<T> {}
 unsafe impl<T: Copy + Sync> Sync for Sinks<T> {}
 
+impl<T: Copy> Drop for Sinks<T> {
+    fn drop(&mut self) {
+        huge_free(self.raw.0, self.raw.1);
+    }
+}
+
 impl<T: Copy> Sinks<T> {
     pub fn new(parts: usize, cap: usize) -> Self {
         let cap = cap.max(4);
-        let base = huge_alloc(parts * cap * std::mem::size_of::<T>()) as *mut T;
-        Sinks { base, cap, len: vec![0; parts], over: (0..parts).map(|_| Vec::new()).collect() }
+        let (a, p, l) = huge_alloc(parts * cap * std::mem::size_of::<T>());
+        Sinks { base: a as *mut T, raw: (p, l), cap, len: vec![0; parts], over: (0..parts).map(|_| Vec::new()).collect() }
     }
     /// Append with non-temporal 16-byte stores (no read-for-ownership).
     #[inline(always)]

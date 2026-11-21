@@ -26,7 +26,11 @@ fn main() {
     let loaded = ingest::load(&data_dir, threads);
     eprintln!("[main] ingest done {:.3}s", t0.elapsed().as_secs_f64());
     aggregate::run(loaded, &output_dir, threads);
-    eprintln!("[main] total {:.3}s", t0.elapsed().as_secs_f64());
+    let hwm = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string()))
+        .unwrap_or_default();
+    eprintln!("[main] total {:.3}s peak_rss_kb {hwm}", t0.elapsed().as_secs_f64());
     // Skip destructors of large buffers.
     std::process::exit(0);
 }
