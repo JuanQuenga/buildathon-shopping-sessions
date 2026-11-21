@@ -15,7 +15,7 @@ mkdir -p "$SCRATCH_ROOT"
 scratch=$(mktemp -d "$SCRATCH_ROOT/run.XXXXXX")
 cleanup() { rm -rf "$scratch" 2>/dev/null || true; }
 trap cleanup EXIT
-CPUS=${CPUS:-8}; MEM=${MEM:-24g}
+CPUS=${CPUS:-${NCPU:-8}}; MEM=${MEM:-24g}
 if [ -f "$cand" ] && [ -x "$cand" ]; then
   env -i PATH=/usr/bin:/bin DATA_DIR="$data" OUTPUT_DIR="$out" SCRATCH_DIR="$scratch" HOME="$scratch" \
       NCPU="$CPUS" MEM_GB="${MEM%g}" ${RUST_BACKTRACE:+RUST_BACKTRACE=$RUST_BACKTRACE} \

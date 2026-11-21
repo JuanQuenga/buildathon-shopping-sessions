@@ -11,7 +11,11 @@
 set -uo pipefail
 source "$(dirname "$0")/env.sh"
 cand=$1; nrand=${2:-2}
-if [ "$cand" = head ]; then cand=$("$ROOT/scripts/build_head.sh") || exit 1; fi
+if [ "$cand" = head ]; then
+  cand=$("$ROOT/scripts/build_head.sh") || exit 1
+elif [[ -f "$cand" && -x "$cand" ]]; then
+  cand=$(realpath -- "$cand") || exit 1
+fi
 declare -a matrix; rc=0
 record() { matrix+=("$(printf '%-6s %s' "$1" "$2")"); [ "$1" = PASS ] || rc=1; }
 log=$(mktemp "$SS_SCRATCH_ROOT/check_all.XXXXXX.log")
@@ -32,7 +36,7 @@ seeds=("$SS_DATA"/seed*-1m)
 for i in $(seq 1 "$nrand"); do
   s=$(( (RANDOM << 15 | RANDOM) + 1000 ))
   d="$SS_SCRATCH_ROOT/rand-seed$s"
-  "$GENERATE" --seed "$s" --events 1000000 --clicks 250000 --output "$d" --threads 8 >/dev/null && seeds+=("$d")
+  "$GENERATE" --seed "$s" --events 1000000 --clicks 250000 --output "$d" --threads "${NCPU:-8}" >/dev/null && seeds+=("$d")
 done
 for d in "${seeds[@]}"; do
   [ -d "$d" ] || continue

@@ -3,7 +3,7 @@
 //! well-formed rows' unquoted field ranges.
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::Path;
 
 pub const PAD: usize = 64;
 const TILE: usize = 24 * 1024;
@@ -16,9 +16,21 @@ pub enum Kind {
 }
 
 pub struct FileInfo {
-    pub path: PathBuf,
+    pub handle: File,
     pub len: u64,
     pub kind: Kind,
+}
+
+pub fn open_csv_files(data_dir: &Path) -> Vec<FileInfo> {
+    let mut files = Vec::new();
+    for (sub, kind) in [("events", Kind::Events), ("clicks", Kind::Clicks), ("links", Kind::Links)] {
+        for path in super::small::list_csv(data_dir, sub) {
+            let handle = File::open(&path).expect("open csv");
+            let len = handle.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(FileInfo { handle, len, kind });
+        }
+    }
+    files
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -246,28 +258,45 @@ pub struct Scratch {
     lfs16: Vec<(u16, u16)>,
 }
 
-#[cfg(target_arch = "x86_64")]
-static AVX512BW_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[derive(Clone, Copy)]
+pub enum Scanner {
+    Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512Bw512,
+    #[cfg(target_arch = "x86_64")]
+    Avx512Vl256,
+}
+
+impl Scanner {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Avx2 => "avx2",
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512Bw512 => "avx512bw512",
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512Vl256 => "avx512vl256",
+        }
+    }
+}
 
 #[inline(always)]
-fn has_avx512bw() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::sync::atomic::Ordering;
-        let s = AVX512BW_STATE.load(Ordering::Relaxed);
-        if s != 0 {
-            return s == 2;
-        }
-        let ok = std::arch::is_x86_feature_detected!("avx512bw")
+pub fn scanner() -> Scanner {
+    static SCANNER: std::sync::OnceLock<Scanner> = std::sync::OnceLock::new();
+    *SCANNER.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        if std::env::var_os("INGEST_NO_AVX512").is_none()
             && std::arch::is_x86_feature_detected!("avx512f")
-            && std::env::var("INGEST_NO_AVX512").is_err();
-        AVX512BW_STATE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
-        ok
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            match std::env::var("INGEST_SCANNER").as_deref() {
+                Ok("avx2") => return Scanner::Avx2,
+                Ok("avx512") => return Scanner::Avx512Bw512,
+                _ if std::arch::is_x86_feature_detected!("avx512vl") => return Scanner::Avx512Vl256,
+                _ => return Scanner::Avx512Bw512,
+            }
+        }
+        Scanner::Avx2
+    })
 }
 
 thread_local! {
@@ -293,7 +322,7 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
         return;
     }
     assert!(buf.len() >= hi + PAD && N <= 15 && hi < u32::MAX as usize);
-    let use_512 = has_avx512bw();
+    let scanner = scanner();
     let mut cur = lo;
     while cur < hi {
         let tile_end = if cur + TILE >= hi {
@@ -305,16 +334,12 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
             }
         };
         if tile_end - cur <= 65_000 {
-            #[cfg(target_arch = "x86_64")]
-            if use_512 {
-                unsafe { scan_tile_stage1_u16_avx512(buf, cur, tile_end, sc) };
-            } else {
-                scan_tile_stage1_u16_avx2(buf, cur, tile_end, sc);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                let _ = use_512;
-                scan_tile_stage1_u16_avx2(buf, cur, tile_end, sc);
+            match scanner {
+                Scanner::Avx2 => scan_tile_stage1_u16(buf, cur, tile_end, sc, masks),
+                #[cfg(target_arch = "x86_64")]
+                Scanner::Avx512Bw512 => unsafe { scan_tile_stage1_u16_avx512(buf, cur, tile_end, sc) },
+                #[cfg(target_arch = "x86_64")]
+                Scanner::Avx512Vl256 => unsafe { scan_tile_stage1_u16_avx512vl(buf, cur, tile_end, sc) },
             }
             scan_tile_stage2_u16::<N, F>(buf, cur, sc, &mut f);
         } else {
@@ -329,92 +354,61 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn scan_tile_stage1_u16_avx512(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
     use std::arch::x86_64::*;
-    let ptr = buf.as_ptr().add(lo);
-    let tile_len = hi - lo;
-    let seps = &mut sc.seps16;
-    let lfs = &mut sc.lfs16;
-    let need_seps = tile_len + 72;
-    if seps.capacity() < need_seps {
-        seps.clear();
-        seps.reserve(need_seps);
-    }
-    let need_lfs = tile_len + 64;
-    if lfs.capacity() < need_lfs {
-        lfs.clear();
-        lfs.reserve(need_lfs);
-    }
-    let sep_base = seps.as_mut_ptr();
-    let lf_base = lfs.as_mut_ptr();
-    let mut sep_len = 0usize;
-    let mut lf_len = 0usize;
-    let mut qb = 0u32;
     let comma = _mm512_set1_epi8(b',' as i8);
     let nl = _mm512_set1_epi8(b'\n' as i8);
     let qt = _mm512_set1_epi8(b'"' as i8);
-    let mut rel = 0usize;
-    while rel < tile_len {
-        let v = _mm512_loadu_si512(ptr.add(rel) as *const _);
+    scan_tile_stage1_u16(buf, lo, hi, sc, |ptr| {
+        let v = _mm512_loadu_si512(ptr.cast());
         let c = _mm512_cmpeq_epi8_mask(v, comma);
-        let nl_m = _mm512_cmpeq_epi8_mask(v, nl);
-        let q_m = _mm512_cmpeq_epi8_mask(v, qt);
-        let sep = c | nl_m;
-        let rem = tile_len - rel;
-        let (m, q, n) = if rem >= 64 {
-            (sep, q_m, nl_m)
-        } else {
-            let valid = below(rem as u32);
-            (sep & valid, q_m & valid, nl_m & valid)
-        };
-        let mut m0 = m as u32;
-        let mut m1 = (m >> 32) as u32;
-        let c0 = m0.count_ones() as usize;
-        let c1 = m1.count_ones() as usize;
-        let b0 = rel as u16;
-        let b1 = b0.wrapping_add(32);
-        let o0 = sep_base.add(sep_len);
-        let o1 = o0.add(c0);
-        for k in 0..4 {
-            *o0.add(k) = b0.wrapping_add(m0.trailing_zeros() as u16);
-            m0 &= m0.wrapping_sub(1);
-        }
-        if m0 != 0 {
-            let mut o = o0.add(4);
-            while m0 != 0 {
-                *o = b0.wrapping_add(m0.trailing_zeros() as u16);
-                o = o.add(1);
-                m0 &= m0.wrapping_sub(1);
-            }
-        }
-        for k in 0..4 {
-            *o1.add(k) = b1.wrapping_add(m1.trailing_zeros() as u16);
-            m1 &= m1.wrapping_sub(1);
-        }
-        if m1 != 0 {
-            let mut o = o1.add(4);
-            while m1 != 0 {
-                *o = b1.wrapping_add(m1.trailing_zeros() as u16);
-                o = o.add(1);
-                m1 &= m1.wrapping_sub(1);
-            }
-        }
-        sep_len += c0 + c1;
+        let n = _mm512_cmpeq_epi8_mask(v, nl);
+        let q = _mm512_cmpeq_epi8_mask(v, qt);
+        (c | n, q, n)
+    });
+}
 
-        let mut nm = n;
-        while nm != 0 {
-            let i = nm.trailing_zeros();
-            *lf_base.add(lf_len) = (b0 + i as u16, (qb + (q & below_lt64(i)).count_ones()) as u16);
-            lf_len += 1;
-            nm &= nm - 1;
-        }
-        qb += q.count_ones();
-        rel += 64;
-    }
-    seps.set_len(sep_len);
-    lfs.set_len(lf_len);
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn scan_tile_stage1_u16_avx512vl(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+    use std::arch::x86_64::*;
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let masks32 = |v: __m256i| {
+        let (c, n, q): (u32, u32, u32);
+        // Keep the byte compares in YMM registers. LLVM can otherwise widen
+        // two VL intrinsics into one ZMM compare when their masks are joined.
+        std::arch::asm!(
+            "vpcmpeqb {c}, {v}, {comma}",
+            "vpcmpeqb {n}, {v}, {nl}",
+            "vpcmpeqb {q}, {v}, {qt}",
+            v = in(ymm_reg) v,
+            comma = in(ymm_reg) comma,
+            nl = in(ymm_reg) nl,
+            qt = in(ymm_reg) qt,
+            c = lateout(kreg) c,
+            n = lateout(kreg) n,
+            q = lateout(kreg) q,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        (c, n, q)
+    };
+    scan_tile_stage1_u16(buf, lo, hi, sc, |ptr| {
+        let (c0, n0, q0) = masks32(_mm256_loadu_si256(ptr.cast()));
+        let (c1, n1, q1) = masks32(_mm256_loadu_si256(ptr.add(32).cast()));
+        let combine = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
+        let n = combine(n0, n1);
+        (combine(c0, c1) | n, combine(q0, q1), n)
+    });
 }
 
 #[inline(always)]
-fn scan_tile_stage1_u16_avx2(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+fn scan_tile_stage1_u16(
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    sc: &mut Scratch,
+    block_masks: impl Fn(*const u8) -> (u64, u64, u64),
+) {
     let ptr = unsafe { buf.as_ptr().add(lo) };
     let tile_len = hi - lo;
     let seps = &mut sc.seps16;
@@ -436,7 +430,7 @@ fn scan_tile_stage1_u16_avx2(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch)
     let mut qb = 0u32;
     let mut rel = 0usize;
     while rel < tile_len {
-        let (sep, q, nl) = masks(unsafe { ptr.add(rel) });
+        let (sep, q, nl) = block_masks(unsafe { ptr.add(rel) });
         let rem = tile_len - rel;
         let (m, q, n) = if rem >= 64 {
             (sep, q, nl)

@@ -26,6 +26,7 @@ fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
 }
 
 /// user_daily rows accumulated directly as PLAIN Parquet column page bodies.
+#[derive(Default)]
 pub struct UserCols {
     n: usize,
     ids: Vec<u8>,
@@ -64,9 +65,21 @@ impl UserCols {
         self.defs.clear();
         self.top.clear();
     }
+    fn sync_lens(&mut self) {
+        // Each push initialized all four fixed-width columns through row n.
+        unsafe {
+            self.day.set_len(self.n);
+            self.sessions.set_len(self.n);
+            self.events.set_len(self.n);
+            self.revenue.set_len(self.n);
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_fixed(&mut self) {
+        // Reserve may relocate existing entries, so expose all initialized rows first.
+        self.sync_lens();
         let extra = self.n.max(4096);
         self.day.reserve(extra);
         let target = self.day.capacity();
@@ -109,11 +122,6 @@ impl UserCols {
             self.sessions.as_mut_ptr().add(n).write(sessions as i64);
             self.events.as_mut_ptr().add(n).write(events as i64);
             self.revenue.as_mut_ptr().add(n).write(revenue);
-            let n1 = n + 1;
-            self.day.set_len(n1);
-            self.sessions.set_len(n1);
-            self.events.set_len(n1);
-            self.revenue.set_len(n1);
 
             let di = n >> 3;
             if n & 7 == 0 {
@@ -170,11 +178,17 @@ impl<'a> UserWriter<'a> {
             return;
         }
         let path = self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq));
-        write_user_cols_to(&path, &self.cols).expect("writing user_daily part");
+        write_user_cols_to(&path, &mut self.cols).expect("writing user_daily part");
         self.total_written += self.cols.len();
         self.seq += 1;
         self.cols.clear();
     }
+    /// Release completed column buffers on the thread that wrote the parts.
+    pub fn release_buffers(&mut self) {
+        debug_assert_eq!(self.cols.len(), 0);
+        drop(std::mem::take(&mut self.cols));
+    }
+
     pub fn finish(&mut self) -> usize {
         if self.cols.len() > 0 {
             let path = if self.seq == 0 {
@@ -182,7 +196,7 @@ impl<'a> UserWriter<'a> {
             } else {
                 self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq))
             };
-            write_user_cols_to(&path, &self.cols).expect("writing user_daily");
+            write_user_cols_to(&path, &mut self.cols).expect("writing user_daily");
             self.total_written += self.cols.len();
             self.seq += 1;
             self.cols.clear();
@@ -193,13 +207,13 @@ impl<'a> UserWriter<'a> {
 
 /// Writes a single clean 0-row `part-0.parquet` when no worker emitted any `user_daily` rows.
 pub fn write_empty_user(dir: &Path) -> io::Result<()> {
-    let empty = UserCols::with_capacity(0);
-    write_user_cols_to(&dir.join("part-0.parquet"), &empty)
+    write_user_cols_to(&dir.join("part-0.parquet"), &mut UserCols::default())
 }
 
 /// Writes column buffers to an explicit Parquet file path.
-pub fn write_user_cols_to(path: &Path, c: &UserCols) -> io::Result<()> {
+fn write_user_cols_to(path: &Path, c: &mut UserCols) -> io::Result<()> {
     use parquet::{Column, Kind};
+    c.sync_lens();
     let prefix = parquet::def_levels_prefix(c.n);
     let cols = [
         Column {
@@ -381,4 +395,30 @@ pub fn write(tables: &Tables, loaded: &Loaded, out: &Path, threads: usize) -> io
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserCols;
+
+    #[test]
+    fn fixed_columns_keep_initialized_rows_when_growing() {
+        let mut cols = UserCols::with_capacity(1);
+        cols.push(b"first", 10, 2, 3, 40, Some(b"cat"));
+        // The next row grows the fixed columns while their Vec lengths are stale.
+        cols.push(b"second", 11, 5, 6, 70, None);
+        cols.sync_lens();
+        assert_eq!(cols.day, [10, 11]);
+        assert_eq!(cols.sessions, [2, 5]);
+        assert_eq!(cols.events, [3, 6]);
+        assert_eq!(cols.revenue, [40, 70]);
+
+        cols.clear();
+        cols.push(b"third", 12, 8, 9, 100, None);
+        cols.sync_lens();
+        assert_eq!(cols.day, [12]);
+        assert_eq!(cols.sessions, [8]);
+        assert_eq!(cols.events, [9]);
+        assert_eq!(cols.revenue, [100]);
+    }
 }

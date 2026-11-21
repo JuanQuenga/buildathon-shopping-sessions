@@ -20,14 +20,13 @@
 //!                    `b_parts[q]` and `ck_parts[q]`, sorts events/clicks, sessionizes/attributes/
 //!                    computes interval-union assists in `i64` ms, streams directly to `UserWriter`
 //!                    and merges `CampStore`s into `campaign_daily`.
-use super::par::{self, SlabBuf, SyncPtr};
+use super::par::{self, SlabBuf, SyncPtr, Timer};
 use super::scan::{self, Chunk, FileInfo, Kind};
 use super::tsfast::{self, DateTable};
 use super::{slow, small, ts};
 use crate::aggregate::{self, output, CampStore, GAP_MS, NO_CATEGORY, WIN_MS};
-use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -37,18 +36,6 @@ const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
 const MAX_THREADS: usize = 32;
-
-struct Timer(Instant, f64);
-impl Timer {
-    fn lap(&mut self, name: &str) {
-        let now = Instant::now();
-        let main_cpu = par::thread_cpu();
-        let cpu = par::CPU_NS.swap(0, Ordering::Relaxed) as f64 * 1e-9 + (main_cpu - self.1);
-        eprintln!("[generic] {name:<12} {:.3}s cpu {:.3}s", (now - self.0).as_secs_f64(), cpu);
-        self.0 = now;
-        self.1 = par::thread_cpu();
-    }
-}
 
 #[inline(always)]
 fn mix64(mut x: u64) -> u64 {
@@ -191,7 +178,7 @@ impl GenericLinks {
         GenericLinks { has_links: false, parts: Vec::new() }
     }
 
-    fn build(files: &[FileInfo], handles: &[File], link_chunks: &[Chunk], threads: usize, tm: &mut Timer) -> Self {
+    fn build(files: &[FileInfo], link_chunks: &[Chunk], threads: usize, tm: &mut Timer) -> Self {
         if link_chunks.is_empty() {
             tm.lap("links");
             return Self::empty();
@@ -210,7 +197,7 @@ impl GenericLinks {
                 let c = link_chunks[i];
                 let fi = &files[c.file as usize];
                 let mut buf = std::mem::take(&mut st.buf);
-                let (lo, hi) = scan::read_chunk(&handles[c.file as usize], fi.len, c, &mut buf);
+                let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, &mut buf);
                 if lo < hi {
                     scan::scan::<2, _>(&buf, lo, hi, |b, f| {
                         let la = flen(f[0]);
@@ -643,83 +630,18 @@ fn transpose_slabs(by_thread: Vec<Vec<SlabBuf>>, nparts: usize) -> Vec<Mutex<Vec
     out.into_iter().map(Mutex::new).collect()
 }
 
-struct PrefetchGuard(Arc<AtomicBool>);
-impl Drop for PrefetchGuard {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// Parallel, memory-bounded generic pipeline: CSVs -> Parquet directly.
 pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
     let threads = threads.clamp(1, MAX_THREADS);
-    let mut tm = Timer(Instant::now(), par::thread_cpu());
+    let mut tm = Timer::new("generic");
 
     // ---------------- Stage 0: small metadata + prefetch ----------------
     let (ws, we) = small::read_manifest(data_dir);
     let (categories, _, prod) = small::read_products_lookup(data_dir);
     let (campaigns, camp) = small::read_campaigns_lookup(data_dir);
     let dt = DateTable::build(ws, we);
-    let mut files: Vec<FileInfo> = Vec::new();
-    for (sub, kind) in [("events", Kind::Events), ("clicks", Kind::Clicks), ("links", Kind::Links)] {
-        for p in small::list_csv(data_dir, sub) {
-            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            files.push(FileInfo { path: p, len, kind });
-        }
-    }
-    let handles: Vec<File> = files.iter().map(|f| File::open(&f.path).expect("open csv")).collect();
-    let pref_stop = Arc::new(AtomicBool::new(false));
-    let _pref_guard = PrefetchGuard(Arc::clone(&pref_stop));
-    if std::env::var("INGEST_NO_PREFETCH").is_err() {
-        let mut segs: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
-        let seg_sz: u64 = 16 << 20;
-        for kind in [Kind::Links, Kind::Events, Kind::Clicks] {
-            for f in files.iter().filter(|f| f.kind == kind) {
-                let mut off = 0u64;
-                while off < f.len {
-                    let len = seg_sz.min(f.len - off);
-                    segs.push((f.path.clone(), off, len));
-                    off += len;
-                }
-            }
-        }
-        let n_pref = segs.len().min(4);
-        if n_pref > 0 {
-            let segs = Arc::new(segs);
-            let next = Arc::new(AtomicUsize::new(0));
-            for _ in 0..n_pref {
-                let segs = Arc::clone(&segs);
-                let next = Arc::clone(&next);
-                let stop = Arc::clone(&pref_stop);
-                std::thread::spawn(move || {
-                    use std::os::fd::AsRawFd;
-                    let mut cached: Option<(std::path::PathBuf, File)> = None;
-                    loop {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= segs.len() {
-                            break;
-                        }
-                        let (ref path, off, len) = segs[i];
-                        let fd = match cached.as_ref() {
-                            Some((p, h)) if p == path => h.as_raw_fd(),
-                            _ => match File::open(path) {
-                                Ok(h) => {
-                                    let fd = h.as_raw_fd();
-                                    cached = Some((path.clone(), h));
-                                    fd
-                                }
-                                Err(_) => continue,
-                            },
-                        };
-                        par::fadvise_range(fd, off, len);
-                    }
-                });
-            }
-        }
-    }
+    let files = Arc::new(scan::open_csv_files(data_dir));
+    let mut prefetch = par::Prefetch::start(&files, threads);
     let chunks = scan::plan(&files, CHUNK);
     let link_chunks: Vec<Chunk> = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
     let event_chunks: Vec<Chunk> = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Events).collect();
@@ -729,7 +651,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
     tm.lap("small");
 
     // ---------------- Stage 1: Links ----------------
-    let links = GenericLinks::build(&files, &handles, &link_chunks, threads, &mut tm);
+    let links = GenericLinks::build(&files, &link_chunks, threads, &mut tm);
 
     // ---------------- Stage 2: Events parse ONLY -> P1 SlabBufs ----------------
     let est_ev = (event_bytes / 75) as usize + 1024;
@@ -748,7 +670,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
         |(parts, buf), i| {
             let c = event_chunks[i];
             let fi = &files[c.file as usize];
-            let (lo, hi) = scan::read_chunk(&handles[c.file as usize], fi.len, c, buf);
+            let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
             if lo < hi {
                 scan::scan::<7, _>(buf, lo, hi, |b, f| {
                     let eid_len = flen(f[0]);
@@ -1099,7 +1021,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
         |(parts, buf), i| {
             let c = click_chunks[i];
             let fi = &files[c.file as usize];
-            let (lo, hi) = scan::read_chunk(&handles[c.file as usize], fi.len, c, buf);
+            let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
             if lo < hi {
                 #[derive(Clone, Copy)]
                 struct PendingCk {
@@ -1182,7 +1104,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
     .into_iter()
     .map(|x| x.0)
     .collect();
-    pref_stop.store(true, Ordering::Relaxed);
+    prefetch.stop();
     drop(links);
     let ck_by_part = transpose_slabs(ck_by_thread, p2);
     tm.lap("ck-parse");
@@ -1818,6 +1740,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
     tm.lap("group+agg");
     let t_cw = Instant::now();
     output::write_campaign_raw(&cd, &camp_rows, &campaigns).expect("writing campaign_daily");
+    tm.lap("campaign-write");
     eprintln!(
         "[stage] campaign_write {:.3}s (user rows {user_rows_written}, campaign rows {})",
         t_cw.elapsed().as_secs_f64(),

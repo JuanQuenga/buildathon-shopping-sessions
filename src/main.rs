@@ -30,7 +30,7 @@ fn main() {
         .unwrap_or_default();
     let hwm_mb: u64 = hwm.parse::<u64>().unwrap_or(0) / 1024;
     eprintln!("[stage] peak_rss_mb={hwm_mb}");
-    eprintln!("[main] total {:.3}s peak_rss_kb {hwm}", t0.elapsed().as_secs_f64());
-    // Skip destructors of large buffers.
-    std::process::exit(0);
+    let (user, sys, minflt) = ingest::par::rusage_self();
+    let wall = t0.elapsed().as_secs_f64();
+    eprintln!("[main] total wall={wall:.6}s user={user:.6}s sys={sys:.6}s minflt={minflt} peak_rss_kb={hwm}");
 }

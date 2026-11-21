@@ -1,10 +1,11 @@
 //! Minimal persistent worker-pool work-stealing helpers and software write-combining sinks (no external deps).
+use super::scan::{self, FileInfo, Kind};
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
-
-/// Sum of worker-thread CPU nanoseconds spent inside `run` (for stage reports).
-pub static CPU_NS: AtomicU64 = AtomicU64::new(0);
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// Persistent spin-then-park worker pool: calling thread runs worker 0, background threads run
 /// workers `1..threads`. Eliminates 11x OS thread spawn/join (`clone3` + stack mmap) per run!
@@ -160,7 +161,6 @@ where
         F: Fn(&mut S) + Sync,
     {
         let ctx = unsafe { &*(raw as *const Ctx<'_, S, I, T, F>) };
-        let c0 = thread_cpu();
         let mut s = (ctx.init)(tid);
         loop {
             let i = ctx.next.fetch_add(1, Ordering::Relaxed);
@@ -170,9 +170,6 @@ where
             (ctx.task)(&mut s, i);
         }
         (ctx.fini)(&mut s);
-        if tid != 0 {
-            CPU_NS.fetch_add(((thread_cpu() - c0) * 1e9) as u64, Ordering::Relaxed);
-        }
         unsafe { (*ctx.out_ptr.add(tid)).write(s) };
     }
 
@@ -199,7 +196,7 @@ where
         shared.cv.notify_all();
     }
 
-    // Calling thread runs worker 0 directly (zero wake latency; its CPU is accounted by Timer).
+    // Calling thread runs worker 0 directly.
     tramp::<S, I, T, F>(job.data, 0);
 
     // Wait for ALL spawned background workers before releasing stack `job`/`ctx`.
@@ -230,7 +227,6 @@ where
             .map(|t| {
                 let (next, init, task, fini) = (&next, &init, &task, &fini);
                 sc.spawn(move || {
-                    let c0 = thread_cpu();
                     let mut s = init(t);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -240,13 +236,21 @@ where
                         task(&mut s, i);
                     }
                     fini(&mut s);
-                    CPU_NS.fetch_add(((thread_cpu() - c0) * 1e9) as u64, Ordering::Relaxed);
                     s
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// Drop one item per task so independent arenas are unmapped concurrently.
+pub fn drop_par<T: Send>(threads: usize, items: Vec<T>) {
+    let items: Vec<_> = items.into_iter().map(|item| Mutex::new(Some(item))).collect();
+    run(threads, items.len(), |_| (), |_, i| {
+        let item = items[i].lock().unwrap().take();
+        drop(item);
+    });
 }
 
 /// Raw pointer that may be shared across threads for disjoint writes.
@@ -282,6 +286,193 @@ pub fn thread_cpu() -> f64 {
     let mut t = Timespec { sec: 0, nsec: 0 };
     unsafe { clock_gettime(3, &mut t) }; // CLOCK_THREAD_CPUTIME_ID
     t.sec as f64 + t.nsec as f64 * 1e-9
+}
+
+#[repr(C)]
+struct Timeval {
+    sec: std::ffi::c_long,
+    usec: std::ffi::c_long,
+}
+
+impl Timeval {
+    fn seconds(&self) -> f64 {
+        self.sec as f64 + self.usec as f64 * 1e-6
+    }
+}
+
+#[repr(C)]
+struct Rusage {
+    utime: Timeval,
+    stime: Timeval,
+    maxrss: std::ffi::c_long,
+    ixrss: std::ffi::c_long,
+    idrss: std::ffi::c_long,
+    isrss: std::ffi::c_long,
+    minflt: std::ffi::c_long,
+    rest: [std::ffi::c_long; 9], // Linux struct rusage fields after ru_minflt
+}
+
+extern "C" {
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+}
+
+/// Whole-process user seconds, system seconds and minor faults, including workers.
+pub fn rusage_self() -> (f64, f64, i64) {
+    let mut usage = MaybeUninit::<Rusage>::uninit();
+    // RUSAGE_SELF includes all threads on Linux.
+    assert_eq!(unsafe { getrusage(0, usage.as_mut_ptr()) }, 0);
+    let usage = unsafe { usage.assume_init() };
+    (usage.utime.seconds(), usage.stime.seconds(), usage.minflt)
+}
+
+pub struct Timer {
+    prefix: &'static str,
+    wall: Instant,
+    usage: (f64, f64, i64),
+}
+
+impl Timer {
+    pub fn new(prefix: &'static str) -> Self {
+        Self { prefix, wall: Instant::now(), usage: rusage_self() }
+    }
+
+    pub fn lap(&mut self, name: &str) {
+        let now = Instant::now();
+        let (user, sys, minflt) = rusage_self();
+        let wall = (now - self.wall).as_secs_f64();
+        let du = user - self.usage.0;
+        let ds = sys - self.usage.1;
+        let df = minflt - self.usage.2;
+        eprintln!("[{}] {name:<12} wall={wall:.6}s user={du:.6}s sys={ds:.6}s minflt={df}", self.prefix);
+        self.wall = now;
+        self.usage = (user, sys, minflt);
+    }
+}
+
+#[repr(C)]
+struct Iovec {
+    base: *mut u8,
+    len: usize,
+}
+
+extern "C" {
+    fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
+}
+
+/// Sample the first 256 KiB without waiting for disk I/O. Some filesystems
+/// don't implement RWF_NOWAIT, so an inconclusive probe leaves prefetch enabled.
+pub fn is_file_cached(fd: i32, len: u64) -> Option<bool> {
+    const SYS_PREADV2: std::ffi::c_long = 327; // Linux x86-64
+    const RWF_NOWAIT: i32 = 0x8;
+    const SAMPLE: usize = 256 << 10;
+    let mut buf = MaybeUninit::<[u8; SAMPLE]>::uninit();
+    let iov = Iovec { base: buf.as_mut_ptr().cast(), len: len.min(SAMPLE as u64) as usize };
+    // preadv2 takes the low and high offset words as separate syscall arguments.
+    let ret = unsafe { syscall(SYS_PREADV2, fd, &iov as *const Iovec, 1usize, 0usize, 0usize, RWF_NOWAIT) };
+    if ret > 0 {
+        Some(true)
+    } else if ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub fn diagnose(threads: usize, cache: Option<bool>, prefetch: usize) {
+    static REPORTED: Once = Once::new();
+    REPORTED.call_once(|| {
+        fn thp_mode(setting: &str) -> String {
+            std::fs::read_to_string(setting)
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .find_map(|mode| Some(mode.strip_prefix('[')?.strip_suffix(']')?.to_owned()))
+                })
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+
+        let cache = match cache {
+            Some(true) => "warm",
+            Some(false) => "cold",
+            None => "unknown",
+        };
+        let scanner = scan::scanner().name();
+        eprintln!(
+            "[diag] threads={threads} cache={cache} thp={}/{} scanner={scanner} prefetch={prefetch}",
+            thp_mode("/sys/kernel/mm/transparent_hugepage/enabled"),
+            thp_mode("/sys/kernel/mm/transparent_hugepage/defrag"),
+        );
+    });
+}
+
+pub struct Prefetch {
+    stop: Option<Arc<AtomicBool>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl Prefetch {
+    pub fn start(files: &Arc<Vec<FileInfo>>, threads: usize) -> Self {
+        let cache = files.iter().filter(|f| f.kind == Kind::Events && f.len != 0)
+            .max_by_key(|f| f.len)
+            .and_then(|f| is_file_cached(f.handle.as_raw_fd(), f.len));
+        let limit = if std::env::var_os("INGEST_NO_PREFETCH").is_some() {
+            0
+        } else if let Ok(n) = std::env::var("INGEST_PREFETCH").unwrap_or_default().parse::<usize>() {
+            n.min(8)
+        } else if cache == Some(true) {
+            0
+        } else {
+            4
+        };
+
+        let mut segments = Vec::new();
+        if limit > 0 {
+            const SEGMENT: u64 = 16 << 20;
+            for kind in [Kind::Links, Kind::Events, Kind::Clicks] {
+                for (i, file) in files.iter().enumerate().filter(|(_, f)| f.kind == kind) {
+                    for offset in (0..file.len).step_by(SEGMENT as usize) {
+                        segments.push((i, offset, SEGMENT.min(file.len - offset)));
+                    }
+                }
+            }
+        }
+        let count = limit.min(segments.len());
+        diagnose(threads, cache, count);
+        if count == 0 {
+            return Self { stop: None, workers: Vec::new() };
+        }
+        let segments = Arc::new(segments);
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicUsize::new(0));
+        let workers = (0..count)
+            .map(|_| {
+                let (files, segments, stop, next) = (files.clone(), segments.clone(), stop.clone(), next.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(file, offset, len)) = segments.get(i) else { break };
+                        fadvise_range(files[file].handle.as_raw_fd(), offset, len);
+                    }
+                })
+            })
+            .collect();
+        Self { stop: Some(stop), workers }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Relaxed);
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 extern "C" {
@@ -326,32 +517,16 @@ pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
 }
 
-/// Map a read-only file with `MADV_SEQUENTIAL` for zero-copy scanning.
-pub fn mmap_ro(fd: i32, len: usize) -> Option<*const u8> {
-    if len == 0 {
-        return None;
-    }
-    unsafe {
-        let p = mmap(std::ptr::null_mut(), len, 1, 2, fd, 0); // PROT_READ=1, MAP_PRIVATE=2
-        if p as isize == -1 || p.is_null() {
-            return None;
-        }
-        madvise(p, len, 2); // MADV_SEQUENTIAL=2
-        Some(p as *const u8)
-    }
-}
-
-/// One 256-byte (4 cache lines) cache-line-aligned software write-combining buffer slot.
-/// Flushing 256 bytes at a time (8x 32B RecA, 16x 16B RecB) keeps the flush branch
-/// highly predictable (>87.5% / >93.75% not-taken) and cuts dTLB touches by 8x-16x.
-const SWCB_BYTES: usize = 256;
+/// Software write-combining buffer size per partition. Two cache lines keep
+/// the combined buffer footprint down with two parse workers sharing L2.
+const SWCB_BYTES: usize = 128;
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct SwcbLine([u8; SWCB_BYTES]);
 
 /// Fixed-capacity per-partition append regions inside one huge-page arena,
-/// fronted by L2-resident 256-byte software write-combining buffers (SWCBs)
-/// that emit 4 full cache lines of non-temporal stores (8x `_mm256_stream_si256`).
+/// fronted by L2-resident software write-combining buffers (SWCBs) that emit
+/// full cache lines of non-temporal stores.
 pub struct Sinks<T: Copy> {
     base: *mut T,
     raw: (*mut u8, usize),
@@ -395,8 +570,8 @@ impl<T: Copy> Sinks<T> {
         }
     }
 
-    /// Append one item into partition `p`'s 256-byte SWCB; when full, stream all
-    /// 4 cache lines non-temporally to the arena (or overflow vector).
+    /// Append to partition `p`'s SWCB. When full, stream it to the arena or
+    /// copy it to the overflow vector.
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
         let pl = Self::per_line();

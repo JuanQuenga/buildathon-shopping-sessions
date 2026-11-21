@@ -42,11 +42,13 @@ pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) {
         return;
     }
     let loaded = if slow_forced {
+        par::diagnose(threads, None, 0);
         slow::load(data_dir)
     } else {
         match fast::load(data_dir, threads) {
             Some(l) => l,
             None => {
+                par::diagnose(threads, None, 0);
                 eprintln!("[ingest] fast path not applicable (long id): using generic path");
                 slow::load(data_dir)
             }
