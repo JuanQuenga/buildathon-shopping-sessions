@@ -102,7 +102,15 @@ impl UserCols {
         self.n >= MAX_ROWS || self.ids.len() >= MAX_COL_BYTES || self.top.len() >= MAX_COL_BYTES
     }
     #[inline(always)]
-    pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+    pub fn push(
+        &mut self,
+        id: &[u8],
+        day: i32,
+        sessions: u32,
+        events: u32,
+        revenue: i64,
+        top: Option<&[u8]>,
+    ) {
         let n = self.n;
         if n == self.day.capacity() {
             self.grow_fixed();
@@ -152,6 +160,7 @@ pub struct UserWriter<'a> {
     worker: usize,
     seq: usize,
     pub cols: UserCols,
+    file: FileBuilder,
     pub total_written: usize,
 }
 
@@ -162,11 +171,20 @@ impl<'a> UserWriter<'a> {
             worker,
             seq: 0,
             cols: UserCols::with_capacity(est_rows),
+            file: FileBuilder::default(),
             total_written: 0,
         }
     }
     #[inline(always)]
-    pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+    pub fn push(
+        &mut self,
+        id: &[u8],
+        day: i32,
+        sessions: u32,
+        events: u32,
+        revenue: i64,
+        top: Option<&[u8]>,
+    ) {
         self.cols.push(id, day, sessions, events, revenue, top);
         if self.cols.needs_flush() {
             self.flush_part();
@@ -177,8 +195,10 @@ impl<'a> UserWriter<'a> {
         if self.cols.len() == 0 {
             return;
         }
-        let path = self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq));
-        write_user_cols_to(&path, &mut self.cols).expect("writing user_daily part");
+        let path = self
+            .dir
+            .join(format!("part-{}-{}.parquet", self.worker, self.seq));
+        write_user_cols_to(&path, &mut self.cols, &mut self.file).expect("writing user_daily part");
         self.total_written += self.cols.len();
         self.seq += 1;
         self.cols.clear();
@@ -186,7 +206,7 @@ impl<'a> UserWriter<'a> {
     /// Release completed column buffers on the thread that wrote the parts.
     pub fn release_buffers(&mut self) {
         debug_assert_eq!(self.cols.len(), 0);
-        drop(std::mem::take(&mut self.cols));
+        self.cols = UserCols::default();
     }
 
     pub fn finish(&mut self) -> usize {
@@ -194,121 +214,108 @@ impl<'a> UserWriter<'a> {
             let path = if self.seq == 0 {
                 self.dir.join(format!("part-{}.parquet", self.worker))
             } else {
-                self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq))
+                self.dir
+                    .join(format!("part-{}-{}.parquet", self.worker, self.seq))
             };
-            write_user_cols_to(&path, &mut self.cols).expect("writing user_daily");
+            write_user_cols_to(&path, &mut self.cols, &mut self.file).expect("writing user_daily");
             self.total_written += self.cols.len();
             self.seq += 1;
             self.cols.clear();
         }
+        self.file = FileBuilder::default();
         self.total_written
     }
 }
 
 /// Writes a single clean 0-row `part-0.parquet` when no worker emitted any `user_daily` rows.
 pub fn write_empty_user(dir: &Path) -> io::Result<()> {
-    write_user_cols_to(&dir.join("part-0.parquet"), &mut UserCols::default())
+    write_user_cols_to(
+        &dir.join("part-0.parquet"),
+        &mut UserCols::default(),
+        &mut FileBuilder::default(),
+    )
 }
 
-/// Writes column buffers to an explicit Parquet file path.
-fn write_user_cols_to(path: &Path, c: &mut UserCols) -> io::Result<()> {
-    use parquet::{Column, Kind};
-    c.sync_lens();
-    let prefix = parquet::def_levels_prefix(c.n);
-    let cols = [
-        Column {
-            name: "user_id",
-            kind: Kind::Utf8,
-            parts: vec![&c.ids],
-        },
-        Column {
-            name: "day",
-            kind: Kind::Date,
-            parts: vec![bytes_of(&c.day)],
-        },
-        Column {
-            name: "sessions",
-            kind: Kind::Int64,
-            parts: vec![bytes_of(&c.sessions)],
-        },
-        Column {
-            name: "events",
-            kind: Kind::Int64,
-            parts: vec![bytes_of(&c.events)],
-        },
-        Column {
-            name: "revenue_cents",
-            kind: Kind::Int64,
-            parts: vec![bytes_of(&c.revenue)],
-        },
-        Column {
-            name: "top_category",
-            kind: Kind::OptUtf8,
-            parts: vec![&prefix, &c.defs, &c.top],
-        },
-    ];
-    parquet::write_columns(path, c.n, &cols)
+fn encode_user_cols(cols: &mut UserCols, file: &mut FileBuilder) {
+    cols.sync_lens();
+    file.reset(cols.n);
+    file.col_user_id(&cols.ids);
+    file.col_date(&cols.day);
+    file.col_i64("sessions", &cols.sessions, true);
+    file.col_i64("events", &cols.events, true);
+    file.col_i64("revenue_cents", &cols.revenue, false);
+    file.col_category(&cols.defs, &cols.top);
+}
+
+fn write_user_cols_to(path: &Path, cols: &mut UserCols, file: &mut FileBuilder) -> io::Result<()> {
+    encode_user_cols(cols, file);
+    std::fs::write(path, file.finish())
 }
 
 /// Writes `campaign_daily` from raw campaign dictionary + rows (no `Loaded` required).
-pub fn write_campaign_raw(dir: &Path, rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
-    let id = |c: u32| -> &[u8] { campaigns.get(c as usize).map(|x| x.0.as_slice()).unwrap_or(b"organic") };
-    let ch = |c: u32| -> &[u8] { campaigns.get(c as usize).map(|x| x.1.as_slice()).unwrap_or(b"organic") };
-    let write_chunk = |path: &Path, chunk: &[CampRow]| -> io::Result<()> {
-        let n = chunk.len();
-        let idb: usize = chunk.iter().map(|r| id(r.campaign).len()).sum();
-        let chb: usize = chunk.iter().map(|r| ch(r.campaign).len()).sum();
-        let mut f = FileBuilder::new(n, 8 * n + idb + chb + 36 * n);
-        f.col_utf8("campaign_id", idb, chunk.iter().map(|r| id(r.campaign)));
-        f.col_utf8("channel", chb, chunk.iter().map(|r| ch(r.campaign)));
-        f.col_date("day", chunk.iter().map(|r| r.day));
-        f.col_i64("sessions", chunk.iter().map(|r| r.cell.sessions));
-        f.col_i64("purchasing_sessions", chunk.iter().map(|r| r.cell.purchasing));
-        f.col_i64("revenue_cents", chunk.iter().map(|r| r.cell.revenue));
-        f.col_i64("assisted_sessions", chunk.iter().map(|r| r.cell.assisted));
-        std::fs::write(path, f.finish())
-    };
-    if rows.len() <= MAX_ROWS {
-        return write_chunk(&dir.join("part-0.parquet"), rows);
+pub fn write_campaign_raw(
+    dir: &Path,
+    rows: &[CampRow],
+    campaigns: &[(Vec<u8>, Vec<u8>)],
+) -> io::Result<()> {
+    let mut file = FileBuilder::default();
+    if rows.is_empty() {
+        encode_campaign(rows, campaigns, &mut file);
+        return std::fs::write(dir.join("part-0.parquet"), file.finish());
     }
-    for (k, chunk) in rows.chunks(MAX_ROWS).enumerate() {
-        write_chunk(&dir.join(format!("part-{k}.parquet")), chunk)?;
+    for (part, chunk) in rows.chunks(MAX_ROWS).enumerate() {
+        encode_campaign(chunk, campaigns, &mut file);
+        std::fs::write(dir.join(format!("part-{part}.parquet")), file.finish())?;
     }
     Ok(())
 }
 
+fn encode_campaign(rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)], file: &mut FileBuilder) {
+    let id = |c: u32| -> &[u8] {
+        campaigns
+            .get(c as usize)
+            .map(|x| x.0.as_slice())
+            .unwrap_or(b"organic")
+    };
+    let ch = |c: u32| -> &[u8] {
+        campaigns
+            .get(c as usize)
+            .map(|x| x.1.as_slice())
+            .unwrap_or(b"organic")
+    };
+    file.reset(rows.len());
+    file.col_utf8("campaign_id", rows.iter().map(|row| id(row.campaign)));
+    file.col_utf8("channel", rows.iter().map(|row| ch(row.campaign)));
+    file.col_date(&rows.iter().map(|row| row.day).collect::<Vec<_>>());
+    let mut integers = Vec::with_capacity(rows.len());
+    integers.extend(rows.iter().map(|row| row.cell.sessions));
+    file.col_i64("sessions", &integers, false);
+    integers.clear();
+    integers.extend(rows.iter().map(|row| row.cell.purchasing));
+    file.col_i64("purchasing_sessions", &integers, false);
+    integers.clear();
+    integers.extend(rows.iter().map(|row| row.cell.revenue));
+    file.col_i64("revenue_cents", &integers, false);
+    integers.clear();
+    integers.extend(rows.iter().map(|row| row.cell.assisted));
+    file.col_i64("assisted_sessions", &integers, false);
+}
+
 fn user_file(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {
-    let ids = &loaded.person_ids;
-    let cats = &loaded.categories;
-    let n = rows.len();
-    let id_bytes: usize = rows.iter().map(|r| ids.get(r.person as usize).len()).sum();
-    let (mut nonnull, mut cat_bytes) = (0usize, 0usize);
-    for r in rows {
-        if r.top != NO_CATEGORY {
-            nonnull += 1;
-            cat_bytes += cats[r.top as usize].len();
-        }
+    let mut cols = UserCols::with_capacity(rows.len());
+    for row in rows {
+        cols.push(
+            loaded.person_ids.get(row.person as usize),
+            row.day,
+            row.sessions,
+            row.events,
+            row.revenue,
+            (row.top != NO_CATEGORY).then(|| loaded.categories[row.top as usize].as_slice()),
+        );
     }
-    let cap = 4 * n + id_bytes + 4 * n + 24 * n + n / 8 + 4 * nonnull + cat_bytes + 64;
-    let mut f = FileBuilder::new(n, cap);
-    f.col_utf8("user_id", id_bytes, rows.iter().map(|r| ids.get(r.person as usize)));
-    f.col_date("day", rows.iter().map(|r| r.day));
-    f.col_i64("sessions", rows.iter().map(|r| r.sessions as i64));
-    f.col_i64("events", rows.iter().map(|r| r.events as i64));
-    f.col_i64("revenue_cents", rows.iter().map(|r| r.revenue));
-    f.col_opt_utf8(
-        "top_category",
-        nonnull,
-        cat_bytes,
-        rows.iter().map(|r| {
-            if r.top == NO_CATEGORY {
-                None
-            } else {
-                Some(cats[r.top as usize].as_slice())
-            }
-        }),
-    );
-    f.finish()
+    let mut file = FileBuilder::default();
+    encode_user_cols(&mut cols, &mut file);
+    file.into_bytes()
 }
 
 #[allow(dead_code)]
@@ -317,31 +324,30 @@ pub fn user_file_bytes(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {
 }
 
 fn camp_file(rows: &[CampRow], loaded: &Loaded) -> Vec<u8> {
-    let camps = &loaded.campaigns;
-    let id = |c: u32| -> &[u8] { camps.get(c as usize).map(|x| x.0.as_slice()).unwrap_or(b"organic") };
-    let ch = |c: u32| -> &[u8] { camps.get(c as usize).map(|x| x.1.as_slice()).unwrap_or(b"organic") };
-    let n = rows.len();
-    let idb: usize = rows.iter().map(|r| id(r.campaign).len()).sum();
-    let chb: usize = rows.iter().map(|r| ch(r.campaign).len()).sum();
-    let mut f = FileBuilder::new(n, 8 * n + idb + chb + 36 * n);
-    f.col_utf8("campaign_id", idb, rows.iter().map(|r| id(r.campaign)));
-    f.col_utf8("channel", chb, rows.iter().map(|r| ch(r.campaign)));
-    f.col_date("day", rows.iter().map(|r| r.day));
-    f.col_i64("sessions", rows.iter().map(|r| r.cell.sessions));
-    f.col_i64("purchasing_sessions", rows.iter().map(|r| r.cell.purchasing));
-    f.col_i64("revenue_cents", rows.iter().map(|r| r.cell.revenue));
-    f.col_i64("assisted_sessions", rows.iter().map(|r| r.cell.assisted));
-    f.finish()
+    let mut file = FileBuilder::default();
+    encode_campaign(rows, &loaded.campaigns, &mut file);
+    file.into_bytes()
 }
 
 /// Writes one worker's user_daily rows as `part-{worker}[-k].parquet` (always >= 1 file).
 #[allow(dead_code)]
-pub fn write_user_rows(dir: &Path, worker: usize, rows: &[UserRow], loaded: &Loaded) -> io::Result<()> {
+pub fn write_user_rows(
+    dir: &Path,
+    worker: usize,
+    rows: &[UserRow],
+    loaded: &Loaded,
+) -> io::Result<()> {
     if rows.len() <= MAX_ROWS {
-        return std::fs::write(dir.join(format!("part-{worker}.parquet")), user_file(rows, loaded));
+        return std::fs::write(
+            dir.join(format!("part-{worker}.parquet")),
+            user_file(rows, loaded),
+        );
     }
     for (k, c) in rows.chunks(MAX_ROWS).enumerate() {
-        std::fs::write(dir.join(format!("part-{worker}-{k}.parquet")), user_file(c, loaded))?;
+        std::fs::write(
+            dir.join(format!("part-{worker}-{k}.parquet")),
+            user_file(c, loaded),
+        )?;
     }
     Ok(())
 }
@@ -381,10 +387,14 @@ pub fn write(tables: &Tables, loaded: &Loaded, out: &Path, threads: usize) -> io
                             return Ok(());
                         }
                         match items[k] {
-                            None => std::fs::write(cd.join("part-0.parquet"), camp_file(&tables.camp_rows, loaded))?,
-                            Some(rows) => {
-                                std::fs::write(ud.join(format!("part-{k}.parquet")), user_file(rows, loaded))?
-                            }
+                            None => std::fs::write(
+                                cd.join("part-0.parquet"),
+                                camp_file(&tables.camp_rows, loaded),
+                            )?,
+                            Some(rows) => std::fs::write(
+                                ud.join(format!("part-{k}.parquet")),
+                                user_file(rows, loaded),
+                            )?,
                         }
                     }
                 })
