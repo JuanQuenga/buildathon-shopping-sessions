@@ -23,13 +23,13 @@ fn main() {
         ingest::fast::bench_rows(std::path::Path::new(&p), &data_dir);
         return;
     }
-    let loaded = ingest::load(&data_dir, threads);
-    eprintln!("[main] ingest done {:.3}s", t0.elapsed().as_secs_f64());
-    aggregate::run(loaded, &output_dir, threads);
+    ingest::run_pipeline(&data_dir, &output_dir, threads);
     let hwm = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string()))
         .unwrap_or_default();
+    let hwm_mb: u64 = hwm.parse::<u64>().unwrap_or(0) / 1024;
+    eprintln!("[stage] peak_rss_mb={hwm_mb}");
     eprintln!("[main] total {:.3}s peak_rss_kb {hwm}", t0.elapsed().as_secs_f64());
     // Skip destructors of large buffers.
     std::process::exit(0);

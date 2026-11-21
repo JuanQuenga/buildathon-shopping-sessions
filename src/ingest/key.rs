@@ -107,22 +107,22 @@ mod tests {
 
 /// Exact id -> value lookup with a dense fast path for ids shaped
 /// `<prefix><decimal without leading zero>` (e.g. `p123`, `c_45`); every other
-/// id goes through an exact hash map. Shaped ids map 1:1 to their number, so
-/// the dense array is exact.
+/// id goes through an exact hash map (inline `u128` for <= 15 bytes, `HashMap`
+/// for > 15 bytes). Shaped ids map 1:1 to their number, so the dense array is exact.
 pub struct IdLookup {
     prefix: [u8; 4],
     plen: usize,
     dense: Vec<u32>,
     rest: Map,
     rest_len: usize,
+    long_rest: std::collections::HashMap<Vec<u8>, u32>,
     default: u32,
 }
 
 const NONE: u32 = u32::MAX;
 
 impl IdLookup {
-    /// Returns None if some id does not fit an inline key (> 15 bytes).
-    pub fn build<'a>(entries: impl Iterator<Item = (&'a [u8], u32)> + Clone, default: u32) -> Option<IdLookup> {
+    pub fn build<'a>(entries: impl Iterator<Item = (&'a [u8], u32)> + Clone, default: u32) -> IdLookup {
         let first = entries.clone().next().map(|e| e.0).unwrap_or(b"");
         let plen = first.iter().take(4).take_while(|b| !b.is_ascii_digit()).count();
         let mut prefix = [0u8; 4];
@@ -131,8 +131,8 @@ impl IdLookup {
         let limit = (n_entries as u64) * 4 + 1024;
         let mut dense: Vec<u32> = Vec::new();
         let mut rest_entries = Vec::new();
+        let mut long_rest = std::collections::HashMap::new();
         for (id, v) in entries {
-            key::pack_check(id)?;
             match shaped(id, &prefix[..plen]) {
                 Some(n) if plen > 0 && n < limit => {
                     if dense.len() <= n as usize {
@@ -142,47 +142,58 @@ impl IdLookup {
                         dense[n as usize] = v;
                     }
                 }
-                _ => rest_entries.push((pack(id)?, v)),
+                _ => {
+                    if let Some(k) = pack(id) {
+                        rest_entries.push((k, v));
+                    } else {
+                        long_rest.entry(id.to_vec()).or_insert(v);
+                    }
+                }
             }
         }
         let mut rest = Map::with_capacity(rest_entries.len());
         for (k, v) in &rest_entries {
             rest.insert(*k, *v);
         }
-        Some(IdLookup { prefix, plen, dense, rest, rest_len: rest_entries.len(), default })
+        IdLookup { prefix, plen, dense, rest, rest_len: rest_entries.len(), long_rest, default }
     }
 
     /// Lookup of field bytes at `p` with `len` bytes; 16+ readable bytes after `p` required.
     #[inline(always)]
     pub unsafe fn get(&self, p: *const u8, len: usize) -> u32 {
         let pl = self.plen;
-        if len > pl && len <= pl + 9 && pl > 0 {
+        if len > pl && len <= pl + 8 && pl > 0 {
             let s = std::slice::from_raw_parts(p, pl);
             if s == &self.prefix[..pl] && *p.add(pl) != b'0' {
                 let nd = len - pl;
-                let n = if nd <= 8 { super::tsfast::digits8(p.add(pl), nd) } else { None };
-                if let Some(n) = n {
+                if let Some(n) = super::tsfast::digits8(p.add(pl), nd) {
                     if (n as usize) < self.dense.len() {
                         let v = *self.dense.get_unchecked(n as usize);
                         if v != NONE {
                             return v;
                         }
                     }
-                    // shaped but absent from dense: only `rest` could hold it if it was too large
-                    if self.rest_len == 0 {
+                    // shaped (<= 8 digits) but absent from dense: only `rest` could hold it if it was >= limit
+                    if self.rest_len == 0 && self.long_rest.is_empty() {
                         return self.default;
                     }
                 }
             }
         }
-        if self.rest_len == 0 || len > MAX_INLINE {
+        if len <= MAX_INLINE {
+            if self.rest_len == 0 {
+                return self.default;
+            }
+            return self.rest.get(pack_at(p, len)).unwrap_or(self.default);
+        }
+        if self.long_rest.is_empty() {
             return self.default;
         }
-        self.rest.get(pack_at(p, len)).unwrap_or(self.default)
+        self.long_rest.get(std::slice::from_raw_parts(p, len)).copied().unwrap_or(self.default)
     }
 }
 
-/// `<prefix><digits>` with no leading zero, at most 9 digits -> number.
+/// `<prefix><digits>` with no leading zero, at most 8 digits -> number.
 fn shaped(id: &[u8], prefix: &[u8]) -> Option<u64> {
     let d = id.strip_prefix(prefix)?;
     if d.is_empty() || d.len() > 8 || d[0] == b'0' || !d.iter().all(|b| b.is_ascii_digit()) {
@@ -191,22 +202,18 @@ fn shaped(id: &[u8], prefix: &[u8]) -> Option<u64> {
     Some(d.iter().fold(0u64, |a, &b| a * 10 + (b - b'0') as u64))
 }
 
-mod key {
-    pub fn pack_check(b: &[u8]) -> Option<()> {
-        (b.len() <= super::MAX_INLINE).then_some(())
-    }
-}
-
 #[cfg(test)]
 mod lookup_tests {
     use super::*;
     #[test]
     fn lookup_exact() {
+        let long_id = b"p_very_long_product_identifier_12345".to_vec();
         let ids: Vec<(Vec<u8>, u32)> = vec![
             (b"p1".to_vec(), 1), (b"p20".to_vec(), 2), (b"p0".to_vec(), 3), (b"p007".to_vec(), 4),
             (b"x9".to_vec(), 5), (b"p99999999".to_vec(), 6), (b"P1".to_vec(), 7), (b"p".to_vec(), 8),
+            (long_id.clone(), 9),
         ];
-        let l = IdLookup::build(ids.iter().map(|(a, b)| (a.as_slice(), *b)), 0).unwrap();
+        let l = IdLookup::build(ids.iter().map(|(a, b)| (a.as_slice(), *b)), 0);
         let q = |s: &[u8]| {
             let mut v = s.to_vec();
             v.resize(s.len() + 32, b'9');
@@ -215,11 +222,14 @@ mod lookup_tests {
         for (id, v) in &ids {
             assert_eq!(q(id), *v, "{:?}", String::from_utf8_lossy(id));
         }
-        for miss in [&b"p2"[..], b"p01", b"p00", b"p200", b"p1 ", b" p1", b"", b"q1", b"p123456789", b"p9999999"] {
+        for miss in [
+            &b"p2"[..], b"p01", b"p00", b"p200", b"p1 ", b" p1", b"", b"q1", b"p123456789",
+            b"p9999999", b"p_very_long_product_identifier_12346",
+        ] {
             assert_eq!(q(miss), 0, "{:?}", String::from_utf8_lossy(miss));
         }
         let only_shaped: Vec<(Vec<u8>, u32)> = (1..100u32).map(|i| (format!("c_{i}").into_bytes(), i)).collect();
-        let l = IdLookup::build(only_shaped.iter().map(|(a, b)| (a.as_slice(), *b)), 0).unwrap();
+        let l = IdLookup::build(only_shaped.iter().map(|(a, b)| (a.as_slice(), *b)), 0);
         let q = |s: &[u8]| {
             let mut v = s.to_vec();
             v.resize(s.len() + 32, b'9');

@@ -17,6 +17,7 @@ impl StringTable {
     pub fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
+    #[allow(dead_code)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

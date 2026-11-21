@@ -15,10 +15,41 @@ pub mod small;
 pub mod ts;
 pub mod tsfast;
 
+use crate::aggregate;
 use crate::types::*;
 use std::io::Write;
 use std::path::Path;
 
+/// End-to-end pipeline entry point: uses the fused fast path (disk -> Parquet directly,
+/// no intermediate `Loaded` materialization) unless `INGEST_SLOW=1`, `INGEST_DUMP` is set,
+/// or the fast path reports an input outside its compact representation (generic fallback).
+pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) {
+    let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
+    let dump_path = std::env::var("INGEST_DUMP").ok();
+    if !slow_forced && dump_path.is_none() {
+        if fast::run_to_output(data_dir, output_dir, threads) {
+            return;
+        }
+        eprintln!("[ingest] fast path not applicable (long id): using generic path");
+    }
+    let loaded = if slow_forced {
+        slow::load(data_dir)
+    } else {
+        match fast::load(data_dir, threads) {
+            Some(l) => l,
+            None => {
+                eprintln!("[ingest] fast path not applicable (long id): using generic path");
+                slow::load(data_dir)
+            }
+        }
+    };
+    if let Some(p) = dump_path {
+        dump(&loaded, Path::new(&p));
+    }
+    aggregate::run(loaded, output_dir, threads);
+}
+
+#[allow(dead_code)]
 pub fn load(data_dir: &Path, threads: usize) -> Loaded {
     let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
     let loaded = if slow_forced {

@@ -81,13 +81,13 @@ pub fn load(data_dir: &Path) -> Loaded {
             if !csv::split(line, &mut f7) || f7[0].is_empty() {
                 continue;
             }
-            let ingest = ts::parse_ts(f7[3]).unwrap_or(i64::MIN);
+            let ingest = ts::parse_ts(f7[3]).unwrap_or(i64::MAX);
             if let Some(c) = ev.get(f7[0]) {
                 if c.ingest <= ingest {
                     continue;
                 }
             }
-            let payload = validate_event(&f7, ingest, ws, we, &products);
+            let payload = if ingest == i64::MAX { None } else { validate_event(&f7, ingest, ws, we, &products) };
             ev.insert(f7[0].to_vec(), Cand { ingest, payload });
         }
     }

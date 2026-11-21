@@ -393,9 +393,29 @@ pub fn def_levels_prefix(n: usize) -> Vec<u8> {
 }
 
 /// Writes a one-row-group file whose column pages are the given parts, without copying
-/// them into an intermediate buffer.
+/// them into an intermediate buffer. When `num_rows == 0`, writes a clean 0-row file
+/// with no row groups and no orphan data page headers.
 pub fn write_columns(path: &std::path::Path, num_rows: usize, cols: &[Column]) -> std::io::Result<()> {
     use std::io::Write;
+    if num_rows == 0 {
+        let metas: Vec<ColMeta> = cols
+            .iter()
+            .map(|c| ColMeta { name: c.name, kind: c.kind, offset: 0, size: 0 })
+            .collect();
+        let mut foot = Vec::with_capacity(512);
+        footer(&mut foot, 0, &metas);
+        let mut f = std::fs::File::create(path)?;
+        let bufs = [std::io::IoSlice::new(PAR1), std::io::IoSlice::new(&foot)];
+        let mut slices: &mut [std::io::IoSlice] = &mut [bufs[0], bufs[1]];
+        while !slices.is_empty() {
+            let n = f.write_vectored(slices)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored wrote 0"));
+            }
+            std::io::IoSlice::advance_slices(&mut slices, n);
+        }
+        return Ok(());
+    }
     let mut headers: Vec<Vec<u8>> = Vec::with_capacity(cols.len());
     let mut metas = Vec::with_capacity(cols.len());
     let mut pos = PAR1.len() as u64;

@@ -75,7 +75,10 @@ pub fn list_csv(data_dir: &Path, sub: &str) -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(data_dir.join(sub)) {
         for e in rd.flatten() {
             let p = e.path();
-            let is_csv = p.extension().map(|x| x == "csv").unwrap_or(false);
+            let is_csv = p
+                .file_name()
+                .map(|n| n.as_encoded_bytes().ends_with(b".csv"))
+                .unwrap_or(false);
             if is_csv && p.is_file() {
                 v.push(p);
             }

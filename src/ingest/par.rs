@@ -1,4 +1,4 @@
-//! Minimal scoped work-stealing helpers (no external deps).
+//! Minimal scoped work-stealing helpers and software write-combining sinks (no external deps).
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Sum of worker-thread CPU nanoseconds spent inside `run` (for stage reports).
@@ -11,12 +11,23 @@ where
     I: Fn(usize) -> S + Sync,
     T: Fn(&mut S, usize) + Sync,
 {
+    run_fini(threads, ntasks, init, task, |_| {})
+}
+
+/// Like `run`, plus a per-thread `fini(&mut state)` hook executed on the worker
+/// thread once all tasks are exhausted (e.g., flushing SWCBs + sfence in parallel).
+pub fn run_fini<S: Send, I, T, F>(threads: usize, ntasks: usize, init: I, task: T, fini: F) -> Vec<S>
+where
+    I: Fn(usize) -> S + Sync,
+    T: Fn(&mut S, usize) + Sync,
+    F: Fn(&mut S) + Sync,
+{
     let next = AtomicUsize::new(0);
     let threads = threads.max(1);
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|t| {
-                let (next, init, task) = (&next, &init, &task);
+                let (next, init, task, fini) = (&next, &init, &task, &fini);
                 sc.spawn(move || {
                     let c0 = thread_cpu();
                     let mut s = init(t);
@@ -27,6 +38,7 @@ where
                         }
                         task(&mut s, i);
                     }
+                    fini(&mut s);
                     CPU_NS.fetch_add(((thread_cpu() - c0) * 1e9) as u64, Ordering::Relaxed);
                     s
                 })
@@ -37,8 +49,11 @@ where
 }
 
 /// Raw pointer that may be shared across threads for disjoint writes.
-#[derive(Clone, Copy)]
 pub struct SyncPtr<T>(pub *mut T);
+impl<T> Clone for SyncPtr<T> {
+    fn clone(&self) -> Self { *self }
+}
+impl<T> Copy for SyncPtr<T> {}
 unsafe impl<T> Send for SyncPtr<T> {}
 unsafe impl<T> Sync for SyncPtr<T> {}
 impl<T> SyncPtr<T> {
@@ -106,12 +121,22 @@ pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
 }
 
+/// One 256-byte (4 cache lines) cache-line-aligned software write-combining buffer slot.
+/// Flushing 256 bytes at a time (8x 32B RecA, 16x 16B RecB) keeps the flush branch
+/// highly predictable (>87.5% / >93.75% not-taken) and cuts dTLB touches by 8x-16x.
+const SWCB_BYTES: usize = 256;
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct SwcbLine([u8; SWCB_BYTES]);
+
 /// Fixed-capacity per-partition append regions inside one huge-page arena,
-/// with a heap overflow vector per partition.
+/// fronted by L2-resident 256-byte software write-combining buffers (SWCBs)
+/// that emit 4 full cache lines of non-temporal stores (8x `_mm256_stream_si256`).
 pub struct Sinks<T: Copy> {
     base: *mut T,
     raw: (*mut u8, usize),
     cap: usize,
+    swcb: Vec<SwcbLine>,
     pub len: Vec<usize>,
     pub over: Vec<Vec<T>>,
 }
@@ -125,39 +150,94 @@ impl<T: Copy> Drop for Sinks<T> {
 }
 
 impl<T: Copy> Sinks<T> {
-    pub fn new(parts: usize, cap: usize) -> Self {
-        let cap = cap.max(4);
-        let (a, p, l) = huge_alloc(parts * cap * std::mem::size_of::<T>());
-        Sinks { base: a as *mut T, raw: (p, l), cap, len: vec![0; parts], over: (0..parts).map(|_| Vec::new()).collect() }
-    }
-    /// Append with non-temporal 16-byte stores (no read-for-ownership).
     #[inline(always)]
-    pub fn push(&mut self, p: usize, x: T) {
-        const { assert!(std::mem::size_of::<T>() % 16 == 0 && std::mem::align_of::<T>() >= 16) };
-        let l = unsafe { *self.len.get_unchecked(p) };
-        if l < self.cap {
-            unsafe {
-                use std::arch::x86_64::*;
-                let dst = self.base.add(p * self.cap + l) as *mut __m128i;
-                let src = &x as *const T as *const __m128i;
-                for i in 0..std::mem::size_of::<T>() / 16 {
-                    _mm_stream_si128(dst.add(i), _mm_loadu_si128(src.add(i)));
-                }
-                *self.len.get_unchecked_mut(p) = l + 1;
-            }
-        } else {
-            self.over[p].push(x);
+    const fn per_line() -> usize {
+        let sz = std::mem::size_of::<T>();
+        assert!(sz == 16 || sz == 32 || sz == 64);
+        assert!(std::mem::align_of::<T>() >= 16);
+        SWCB_BYTES / sz
+    }
+
+    pub fn new(parts: usize, cap: usize) -> Self {
+        let pl = Self::per_line();
+        let cap = cap.max(pl).div_ceil(pl) * pl;
+        let (a, p, l) = huge_alloc(parts * cap * std::mem::size_of::<T>());
+        Sinks {
+            base: a as *mut T,
+            raw: (p, l),
+            cap,
+            swcb: vec![SwcbLine([0u8; SWCB_BYTES]); parts],
+            len: vec![0; parts],
+            over: (0..parts).map(|_| Vec::new()).collect(),
         }
     }
-    /// Must be called by the writing thread before others read.
-    pub fn fence(&self) {
-        unsafe { std::arch::x86_64::_mm_sfence() }
+
+    /// Append one item into partition `p`'s 256-byte SWCB; when full, stream all
+    /// 4 cache lines non-temporally to the arena (or overflow vector).
+    #[inline(always)]
+    pub fn push(&mut self, p: usize, x: T) {
+        let pl = Self::per_line();
+        let l = unsafe { *self.len.get_unchecked(p) };
+        let slot = l & (pl - 1);
+        let line_ptr = unsafe { self.swcb.as_mut_ptr().add(p) as *mut T };
+        unsafe { line_ptr.add(slot).write(x) };
+        let nl = l + 1;
+        unsafe { *self.len.get_unchecked_mut(p) = nl };
+        if (nl & (pl - 1)) == 0 {
+            self.flush_full(p, nl, line_ptr);
+        }
     }
+
+    #[cold]
+    #[inline(never)]
+    fn flush_full(&mut self, p: usize, nl: usize, line_ptr: *const T) {
+        let pl = Self::per_line();
+        let base_idx = nl - pl;
+        if nl <= self.cap {
+            unsafe {
+                use std::arch::x86_64::*;
+                let dst = self.base.add(p * self.cap + base_idx) as *mut __m256i;
+                let src = line_ptr as *const __m256i;
+                debug_assert_eq!(dst as usize & 63, 0);
+                debug_assert_eq!(src as usize & 63, 0);
+                for i in 0..(SWCB_BYTES / 32) {
+                    _mm256_stream_si256(dst.add(i), _mm256_load_si256(src.add(i)));
+                }
+            }
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(line_ptr, pl) };
+            self.over[p].extend_from_slice(slice);
+        }
+    }
+
+    /// Flush all partially-filled SWCB lines into the arena/overflow and issue sfence.
+    /// Must be called once by the writing thread after all pushes finish.
+    pub fn finish(&mut self) {
+        let pl = Self::per_line();
+        for p in 0..self.len.len() {
+            let l = self.len[p];
+            let rem = l & (pl - 1);
+            if rem != 0 {
+                let base_idx = l - rem;
+                let src = unsafe { std::slice::from_raw_parts(self.swcb.as_ptr().add(p) as *const T, rem) };
+                if l <= self.cap {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.cap + base_idx), rem);
+                    }
+                } else {
+                    self.over[p].extend_from_slice(src);
+                }
+            }
+        }
+        unsafe { std::arch::x86_64::_mm_sfence() };
+    }
+
     #[inline]
     pub fn part(&self, p: usize) -> (&[T], &[T]) {
         let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p].min(self.cap)) };
         (a, &self.over[p])
     }
+
     pub fn count(&self, p: usize) -> usize {
         self.len[p].min(self.cap) + self.over[p].len()
     }

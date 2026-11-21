@@ -88,20 +88,20 @@ pub fn run(loaded: Loaded, output_dir: &Path, threads: usize) {
 }
 
 #[inline]
-fn day_of(ts: i64) -> i32 {
+pub fn day_of(ts: i64) -> i32 {
     ts.div_euclid(DAY_MS) as i32
 }
 
 /// Campaign x day accumulator: dense over the window's days, sparse overflow otherwise.
-struct CampStore {
-    day0: i32,
-    ndays: u32,
-    dense: Vec<CampCell>,
-    sparse: HashMap<(u32, i32), CampCell>,
+pub struct CampStore {
+    pub day0: i32,
+    pub ndays: u32,
+    pub dense: Vec<CampCell>,
+    pub sparse: HashMap<(u32, i32), CampCell>,
 }
 
 impl CampStore {
-    fn new(ncamp_total: usize, day0: i32, ndays: u32) -> Self {
+    pub fn new(ncamp_total: usize, day0: i32, ndays: u32) -> Self {
         // Cap dense size (~32 MB per worker); beyond that everything goes sparse.
         let (ndays, dense) = match ncamp_total.checked_mul(ndays as usize) {
             Some(n) if n <= (1 << 20) => (ndays, vec![CampCell::default(); n]),
@@ -114,15 +114,61 @@ impl CampStore {
             sparse: HashMap::new(),
         }
     }
-    #[inline]
-    fn cell(&mut self, camp: u32, day: i32) -> &mut CampCell {
+    #[inline(always)]
+    pub fn cell(&mut self, camp: u32, day: i32) -> &mut CampCell {
         let di = day.wrapping_sub(self.day0) as u32;
         if di < self.ndays {
-            &mut self.dense[camp as usize * self.ndays as usize + di as usize]
+            unsafe { self.dense.get_unchecked_mut(camp as usize * self.ndays as usize + di as usize) }
         } else {
             self.sparse.entry((camp, day)).or_default()
         }
     }
+}
+
+/// Merge per-worker `CampStore`s into non-empty `CampRow`s.
+pub fn merge_camps(stores: impl IntoIterator<Item = CampStore>) -> Vec<CampRow> {
+    let mut merged: Option<CampStore> = None;
+    for camp in stores {
+        match merged.as_mut() {
+            None => merged = Some(camp),
+            Some(m) => {
+                for (d, s) in m.dense.iter_mut().zip(camp.dense.iter()) {
+                    d.sessions += s.sessions;
+                    d.purchasing += s.purchasing;
+                    d.revenue += s.revenue;
+                    d.assisted += s.assisted;
+                }
+                for (k, s) in camp.sparse {
+                    let d = m.sparse.entry(k).or_default();
+                    d.sessions += s.sessions;
+                    d.purchasing += s.purchasing;
+                    d.revenue += s.revenue;
+                    d.assisted += s.assisted;
+                }
+            }
+        }
+    }
+    let mut camp_rows = Vec::new();
+    if let Some(m) = merged {
+        let nd = m.ndays as usize;
+        if nd > 0 {
+            for (i, cell) in m.dense.iter().enumerate() {
+                if cell.sessions != 0 || cell.assisted != 0 {
+                    camp_rows.push(CampRow {
+                        campaign: (i / nd) as u32,
+                        day: m.day0 + (i % nd) as i32,
+                        cell: *cell,
+                    });
+                }
+            }
+        }
+        for ((c, d), cell) in m.sparse {
+            if cell.sessions != 0 || cell.assisted != 0 {
+                camp_rows.push(CampRow { campaign: c, day: d, cell });
+            }
+        }
+    }
+    camp_rows
 }
 
 struct Worker<'a> {
@@ -130,8 +176,8 @@ struct Worker<'a> {
     organic: u32,
     camp: CampStore,
     rows: Vec<UserRow>,
-    /// When set, rows go straight into Parquet column buffers instead of `rows`.
-    cols: Option<output::UserCols>,
+    /// When set, rows go straight into Parquet column buffers (split before page limits).
+    writer: Option<output::UserWriter<'a>>,
     written: usize,
     t_compute: f64,
     t_write: f64,
@@ -157,7 +203,7 @@ impl<'a> Worker<'a> {
             organic: ncamp as u32,
             camp: CampStore::new(ncamp + 1, day0, ndays),
             rows: Vec::new(),
-            cols: None,
+            writer: None,
             written: 0,
             t_compute: 0.0,
             t_write: 0.0,
@@ -187,14 +233,14 @@ impl<'a> Worker<'a> {
             self.cat_sum[c as usize] = 0;
         }
         self.cat_touched.clear();
-        if let Some(c) = self.cols.as_mut() {
+        if let Some(w) = self.writer.as_mut() {
             let id = self.loaded.person_ids.get(person as usize);
             let cat = if top == NO_CATEGORY {
                 None
             } else {
                 Some(self.loaded.categories[top as usize].as_slice())
             };
-            c.push(id, day, sessions, events, revenue, cat);
+            w.push(id, day, sessions, events, revenue, cat);
         } else {
             self.rows.push(UserRow {
                 person,
@@ -410,9 +456,8 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
                 let t_start = &t_start;
                 sc.spawn(move || {
                     let mut w = Worker::new(loaded, day0, ndays);
-                    if user_dir.is_some() {
-                        // Generous reservation; untouched capacity costs only address space.
-                        w.cols = Some(output::UserCols::with_capacity(total / threads / 4 + 1024));
+                    if let Some(dir) = user_dir {
+                        w.writer = Some(output::UserWriter::new(dir, tid, total / threads / 4 + 1024));
                     }
                     loop {
                         let k = next.fetch_add(1, Ordering::Relaxed);
@@ -424,12 +469,10 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
                             w.person(p);
                         }
                     }
-                    if let Some(dir) = user_dir {
+                    if let Some(mut wr) = w.writer.take() {
                         w.t_compute = t_start.elapsed().as_secs_f64();
-                        let cols = w.cols.take().unwrap();
-                        output::write_user_cols(dir, tid, &cols).expect("writing user_daily");
+                        w.written = wr.finish();
                         w.t_write = t_start.elapsed().as_secs_f64() - w.t_compute;
-                        w.written = cols.len();
                     }
                     w
                 })
@@ -441,8 +484,11 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
     // Merge campaign accumulators.
     let mut workers = workers;
     let mut user_rows = Vec::with_capacity(workers.len());
-    let user_rows_written = workers.iter().map(|w| w.written).sum();
-    if user_dir.is_some() {
+    let user_rows_written: usize = workers.iter().map(|w| w.written).sum();
+    if let Some(dir) = user_dir {
+        if user_rows_written == 0 {
+            output::write_empty_user(dir).expect("writing empty user_daily");
+        }
         let fmt = |f: &dyn Fn(&Worker) -> f64| {
             workers
                 .iter()
@@ -456,52 +502,12 @@ pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) 
             fmt(&|w| w.t_write)
         );
     }
-    let mut merged: Option<CampStore> = None;
+    let mut camps = Vec::with_capacity(workers.len());
     for w in workers.drain(..) {
         user_rows.push(w.rows);
-        match merged.as_mut() {
-            None => merged = Some(w.camp),
-            Some(m) => {
-                for (d, s) in m.dense.iter_mut().zip(w.camp.dense.iter()) {
-                    d.sessions += s.sessions;
-                    d.purchasing += s.purchasing;
-                    d.revenue += s.revenue;
-                    d.assisted += s.assisted;
-                }
-                for (k, s) in w.camp.sparse {
-                    let d = m.sparse.entry(k).or_default();
-                    d.sessions += s.sessions;
-                    d.purchasing += s.purchasing;
-                    d.revenue += s.revenue;
-                    d.assisted += s.assisted;
-                }
-            }
-        }
+        camps.push(w.camp);
     }
-    let mut camp_rows = Vec::new();
-    if let Some(m) = merged {
-        let nd = m.ndays as usize;
-        if nd > 0 {
-            for (i, cell) in m.dense.iter().enumerate() {
-                if cell.sessions != 0 || cell.assisted != 0 {
-                    camp_rows.push(CampRow {
-                        campaign: (i / nd) as u32,
-                        day: m.day0 + (i % nd) as i32,
-                        cell: *cell,
-                    });
-                }
-            }
-        }
-        for ((c, d), cell) in m.sparse {
-            if cell.sessions != 0 || cell.assisted != 0 {
-                camp_rows.push(CampRow {
-                    campaign: c,
-                    day: d,
-                    cell,
-                });
-            }
-        }
-    }
+    let camp_rows = merge_camps(camps);
     Tables {
         user_rows,
         user_rows_written,

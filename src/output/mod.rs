@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_ROWS: usize = 1 << 21;
+const MAX_COL_BYTES: usize = 1 << 29; // 512 MiB cap per page (well below Parquet i32::MAX limit)
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("Parquet PLAIN buffers are built in native byte order; little-endian only");
@@ -38,9 +39,10 @@ pub struct UserCols {
 
 impl UserCols {
     pub fn with_capacity(rows: usize) -> Self {
+        let rows = rows.min(MAX_ROWS);
         UserCols {
             n: 0,
-            ids: Vec::with_capacity(rows * 16),
+            ids: Vec::with_capacity(rows * 14),
             day: Vec::with_capacity(rows),
             sessions: Vec::with_capacity(rows),
             events: Vec::with_capacity(rows),
@@ -52,7 +54,21 @@ impl UserCols {
     pub fn len(&self) -> usize {
         self.n
     }
-    #[inline]
+    pub fn clear(&mut self) {
+        self.n = 0;
+        self.ids.clear();
+        self.day.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.defs.clear();
+        self.top.clear();
+    }
+    #[inline(always)]
+    pub fn needs_flush(&self) -> bool {
+        self.n >= MAX_ROWS || self.ids.len() >= MAX_COL_BYTES || self.top.len() >= MAX_COL_BYTES
+    }
+    #[inline(always)]
     pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
         self.ids.extend_from_slice(&(id.len() as u32).to_le_bytes());
         self.ids.extend_from_slice(id);
@@ -60,11 +76,11 @@ impl UserCols {
         self.sessions.push(sessions as i64);
         self.events.push(events as i64);
         self.revenue.push(revenue);
-        if self.n % 8 == 0 {
+        if self.n & 7 == 0 {
             self.defs.push(0);
         }
         if let Some(t) = top {
-            *self.defs.last_mut().unwrap() |= 1 << (self.n % 8);
+            *unsafe { self.defs.last_mut().unwrap_unchecked() } |= 1 << (self.n & 7);
             self.top.extend_from_slice(&(t.len() as u32).to_le_bytes());
             self.top.extend_from_slice(t);
         }
@@ -72,8 +88,68 @@ impl UserCols {
     }
 }
 
-/// Writes one worker's column buffers as `part-{worker}.parquet`.
-pub fn write_user_cols(dir: &Path, worker: usize, c: &UserCols) -> io::Result<()> {
+/// Streaming per-worker `user_daily` writer that splits parts before hitting `MAX_ROWS`
+/// or `MAX_COL_BYTES` so Parquet pages never overflow `i32::MAX`.
+pub struct UserWriter<'a> {
+    dir: &'a Path,
+    worker: usize,
+    seq: usize,
+    pub cols: UserCols,
+    pub total_written: usize,
+}
+
+impl<'a> UserWriter<'a> {
+    pub fn new(dir: &'a Path, worker: usize, est_rows: usize) -> Self {
+        UserWriter {
+            dir,
+            worker,
+            seq: 0,
+            cols: UserCols::with_capacity(est_rows),
+            total_written: 0,
+        }
+    }
+    #[inline(always)]
+    pub fn push(&mut self, id: &[u8], day: i32, sessions: u32, events: u32, revenue: i64, top: Option<&[u8]>) {
+        self.cols.push(id, day, sessions, events, revenue, top);
+        if self.cols.needs_flush() {
+            self.flush_part();
+        }
+    }
+    #[cold]
+    fn flush_part(&mut self) {
+        if self.cols.len() == 0 {
+            return;
+        }
+        let path = self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq));
+        write_user_cols_to(&path, &self.cols).expect("writing user_daily part");
+        self.total_written += self.cols.len();
+        self.seq += 1;
+        self.cols.clear();
+    }
+    pub fn finish(&mut self) -> usize {
+        if self.cols.len() > 0 {
+            let path = if self.seq == 0 {
+                self.dir.join(format!("part-{}.parquet", self.worker))
+            } else {
+                self.dir.join(format!("part-{}-{}.parquet", self.worker, self.seq))
+            };
+            write_user_cols_to(&path, &self.cols).expect("writing user_daily");
+            self.total_written += self.cols.len();
+            self.seq += 1;
+            self.cols.clear();
+        }
+        self.total_written
+    }
+}
+
+/// Writes a single clean 0-row `part-0.parquet` when no worker emitted any `user_daily` rows.
+pub fn write_empty_user(dir: &Path) -> io::Result<()> {
+    let empty = UserCols::with_capacity(0);
+    write_user_cols_to(&dir.join("part-0.parquet"), &empty)
+}
+
+/// Writes column buffers to an explicit Parquet file path.
+pub fn write_user_cols_to(path: &Path, c: &UserCols) -> io::Result<()> {
     use parquet::{Column, Kind};
     let prefix = parquet::def_levels_prefix(c.n);
     let cols = [
@@ -108,7 +184,34 @@ pub fn write_user_cols(dir: &Path, worker: usize, c: &UserCols) -> io::Result<()
             parts: vec![&prefix, &c.defs, &c.top],
         },
     ];
-    parquet::write_columns(&dir.join(format!("part-{worker}.parquet")), c.n, &cols)
+    parquet::write_columns(path, c.n, &cols)
+}
+
+/// Writes `campaign_daily` from raw campaign dictionary + rows (no `Loaded` required).
+pub fn write_campaign_raw(dir: &Path, rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
+    let id = |c: u32| -> &[u8] { campaigns.get(c as usize).map(|x| x.0.as_slice()).unwrap_or(b"organic") };
+    let ch = |c: u32| -> &[u8] { campaigns.get(c as usize).map(|x| x.1.as_slice()).unwrap_or(b"organic") };
+    let write_chunk = |path: &Path, chunk: &[CampRow]| -> io::Result<()> {
+        let n = chunk.len();
+        let idb: usize = chunk.iter().map(|r| id(r.campaign).len()).sum();
+        let chb: usize = chunk.iter().map(|r| ch(r.campaign).len()).sum();
+        let mut f = FileBuilder::new(n, 8 * n + idb + chb + 36 * n);
+        f.col_utf8("campaign_id", idb, chunk.iter().map(|r| id(r.campaign)));
+        f.col_utf8("channel", chb, chunk.iter().map(|r| ch(r.campaign)));
+        f.col_date("day", chunk.iter().map(|r| r.day));
+        f.col_i64("sessions", chunk.iter().map(|r| r.cell.sessions));
+        f.col_i64("purchasing_sessions", chunk.iter().map(|r| r.cell.purchasing));
+        f.col_i64("revenue_cents", chunk.iter().map(|r| r.cell.revenue));
+        f.col_i64("assisted_sessions", chunk.iter().map(|r| r.cell.assisted));
+        std::fs::write(path, f.finish())
+    };
+    if rows.len() <= MAX_ROWS {
+        return write_chunk(&dir.join("part-0.parquet"), rows);
+    }
+    for (k, chunk) in rows.chunks(MAX_ROWS).enumerate() {
+        write_chunk(&dir.join(format!("part-{k}.parquet")), chunk)?;
+    }
+    Ok(())
 }
 
 fn user_file(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {

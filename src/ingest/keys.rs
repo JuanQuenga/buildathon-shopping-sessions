@@ -12,6 +12,7 @@ pub trait Key: Copy + Eq + Ord + Default + Send + Sync + std::fmt::Debug + 'stat
     /// Encode `len >= 1` bytes at `p` (64 readable bytes after `p` guaranteed).
     /// `None` = this id cannot be represented in this key type.
     unsafe fn enc(p: *const u8, len: usize) -> Option<Self>;
+    #[cfg(test)]
     fn enc_slice(s: &[u8]) -> Option<Self> {
         let mut b = [0u8; 80];
         if s.len() > 16 {
@@ -25,6 +26,8 @@ pub trait Key: Copy + Eq + Ord + Default + Send + Sync + std::fmt::Debug + 'stat
     }
     fn h(self) -> u64;
     fn unpack(self, out: &mut Vec<u8>);
+    /// Unpack bytes into a 16-byte stack buffer, returning the byte length.
+    fn unpack_buf(self, dst: &mut [u8; 16]) -> usize;
     fn is_zero(self) -> bool;
 }
 
@@ -51,6 +54,12 @@ impl Key for u128 {
         wide::unpack(self, out)
     }
     #[inline(always)]
+    fn unpack_buf(self, dst: &mut [u8; 16]) -> usize {
+        let len = (self & 0xff) as usize;
+        *dst = self.to_be_bytes();
+        len
+    }
+    #[inline(always)]
     fn is_zero(self) -> bool {
         self == 0
     }
@@ -64,30 +73,31 @@ impl Key for u64 {
         }
         use std::arch::x86_64::*;
         let v = _mm_loadu_si128(p as *const __m128i);
-        // lanes >= len -> treated as padding (code 0)
         let idx = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         let live = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), idx);
-        // ranges (signed compares are fine: all bounds < 0x80, bytes >= 0x80 are negative -> out of range)
-        let ge = |c: u8| _mm_cmpgt_epi8(v, _mm_set1_epi8(c as i8 - 1));
-        let le = |c: u8| _mm_cmpgt_epi8(_mm_set1_epi8(c as i8 + 1), v);
-        let dig = _mm_and_si128(ge(b'0'), le(b'9'));
-        let up = _mm_and_si128(ge(b'A'), le(b'Z'));
-        let lo = _mm_and_si128(ge(b'a'), le(b'z'));
-        let ok = _mm_or_si128(_mm_or_si128(dig, up), lo);
+        // Unsigned range checks via signed shift by -128: (x - base - 128) < (-128 + width)
+        // Digits '0'..='9' (0x30..=0x39): base = 0x30, width = 10 -> sub 0xB0 (-80), cmpgt -118
+        let dig = _mm_cmpgt_epi8(_mm_set1_epi8(-118), _mm_sub_epi8(v, _mm_set1_epi8(0xB0u8 as i8)));
+        // Alpha 'A'..='Z' or 'a'..='z': (v | 0x20) in 0x61..=0x7A -> sub 0xE1 (-31), cmpgt -102
+        let v_lo = _mm_or_si128(v, _mm_set1_epi8(0x20));
+        let alpha = _mm_cmpgt_epi8(_mm_set1_epi8(-102), _mm_sub_epi8(v_lo, _mm_set1_epi8(0xE1u8 as i8)));
+        let ok = _mm_or_si128(dig, alpha);
         let bad = _mm_andnot_si128(ok, live);
         if _mm_movemask_epi8(bad) != 0 {
             return None;
         }
-        // code = v - off: digits 0x2F, upper 0x36, lower 0x3C
-        let off = _mm_or_si128(
-            _mm_or_si128(_mm_and_si128(dig, _mm_set1_epi8(0x2F)), _mm_and_si128(up, _mm_set1_epi8(0x36))),
-            _mm_and_si128(lo, _mm_set1_epi8(0x3C)),
-        );
+        // Offset: dig -> 0x2F, upper -> 0x36, lower -> 0x3C (= 0x36 + 6).
+        // For alpha: bit 5 of v is 0x20 iff lower. is_lo = (v & 0x20) != 0.
+        let is_lo = _mm_cmpeq_epi8(_mm_and_si128(v, _mm_set1_epi8(0x20)), _mm_set1_epi8(0x20));
+        // base_off = dig ? 0x2F : 0x36; then add 6 if alpha & is_lo (note: for dig, bit 5 is 1 too! so mask with alpha)
+        let base_off = _mm_blendv_epi8(_mm_set1_epi8(0x36), _mm_set1_epi8(0x2F), dig);
+        let lo_add = _mm_and_si128(_mm_and_si128(alpha, is_lo), _mm_set1_epi8(6));
+        let off = _mm_add_epi8(base_off, lo_add);
         let code = _mm_and_si128(_mm_sub_epi8(v, off), live);
         // pairs: c0*64 + c1 (12 bits) in 16-bit lanes
-        let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140)); // bytes (64, 1)
+        let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
         // quads: p0*4096 + p1 (24 bits) in 32-bit lanes
-        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000)); // words (4096, 1)
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
         let l0 = _mm_cvtsi128_si32(quads) as u32 as u64;
         let l1 = _mm_extract_epi32::<1>(quads) as u32 as u64;
         let l2 = _mm_extract_epi32::<2>(quads) as u32 as u64;
@@ -98,17 +108,28 @@ impl Key for u64 {
         mix(self)
     }
     fn unpack(self, out: &mut Vec<u8>) {
+        let mut buf = [0u8; 16];
+        let n = self.unpack_buf(&mut buf);
+        out.extend_from_slice(&buf[..n]);
+    }
+    #[inline(always)]
+    fn unpack_buf(self, dst: &mut [u8; 16]) -> usize {
+        let mut n = 0usize;
         for i in 0..10 {
             let c = ((self >> (54 - 6 * i)) & 63) as u8;
             if c == 0 {
                 break;
             }
-            out.push(match c {
-                1..=10 => c + 0x2F,
-                11..=36 => c + 0x36,
-                _ => c + 0x3C,
-            });
+            dst[n] = if c <= 10 {
+                c + 0x2F
+            } else if c <= 36 {
+                c + 0x36
+            } else {
+                c + 0x3C
+            };
+            n += 1;
         }
+        n
     }
     #[inline(always)]
     fn is_zero(self) -> bool {
@@ -178,14 +199,25 @@ impl<K: Key, V: Copy + Default> Map<K, V> {
         }
     }
     #[inline(always)]
-    pub fn prefetch(&self, k: K) {
-        let s = k.h() as usize & self.mask;
+    pub fn get_h(&self, k: K, h: u64) -> Option<V> {
+        let mut s = h as usize & self.mask;
+        loop {
+            let slot = unsafe { self.e.get_unchecked(s) };
+            if slot.0 == k {
+                return Some(slot.1);
+            }
+            if slot.0.is_zero() {
+                return None;
+            }
+            s = (s + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    pub fn prefetch_h(&self, h: u64) {
+        let s = h as usize & self.mask;
         unsafe {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(self.e.as_ptr().add(s) as *const i8);
         }
-    }
-    pub fn iter(&self) -> impl Iterator<Item = &(K, V)> {
-        self.e[..=self.mask].iter().filter(|x| !x.0.is_zero())
     }
 }
 
