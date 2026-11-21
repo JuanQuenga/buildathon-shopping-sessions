@@ -2,15 +2,16 @@
 
 ## Please submit
 
-- **Tag**: `candidate-5` (HEAD on `main`) — **ready for official submission now** (passes full gate + all 4× 60M datasets exact `MATCH` in Docker).
-  - **What it tests**:
-    1. **Single-materialization parse + dead-bitset dedup (`SPEED_REVIEW` Item 5)**: writes 16 B `RecB` directly to person partitions at parse time (ring-32 `Links` prefetch) + 16 B `Tok { eid, ingest, loc }` to `eid` partitions; `dedup` runs Pass 1 only, setting `AtomicU64` dead bits (2.6 MB bitset) on the ~5% losers — eliminating `dedup` Pass 2 completely, halving event DRAM traffic (128 B → 64 B/event), cutting 20M peak RSS **1,178 → 880 MiB (−25%)**, minor faults **332k → 248k (−25%)**, and 4T `dedup` wall **274 ms → 71 ms (0 minor faults)**. Exact two-pass fallback handles wide keys, dump mode, `>16` threads, and location overflow.
-    2. **Fixes three primary suspects for `candidate-4`'s scorer regression (0.985 s vs 0.882 s)**:
-       - **Runtime adaptive THP**: probes 16 MiB `MADV_HUGEPAGE` touch latency (`< 8 ms`) whenever `transparent_hugepage/enabled` is `[madvise]` or unreadable (restoring 2 MiB huge pages on clean cloud VMs while avoiding compaction stalls on `[always]` hosts).
-       - **Pure `AVX2` default scanner** (rules out Cascade Lake AVX-512 frequency-license penalty; `INGEST_SCANNER=avx512vl|avx512` still available).
-       - **`256 KiB` `pread` chunks restored** (halves read syscalls back to `candidate-3`'s level).
-    3. **Retains mandatory 60M safety**: parallel memory-bounded generic path (`src/ingest/generic.rs`) verified exact `MATCH` in Docker on `seed60-60m` (12.81 s, 3.51 GiB), `seed60-longids` (15.47 s, 5.67 GiB), `seed60-5kcat` (9.62 s, 2.86 GiB), and `seed60-90d` (11.19 s, 2.74 GiB).
-  - **Verification**: 17/17 release unit tests (0 warnings), `objdump` ISA check, full native + forced `INGEST_GENERIC=1` + `INGEST_SLOW=1` + `INGEST_NO_AVX512=1` + Polars/PyArrow/DuckDB checks, Docker 36/36 + dev, 20M `oracle2` exact `MATCH`, and all 4× 60M Docker exact `MATCH`.
+- **Tag**: `candidate-6` (HEAD on `main`, code `8f5cb0b`) — **ready for the 4:08 AM official slot** (clean single-variable I/O A/B on `candidate-5` base).
+  - **What it tests (I/O A+D)**: keeps `candidate-5`'s exact compute, single-materialization dedup, adaptive THP, AVX2 scanner, parallel teardown, and parallel generic safety unchanged, replacing ONLY the input I/O path with:
+    1. Unconditional `t = 0` `posix_fadvise(WILLNEED)` across all files.
+    2. **24 dedicated reader threads** reading **4 MiB** LF-aligned chunks (16× fewer `pread` syscalls than 256 KiB) into a **bounded 32-buffer 4 KiB-aligned pool (128 MiB cap)** started at `t = 0` concurrently with `small` + `links-parse` + `links-uf`, handing filled buffers directly to the parse threads (`parse_wait_s = 0.000 s`).
+    3. `O_DIRECT` aligned reads built & verified behind `INGEST_ODIRECT=1` (OFF by default in `candidate-6`; ready for clean 1-line A/B in `candidate-7` at 4:36 AM if warranted).
+  - **Local `seed20-20m` A/B (`NCPU=4`, median of 3, `mincore`-verified cold & warm)**:
+    - Cold cache: `candidate-5` **3.069 s** → **`candidate-6` buffered 2.000 s (−34.8%!!)** (`candidate-6` direct 2.168 s).
+    - Warm cache: `candidate-5` **1.660 s** → **`candidate-6` buffered 1.485 s (−10.5%)** (`candidate-6` direct 1.889 s).
+    - `parse_wait_s = 0.000 s` across both cold & warm; outside-`main` teardown ~10 ms; peak RSS ~1.00 GiB.
+  - **Verification**: 22/22 release unit tests (0 warnings), full native `check_all.sh` (36 official, 32 adversarial, dev, 8× 1M seeds, 20M vs `oracle2`), `INGEST_ODIRECT=1` exact `MATCH` on dev + 20M (plus `EINVAL` fallback tests), `INGEST_GENERIC=1` exact `MATCH` on dev + 20M, Docker `ss-test:candidate-6` 36/36 official + dev, Docker `seed60-60m` exact `MATCH` (10.032 s, 3.52 GiB RSS), Docker `seed60-longids` exact `MATCH` (14.553 s, 5.68 GiB RSS).
 
 ## Official scores
 
