@@ -674,6 +674,35 @@ def big_cases(seed=11):
         c.ev(f"o{j}", f"other{j % 300}", f3(WS + rnd.randrange(0, 14 * DAY)), f1(WS), "view", "p1", "",
              file="part-00007.csv")
     cases.append(c)
+
+    c = Case("big_bursty_user",
+             "rules.md Events 5 / Clicks 4,7: one person with ~300k events in ~10k sessions (gaps around the 30-min "
+             "edge) and 20k clicks over 200 campaigns with many co-timestamp ties; stresses attribution and assists.")
+    c.campaigns = [(f"c_{i}", f"ch{i % 7}") for i in range(1, 201)]
+    ids = [f"b{i}" for i in range(4)]
+    c.ln("b0", "b1"); c.ln("b2", "b1"); c.ln("b3", "b0")
+    t = WS
+    n = 0
+    sess_starts = []
+    while t < WE - 2 * H:
+        sess_starts.append(t)
+        for _ in range(rnd.randrange(1, 60)):
+            typ = "purchase" if rnd.random() < 0.1 else "cart"
+            ts = f3(t) if t % 1000 else rnd.choice([f1(t), f3(t)])
+            c.ev(f"z{n}", rnd.choice(ids), ts, f1(t - t % 1000), typ, f"p{rnd.randrange(1, 3)}",
+                 str(rnd.randrange(1, 100000)) if typ == "purchase" else "", file=f"part-{n % 5:05d}.csv")
+            n += 1
+            t += rnd.choice([0, 1, 999, 60_000, 30 * M])
+        t += rnd.choice([30 * M + 1, 31 * M, 2 * H, 30 * M + 1000])
+    for k in range(20000):
+        if rnd.random() < 0.3:
+            ct = rnd.choice(sess_starts) - rnd.choice([0, 7 * DAY, 7 * DAY + 1, 1, 60_000])
+        else:
+            ct = WS - 7 * DAY + rnd.randrange(0, 21 * DAY)
+        for dup in range(rnd.choice([1, 1, 1, 2, 3])):     # co-timestamp clicks, ids not in numeric order
+            c.ck(f"{rnd.randrange(1, 10 ** rnd.randrange(1, 6))}_{k}_{dup}", rnd.choice(ids),
+                 f"c_{rnd.randrange(1, 201)}", f3(ct), file=f"part-{k % 4:05d}.csv")
+    cases.append(c)
     return cases
 
 
