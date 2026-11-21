@@ -2,23 +2,25 @@
 
 ## Please submit
 
-- **Tag**: `candidate-12a` (HEAD on `main`, code `c34c244` on glibc bookworm) — **1-variable `group+agg` rework ONLY on `candidate-11b` (`0.8195 s`) base**.
-  - **What it changes vs `candidate-11b` (`ea17016`, `0.8195 s`)** (`links`, `parse`, `dedup`, `relocate`, and `Dockerfile` 100% unchanged):
-    1. **Single-pass CSR in `group_fused`**: stages `CompactEv` alongside person IDs in Pass 1 (`GroupMap` with inline counts) so CSR scatter never re-reads `b_sinks`, `reloc_b`, or `DeadEvents` a second time.
-    2. **Faster `session/credit/assist`**: relative session days (`s_day`), multiply-shift day calc, flat unchecked `CampStore` indexing, advancing assist windows over sorted starts (`Aggregate` worker CPU `0.874 → 0.794 s`, −9.2%).
-    3. **Compact multi-row-group `UserCols` + `u32` `sessions`/`events` Parquet streaming**: flushes bounded Parquet row groups with stable per-file schema (`22.17 MB` at 20M vs `21.40 MB`), cutting `group+agg` minor faults by **−62% to −70%** (`54.6k → 16.5k–19.6k`), `group+agg sys` by **−46%** (`0.191 → 0.103 s`), and **Peak RSS by −120 MB** (`1,076 → 956 MB`).
-    4. Restored `c11b`'s 3-pass radix / 16-item sort cutoffs (`c34c244`) after Sol's byte-radix sort regressed +57 ms.
-  - **Local 8-vCPU (`0-3,8-11`) warm A/B vs `candidate-11b` (`seed20-20m`, high host load ~15)**:
-    - **`group+agg` minor faults**: `51.6k–54.6k → 16.5k–19.6k` (**−62% to −70%**)
-    - **`group+agg` CPU (`user+sys`)**: `1.159 s → 1.037 s` (`−122 ms`, **−10.5%**; `g_sys` `0.224 → 0.118 s`, **−47%**)
-    - **`instructions:u`**: `17.61B → 16.92B` (**−690M instr, −3.9%**) | **`cache-references:u`**: `596.7M → 553.8M` (**−7.2%**) | **`cache-misses:u`**: `48.38M → 47.10M` (−2.6%) | **Peak RSS**: `1,076 → 956 MB` (**−120 MB**)
-    - **Model C predicted official gain**: modest (`~−15 to −35 ms`, `0.8195 → ~0.785–0.805 s`) — clean 1-variable test of `group+agg` + RSS/fault reduction before `12b` (`relocate` + `links-uf` + `24 B RecC`).
-  - **Verification**: 30/30 release unit tests (0 warnings), 36 official fixtures, 32 adversarial suites, `dev` + 1M seeds + `seed20-20m`, **Polars + PyArrow + DuckDB** multi-row-group & wide-revenue (4B cents) exact match, forced `INGEST_GENERIC=1`, all four 60M datasets (`5.67 GiB` peak RSS), and Docker `ss-test:c12a` (`--network none --read-only --user 1000:1000 --memory=8g`) exact `MATCH` on `dev` and `seed20-20m`.
+- **Tag**: `candidate-12b` (HEAD on `main`, code `4ec2aa3` on glibc bookworm) — **1-variable allocation/THP/arena-reuse/`mallopt` change ONLY on `candidate-12a` (`0.7205 s`) base** (zero algorithm change).
+  - **What it changes vs `candidate-12a` (`bf812eb`, `0.7205 s`)**:
+    1. **Unified 2 MiB-aligned `MADV_HUGEPAGE` arena reuse across stages**: `links-uf` reuses the `tok` arena before `parse`; `relocate` reuses the `tok` arena after `dedup`; `group+agg` reuses relocation arena tails; no mid-run `munmap` of parse arenas (`sink_thp()` fixed to always apply `MADV_HUGEPAGE` whenever THP is `always` or `madvise`).
+    2. **Startup `mallopt`** (`M_TRIM_THRESHOLD`, `M_MMAP_THRESHOLD`, `M_ARENA_MAX`) to stop glibc from repeatedly `mmap`/`munmap`-ing transient buffers (`UserCols`, per-thread scratch).
+    3. **Recycled per-worker `pread` buffers** across input chunks + `/proc/self/smaps_rollup` `AnonHugePages` diagnostic.
+  - **Local verification & fault/THP signature** (note: local 14-day-uptime host is RAM-fragmented under `thp=always/madvise`, so 20M only gets `94–146 MiB` THP locally with kernel compaction `sys`, whereas clean memory gets **87% THP**):
+    - **Docker `dev` (clean THP fit)**: `90.1 / 103.4 MiB` (**87% `AnonHugePages`**), `links-uf` **7 faults**, `parse` **379 faults**, `dedup` **0 faults**, `relocate` **2 faults**, total **3,309 faults** (`0.073 s`).
+    - **20M (`seed20-20m`, fragmented local host)**: `links-parse` faults −80–95% (`5.1k → 0.2–1.1k`), `links-uf` faults −65–90% (`16.8k → 1.7–6.4k`), `group+agg` faults −37% (`16.2k → 9.9k`) & `group+agg sys` −70% (`0.108 → 0.030 s`), `dedup` faults `747`, `cache-misses:u` `48.1M → 45.6M`, exit `AnonHugePages` `4 → 94–146 MiB`, Peak RSS `954 MB` (Docker).
+  - **Explicit model prediction BEFORE submission**:
+    - **If the clean scorer VM backs the unified 820 MiB arena with 2 MiB THP** (like Docker `dev` at 87% THP, cutting ~200k+ minor faults): **~0.48–0.58 s** (at `1.1–2.8 µs/fault`, minus user CPU floor).
+    - **If the scorer VM has THP disabled or fragmented** (only the ~25–35k non-THP arena-reuse/`mallopt` faults drop): **~0.66–0.70 s** (vs `12a`'s `0.7205 s`).
+    - **Worst-case risk**: if the scorer VM has `defrag=always` or heavy compaction stalls on `MADV_HUGEPAGE`, compaction `sys` could partially offset fault savings (recall `c3` with `MADV_HUGEPAGE` beat `c4` without it by **−103 ms** on the scorer, strongly indicating the scorer grants THP cleanly!).
+  - **Verification**: 30/30 release unit tests (0 warnings), 36 official fixtures, 32 adversarial suites, `dev` + 1M seeds + `seed20-20m`, forced `INGEST_GENERIC=1`, 8 byte-identical `INGEST_DUMP` comparisons, all four 60M datasets (`seed60-60m` **2.85 GiB**, `seed60-longids` **5.84 GiB**, `seed60-5kcat` **2.98 GiB**, `seed60-90d` **2.91 GiB** — all well under 8 GiB), and Docker `ss-test:c12b` (`--network none --read-only --user 1000:1000 --memory=8g`) exact `MATCH` on `dev` and `seed20-20m`.
 
 ## Official scores
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
+| `candidate-12a` | `bf812eb` (`c34c244`) | **0.7205 s** | **26 (NEW BEST)** | Accepted exact output; **−99.0 ms vs 11b** from 1-variable `group+agg` rework (−35k faults, −120 MB RSS, −106 ms group sys) → proves scorer heavily charges fresh memory / minor faults (~1.1–2.8 µs/fault) |
 | `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | NEW BEST (leader 0.31 s) | Accepted exact output; direct specialized events/clicks parsers + co-partitioned L2 Links + zero-fault `tok→reloc` arena reuse (−55.7 ms vs c8) |
 | `candidate-11a` | `f6d8110` | **0.8678 s** | — | Accepted exact output; co-partitioned L2 Links + quote-bit SIMD scan + BMI2 PEXT keys (matched 0.865–0.890 s out-of-sample model prediction!) |
 | `candidate-8` | `5d0f934` (`49473d0`) | **0.8752 s** | 37 | Accepted exact output (H1: 4.46× smaller compact Parquet 97.9→21.9 MB); −7.4 ms vs c5 |
