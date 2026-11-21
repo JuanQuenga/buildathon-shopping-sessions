@@ -2,12 +2,11 @@
 
 ## Please submit
 
-- **Tag**: `candidate-7` (HEAD on `main`) — **ready for the 4:36 AM official slot (H2: 1-variable thread-count A/B on `candidate-5` base)**.
-  - **What it tests (H2)**: reverts `candidate-6`'s 24-reader pool cleanly back to `candidate-5` (`2bd1a01`, 0.8826 s official) and changes **ONLY** worker thread count from `8` → **`4`** (1 physical core per thread on 4C×2T Cascade Lake).
-    - If wall stays ~0.88 s (or drops < 0.85 s): proves 0.88 s is NOT per-core parallel compute (points to HT oversubscription / bandwidth / output / fixed cost).
-    - If wall jumps to ~1.30–1.50 s: proves 0.88 s IS parallel CPU compute scaling strongly with threads.
-  - **Next (5:08 AM slot, in flight)**: `candidate-8` (**H1**: 4–6× smaller compact Parquet output on `candidate-5` base — RLE_DICTIONARY + DELTA_BINARY_PACKED + narrow physical INT32 + Snappy, single `write` per file, zero external deps).
-  - **Verification**: 17/17 release unit tests (0 warnings), Docker `ss-test:candidate-7` under `--cpus 8` confirmed `threads=4` and exact `MATCH` on `dev` (inherits full `candidate-5` gate + 4× 60M parallel generic safety).
+- **Tag**: `candidate-8` (HEAD on `main`, code `49473d0`) — **ready for the 5:08 AM official slot NOW (H1: 1-variable 4.46× smaller compact Parquet output on `candidate-5` 8-thread base)**.
+  - **What it tests (H1)**: keeps `candidate-5`'s exact 8-thread ingest/dedup/group/aggregate/generic path untouched and replaces ONLY `src/output/{parquet.rs,mod.rs}` with zero-dependency Parquet v1 **RLE_DICTIONARY** (`day`, `sessions`, `events`, `top_category`, `campaign_id`, `channel`), per-part narrow physical **`INT32`** where values fit, and pure-Rust **Snappy** (`user_id`, `revenue_cents`), assembled in one reusable buffer with a **single `write` syscall per Parquet file** (no `fsync`).
+  - **Output size reduction (`seed20-20m`)**: **97.90 MB → 21.94 MB (4.46× smaller)**: `user_id` 29.10→11.18 MB, `day` 8.99→1.12 MB, `sessions` 17.98→1.41 MB, `events` 17.98→2.82 MB, `revenue_cents` 17.98→4.56 MB, `top_category` 4.31→0.52 MB. (`seed60-60m`: 65.14 MB; `seed60-longids`: 112.12 MB).
+  - **Local `seed20-20m` warm A/B (`NCPU=4`, 6 alternating runs)**: process wall **984.63 ms → 961.30 ms (−23.33 ms)**, encoding CPU 39.2 ms summed across 4 workers (~10 ms/worker), outside-`main` 8.27 ms.
+  - **Verification**: 27/27 release unit tests (0 warnings), **Polars + PyArrow + DuckDB** exact match on `dev`, `all_empty_output`, `E1` (null `top_category`), and `seed20-20m`, full native `check_all.sh` (36 official, 32 adversarial, dev, 8× 1M seeds, 20M `oracle2`), `INGEST_GENERIC=1` exact `MATCH`, dev syscall check (1 `write`/file), Docker 36/36 + dev, and Docker `seed60-60m` (13.16 s, 3.52 GiB) + `seed60-longids` (13.21 s, 5.67 GiB) exact `MATCH`.
 
 ## Official scores
 
@@ -16,6 +15,7 @@
 | `candidate-3` | `63b9256` (`4f01a6e`) | **0.8824 s** | 29 (leaders now 0.42 s) | Accepted exact output (best official so far) |
 | `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | 36 (leaders now 0.36 s) | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 |
 | `candidate-6` | `5f6718c` (`8f5cb0b`) | **0.948 s** | — | Accepted exact output; +65 ms slower with 24 readers × 4 MiB + t=0 fadvise → cold-I/O hypothesis refuted (scored median is warm cache) |
+| `candidate-7` | `8c4250c` (`c4d681c`) | **1.068 s** | — | Accepted exact output (H2: 4 threads vs 8 on c5 base); +0.185 s (+17% HT gain → ~0.60–0.74 s parallel + ~0.14–0.28 s non-scaling/serial/fixed) |
 | `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (disabled `MADV_HUGEPAGE` on `Sinks`, halved chunks to 128 KiB, switched to AVX-512VL-256) |
 | `probe-1` | `4456bb8` | rejected (dev) | — | Deliberate 0-row dev mismatch; confirmed scorer returns row diff (not stderr) on mismatch |
 
