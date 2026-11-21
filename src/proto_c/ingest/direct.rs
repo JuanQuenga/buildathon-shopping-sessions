@@ -2,7 +2,7 @@
 //! bytes beyond the row, so each accepted field proves where its delimiter is.
 
 use super::{scan, ts, tsfast, ParseRows, Result};
-use crate::proto_c::packed;
+use crate::proto_c::packed::{self, INVALID_INGEST};
 
 const INVALID_CAMP: u32 = u32::MAX;
 
@@ -30,6 +30,82 @@ unsafe fn open(p: *const u8) -> (*const u8, u8, usize) {
 #[inline(always)]
 unsafe fn ends(p: *const u8, len: usize, delim: u8, quoted: usize) -> bool {
     (*p.add(len) == delim) & ((quoted == 0) | (*p.add(len + 1) == b','))
+}
+
+#[inline(always)]
+unsafe fn id_eid(p: *const u8) -> Option<(u64, *const u8)> {
+    let (p, delim, quoted) = open(p);
+    let len = if ends(p, 9, delim, quoted) {
+        9
+    } else if ends(p, 8, delim, quoted) {
+        8
+    } else {
+        return None;
+    };
+    let key = packed::encode_eid_short(*p, ld8(p.add(1)), len - 1)?;
+    Some((key, p.add(len + 1 + quoted)))
+}
+
+#[inline(always)]
+unsafe fn id_eol(p: *const u8, prefix: u8) -> Option<(u64, *const u8)> {
+    let quoted = (*p == b'"') as usize;
+    let p = p.add(quoted);
+    let delim = if quoted == 0 { b'\n' } else { b'"' };
+    let ends_nl = |len: usize| (*p.add(len) == delim) & ((quoted == 0) | (*p.add(len + 1) == b'\n'));
+    let len = if ends_nl(9) {
+        9
+    } else if ends_nl(8) {
+        8
+    } else {
+        return None;
+    };
+    let key = packed::encode_short(*p, ld8(p.add(1)), len - 1, prefix)?;
+    Some((key, p.add(len + 1 + quoted)))
+}
+
+/// Fast direct parser for two-column link CSVs (`user_a,user_b\n`).
+/// Falls back per row to `scan::row_fields::<2>` + scalar `packed::encode`.
+#[inline]
+pub(super) fn links(
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    mut emit: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<()> {
+    if lo >= hi {
+        return Ok(());
+    }
+    assert!(hi < u32::MAX as usize && buf.len() >= hi + scan::PAD && buf[hi - 1] == b'\n');
+    let base = buf.as_ptr();
+    let mut p = unsafe { base.add(lo) };
+    let end = unsafe { base.add(hi) };
+    while p < end {
+        let fast = unsafe {
+            id(p, b'u').and_then(|(a, next)| id_eol(next, b'u').map(|(b, eol)| (a, b, eol)))
+        };
+        if let Some((a, b, next)) = fast {
+            if a != b {
+                emit(a, b)?;
+            }
+            p = next;
+        } else {
+            let start = unsafe { p.offset_from(base) as usize };
+            let lf = start + scan::memchr(b'\n', &buf[start..hi]).expect("LF-terminated chunk");
+            if let Some([a, b]) = scan::row_fields::<2>(buf, start, lf) {
+                let a = &buf[a.0 as usize..a.1 as usize];
+                let b = &buf[b.0 as usize..b.1 as usize];
+                if !a.is_empty() && !b.is_empty() {
+                    match (packed::encode(a, b'u'), packed::encode(b, b'u')) {
+                        (Some(a), Some(b)) if a == b => {}
+                        (Some(a), Some(b)) => emit(a, b)?,
+                        _ => return Err("link user ID exceeds the 43-bit alphabet"),
+                    }
+                }
+            }
+            p = unsafe { base.add(lf + 1) };
+        }
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -96,6 +172,7 @@ impl Tail {
 
 pub(super) trait EventOutput {
     fn valid(&mut self, eid: u64, ingest: u32, user: u64, ts: u32, cc: u32);
+    fn valid_sec(&mut self, eid: u64, ingest: u32, user: u64, sec: u32, cc: u32);
     fn invalid(&mut self, eid: u64, ingest: u32);
     fn unsupported(&mut self, limit: &'static str);
 }
@@ -104,7 +181,7 @@ pub(super) trait EventOutput {
 /// emitting. At the start of each field at least PAD bytes remain readable.
 #[inline(always)]
 unsafe fn event(rows: &ParseRows, p: *const u8, emit: &mut impl EventOutput) -> Option<*const u8> {
-    let (eid, p) = id(p, b'e')?;
+    let (eid, p) = id_eid(p)?;
     let (user, p) = id(p, b'u')?;
     let (p, delim, q) = open(p);
     let len = if *p.add(19) == b'Z' && ends(p, 20, delim, q) {
@@ -120,18 +197,31 @@ unsafe fn event(rows: &ParseRows, p: *const u8, emit: &mut impl EventOutput) -> 
     if *ingest_p.add(19) != b'Z' || !ends(ingest_p, 20, delim, q) {
         return None;
     }
-    let (t, ingest) = if len == 20 {
-        rows.dt.parse_f1_pair(p, ingest_p)?
+    let (t_sec_opt, t, ingest) = if len == 20 {
+        let (ts_sec, ing) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        if rows.ws_whole_sec {
+            if (ts_sec < rows.ws_sec) | (ts_sec >= rows.we_sec) {
+                return None;
+            }
+            if ing - ts_sec > 86_400 {
+                return None;
+            }
+            (Some((ts_sec - rows.ws_sec) as u32), 0, ing)
+        } else {
+            let t = ts_sec * 1000;
+            if (t < rows.ws) | (t >= rows.we) | (ing * 1000 - t > ts::DAY_MS) {
+                return None;
+            }
+            (None, t, ing)
+        }
     } else {
-        (rows.dt.parse(p, len)?, rows.dt.parse_f1_sec(ingest_p, 20)?)
+        let (t, ing) = (rows.dt.parse(p, len)?, rows.dt.parse_f1_sec(ingest_p, 20)?);
+        if (t < rows.ws) | (t >= rows.we) | (ing * 1000 - t > ts::DAY_MS) {
+            return None;
+        }
+        (None, t, ing)
     };
-    if (t < rows.ws) | (t >= rows.we) {
-        return None;
-    }
     let relative_ingest = rows.ingest_rel(ingest)?;
-    if ingest * 1000 - t > ts::DAY_MS {
-        return None;
-    }
     let (p, delim, q) = open(ingest_p.add(21 + q));
     let word = p.cast::<u32>().read_unaligned();
     let (purchase, p) = if ((word == u32::from_le_bytes(*b"view"))
@@ -163,7 +253,11 @@ unsafe fn event(rows: &ParseRows, p: *const u8, emit: &mut impl EventOutput) -> 
     } else {
         0
     };
-    emit.valid(eid, relative_ingest, user, (t - rows.ws) as u32, cc);
+    if let Some(sec) = t_sec_opt {
+        emit.valid_sec(eid, relative_ingest, user, sec, cc);
+    } else {
+        emit.valid(eid, relative_ingest, user, (t - rows.ws) as u32, cc);
+    }
     Some(p.add(tail.lf + 1))
 }
 
@@ -231,9 +325,10 @@ fn parse_event(
     if eid.is_empty() {
         return Ok(());
     }
-    let eid = packed::encode(eid, b'e').ok_or("event ID exceeds the 43-bit alphabet")?;
+    let eid = packed::encode_eid(eid).ok_or("event ID exceeds the 43-bit alphabet")?;
     let Some(ims) = timestamp(rows, ingest) else {
-        return Err("unparseable ingest timestamp");
+        emit.invalid(eid, INVALID_INGEST);
+        return Ok(());
     };
     let ingest = rows
         .ingest_rel(ims.div_euclid(1000))

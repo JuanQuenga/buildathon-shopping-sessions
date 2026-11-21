@@ -1,29 +1,10 @@
-use super::{par, read, scan, Chunks, ReadBuffers, Result, PARTITIONS};
-use crate::proto_c::arena::{Bucket, Region};
+use super::{direct, par, read, Chunks, ReadBuffers, Result, PARTITIONS};
+use crate::proto_c::arena::{Bucket, LocalAlloc, Region};
 use crate::proto_c::packed::{self, hash, ID_BITS, ID_MASK, LOW_HASH_BITS, PERSON_BITS, PERSON_MASK};
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 const INDEX_LIMIT: usize = 1 << (64 - ID_BITS);
-const BLOOM_WORDS: usize = (1536 << 10) / 8;
-const MASKS: [u64; 1024] = bloom_masks();
-
-const fn bloom_masks() -> [u64; 1024] {
-    let mut masks = [0; 1024];
-    let mut i = 0;
-    let mut x = 41u64;
-    while i < masks.len() {
-        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let z = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        masks[i] = (1 << (z & 15))
-            | (1 << (16 + ((z >> 8) & 15)))
-            | (1 << (32 + ((z >> 16) & 15)))
-            | (1 << (48 + ((z >> 24) & 15)));
-        i += 1;
-    }
-    masks
-}
 
 #[inline(always)]
 pub fn partition(h: u64) -> usize {
@@ -33,141 +14,101 @@ pub fn partition(h: u64) -> usize {
 #[derive(Clone, Copy)]
 struct Shard {
     start: usize,
-    cap: usize,
+    len: usize,
 }
 
-impl Shard {
-    #[inline(always)]
-    fn slot(self, h: u64) -> usize {
-        let start = ((h as u32 as u64 * self.cap as u64) >> 32) as usize;
-        self.start + start
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(64))]
+pub struct RelocBucket {
+    keys: [u64; 4],
+    canon: [u64; 4],
+}
+
+/// L2-hot per-worker 4-wide AVX2 hash map built once per raw shard `q`.
+/// Keys store `perm35 + 1` so `0` unambiguously marks an empty lane with no mask.
+#[derive(Default)]
+pub struct RelocMap {
+    buckets: Vec<RelocBucket>,
+    mask: usize,
+}
+
+impl RelocMap {
+    pub fn reset(&mut self, pairs: &[(u64, u64)]) {
+        let cap = pairs.len().div_ceil(2).next_power_of_two().max(1);
+        if self.buckets.len() < cap {
+            self.buckets.resize(cap, RelocBucket::default());
+        }
+        let buckets = &mut self.buckets[..cap];
+        buckets.fill(RelocBucket::default());
+        let mask = cap - 1;
+        self.mask = mask;
+        for &(perm35, canon43) in pairs {
+            let k = perm35 + 1;
+            let mut slot = perm35 as usize & mask;
+            'ins: loop {
+                let b = unsafe { buckets.get_unchecked_mut(slot) };
+                for lane in 0..4 {
+                    if b.keys[lane] == 0 {
+                        b.keys[lane] = k;
+                        b.canon[lane] = canon43;
+                        break 'ins;
+                    }
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
     }
 
     #[inline(always)]
-    fn perm_group(self, perm35: u64) -> usize {
-        let groups = (self.cap >> 3) as u64;
-        let mix = perm35.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32;
-        self.start + ((((mix * groups) >> 32) as usize) << 3)
+    pub fn prefetch(&self, perm35: u64) -> usize {
+        let slot = perm35 as usize & self.mask;
+        unsafe {
+            _mm_prefetch::<_MM_HINT_T0>(self.buckets.as_ptr().add(slot).cast());
+        }
+        slot
     }
 
     #[inline(always)]
-    fn next(self, index: usize) -> usize {
-        if index + 1 == self.start + self.cap {
-            self.start
-        } else {
-            index + 1
+    pub fn resolve_slot(&self, perm35: u64, mut slot: usize) -> Option<(usize, u64)> {
+        use std::arch::x86_64::*;
+        let needle = unsafe { _mm256_set1_epi64x((perm35 + 1) as i64) };
+        let zero = unsafe { _mm256_setzero_si256() };
+        let mask = self.mask;
+        unsafe {
+            loop {
+                let b = self.buckets.get_unchecked(slot);
+                let keys = _mm256_load_si256(b.keys.as_ptr().cast());
+                let hits = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
+                    as u32;
+                if hits != 0 {
+                    let c = *b.canon.get_unchecked(hits.trailing_zeros() as usize);
+                    return Some(((c >> PERSON_BITS) as usize, c & PERSON_MASK));
+                }
+                if _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, zero))) != 0 {
+                    return None;
+                }
+                slot = (slot + 1) & mask;
+            }
         }
     }
 }
 
 pub struct Links<'a> {
-    table: &'a [u64],
+    pairs: &'a [(u64, u64)],
     by_raw: [Shard; PARTITIONS],
-    canonical: &'a [u64],
-    bloom: &'a [u64],
 }
 
-impl Links<'_> {
+impl<'a> Links<'a> {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
+        self.pairs.is_empty()
     }
 
     #[inline(always)]
-    pub fn shard_empty(&self, q: usize) -> bool {
-        self.by_raw[q].cap == 0
+    pub fn shard(&self, q: usize) -> &[(u64, u64)] {
+        let s = unsafe { *self.by_raw.get_unchecked(q) };
+        unsafe { self.pairs.get_unchecked(s.start..s.start + s.len) }
     }
-
-    #[inline(always)]
-    pub fn prefetch_perm(&self, q: usize, perm35: u64) -> usize {
-        let shard = unsafe { *self.by_raw.get_unchecked(q) };
-        let group = shard.perm_group(perm35);
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(group).cast()) };
-        group
-    }
-
-    /// Resolve a 35-bit permuted person key inside raw shard `q` directly to
-    /// `(canonical_q, canonical_perm35)` using an 8-wide 64B cache-line AVX2 probe.
-    #[inline(always)]
-    pub fn resolve_perm_slot(&self, q: usize, perm35: u64, mut i: usize) -> Option<(usize, u64)> {
-        use std::arch::x86_64::*;
-        let shard = unsafe { *self.by_raw.get_unchecked(q) };
-        let end = shard.start + shard.cap;
-        unsafe {
-            let needle = _mm256_set1_epi64x(perm35 as i64);
-            let mask35 = _mm256_set1_epi64x(PERSON_MASK as i64);
-            let zero = _mm256_setzero_si256();
-            loop {
-                let ptr = self.table.as_ptr().add(i).cast::<__m256i>();
-                let v0 = _mm256_load_si256(ptr);
-                let v1 = _mm256_load_si256(ptr.add(1));
-                let z0 = _mm256_cmpeq_epi64(v0, zero);
-                let z1 = _mm256_cmpeq_epi64(v1, zero);
-                let eq0 = _mm256_andnot_si256(z0, _mm256_cmpeq_epi64(_mm256_and_si256(v0, mask35), needle));
-                let eq1 = _mm256_andnot_si256(z1, _mm256_cmpeq_epi64(_mm256_and_si256(v1, mask35), needle));
-                let h0 = _mm256_movemask_pd(_mm256_castsi256_pd(eq0)) as u32;
-                let h1 = _mm256_movemask_pd(_mm256_castsi256_pd(eq1)) as u32;
-                let hits = h0 | (h1 << 4);
-                if hits != 0 {
-                    let lane = hits.trailing_zeros() as usize;
-                    let slot = *self.table.get_unchecked(i + lane);
-                    let idx = ((slot >> PERSON_BITS) - 1) as usize;
-                    let c = *self.canonical.get_unchecked(idx);
-                    return Some(((c >> PERSON_BITS) as usize, c & PERSON_MASK));
-                }
-                if _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(z0, z1))) != 0 {
-                    return None;
-                }
-                i += 8;
-                if i == end {
-                    i = shard.start;
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn possible(&self, h: u64) -> bool {
-        if self.bloom.is_empty() {
-            return false;
-        }
-        let (i, bits) = bloom_bits(h, self.bloom.len());
-        unsafe { *self.bloom.get_unchecked(i) & bits == bits }
-    }
-
-    #[inline(always)]
-    pub fn prefetch(&self, h: u64) {
-        let shard = self.by_raw[partition(h)];
-        if shard.cap != 0 {
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(shard.slot(h)).cast()) };
-        }
-    }
-
-    #[inline]
-    pub fn resolve(&self, raw: u64, h: u64) -> u64 {
-        let shard = self.by_raw[partition(h)];
-        if shard.cap == 0 {
-            return raw;
-        }
-        let mut i = shard.slot(h);
-        loop {
-            let slot = unsafe { *self.table.get_unchecked(i) };
-            if slot == 0 {
-                return raw;
-            }
-            if slot & ID_MASK == raw {
-                return unsafe { *self.canonical.get_unchecked((slot >> ID_BITS) as usize) };
-            }
-            i = shard.next(i);
-        }
-    }
-}
-
-#[inline(always)]
-fn bloom_bits(h: u64, len: usize) -> (usize, u64) {
-    let index = ((h as u32 as u64 * len as u64) >> 32) as usize;
-    let bits = MASKS[(h >> 54) as usize];
-    (index, bits)
 }
 
 fn find(parent: &[AtomicU32], mut i: u32) -> u32 {
@@ -208,7 +149,7 @@ fn union(parent: &[AtomicU32], keys: &[u64], mut a: u32, mut b: u32) {
 
 pub fn build<'a>(
     chunks: &Chunks,
-    buffers: &ReadBuffers<'_>,
+    buffers: &ReadBuffers,
     persistent: &'a Region<'_>,
     scratch: &Region<'_>,
     threads: usize,
@@ -217,12 +158,11 @@ pub fn build<'a>(
     let pairs = par::run(
         threads,
         chunks.links.len(),
-        |tid| (tid, Bucket::<[u64; 2]>::default(), Ok(())),
-        |(tid, pairs, error), i| {
+        |tid| (tid, Bucket::<[u64; 2]>::default(), LocalAlloc::new(scratch, 256 << 10, false), Ok(())),
+        |(tid, pairs, alloc, error), i| {
             if error.is_err() {
                 return;
             }
-            // Each pool worker is alone in its own buffer.
             let (buf, lo, hi) = match unsafe { read(chunks, chunks.links[i], buffers, *tid) } {
                 Ok(chunk) => chunk,
                 Err(err) => {
@@ -230,44 +170,27 @@ pub fn build<'a>(
                     return;
                 }
             };
-            let mut start = lo;
-            while start < hi {
-                let lf = start + scan::memchr(b'\n', &buf[start..hi]).unwrap();
-                if let Some([a, b]) = scan::row_fields::<2>(buf, start, lf) {
-                    let a = &buf[a.0 as usize..a.1 as usize];
-                    let b = &buf[b.0 as usize..b.1 as usize];
-                    if !a.is_empty() && !b.is_empty() {
-                        match (packed::encode(a, b'u'), packed::encode(b, b'u')) {
-                            (Some(a), Some(b)) if a == b => {}
-                            (Some(a), Some(b)) => {
-                                if pairs.push(scratch, [a, b]).is_none() {
-                                    *error = Err("link pair arena exhausted");
-                                    return;
-                                }
-                            }
-                            _ => {
-                                *error = Err("link user ID exceeds the 43-bit alphabet");
-                                return;
-                            }
-                        }
-                    }
-                }
-                start = lf + 1;
+            if let Err(err) = direct::links(buf, lo, hi, |a, b| {
+                pairs
+                    .push_local(alloc, [a, b])
+                    .map(|_| ())
+                    .ok_or("link pair arena exhausted")
+            }) {
+                *error = Err(err);
             }
         },
     );
-    for (_, _, error) in &pairs {
-        (*error)?;
-    }
+    let pairs = pairs
+        .into_iter()
+        .map(|(_, p, _, err)| err.map(|()| p))
+        .collect::<Result<Vec<_>>>()?;
     timer.lap("links-parse");
-    let edges = pairs.iter().map(|(_, p, _)| p.len()).sum::<usize>();
+    let edges = pairs.iter().map(|p| p.len()).sum::<usize>();
     if edges == 0 {
         timer.lap("links-uf");
         return Ok(Links {
-            table: &[],
-            by_raw: [Shard { start: 0, cap: 0 }; PARTITIONS],
-            canonical: &[],
-            bloom: &[],
+            pairs: &[],
+            by_raw: [Shard { start: 0, len: 0 }; PARTITIONS],
         });
     }
     if 2 * edges > INDEX_LIMIT {
@@ -278,16 +201,16 @@ pub fn build<'a>(
     // Each parse worker scatters its endpoints by key hash for parallel interning.
     let mut edge_base = Vec::with_capacity(pairs.len());
     let mut prefix = 0;
-    for (_, pairs, _) in &pairs {
+    for p in &pairs {
         edge_base.push(prefix);
-        prefix += pairs.len();
+        prefix += p.len();
     }
     let endpoints = par::run(
         threads,
         pairs.len(),
-        |_| Vec::new(),
-        |out, tid| {
-            let (_, pairs, _) = &pairs[tid];
+        |_| (LocalAlloc::new(scratch, 256 << 10, false), Vec::new()),
+        |(alloc, out), tid| {
+            let pairs = &pairs[tid];
             let mut buckets: [Bucket<'_, u64>; PARTITIONS] =
                 std::array::from_fn(|_| Bucket::default());
             for (i, &pair) in pairs.rows().enumerate() {
@@ -295,7 +218,7 @@ pub fn build<'a>(
                     let p = partition(hash(key));
                     let pos = 2 * (edge_base[tid] + i) + side;
                     if buckets[p]
-                        .push(scratch, key | ((pos as u64) << ID_BITS))
+                        .push_local(alloc, key | ((pos as u64) << ID_BITS))
                         .is_none()
                     {
                         out.push(Err("link endpoint arena exhausted"));
@@ -308,7 +231,7 @@ pub fn build<'a>(
     );
     let endpoints = endpoints
         .into_iter()
-        .flatten()
+        .flat_map(|(_, out)| out)
         .collect::<Result<Vec<_>>>()?;
     drop(pairs);
 
@@ -337,7 +260,7 @@ pub fn build<'a>(
             let mut count = 0;
             for encoded in endpoints.iter().flat_map(|b| b[p].rows()) {
                 let key = encoded & ID_MASK;
-                let mut slot = hash(key) as usize & (cap - 1);
+                let mut slot = (hash(key) >> LOW_HASH_BITS) as usize & (cap - 1);
                 loop {
                     let v = table[slot];
                     if v == 0 {
@@ -403,111 +326,59 @@ pub fn build<'a>(
             out.push((p, roots, end - start - roots));
         },
     );
-    let mut roots_by_part = [0; PARTITIONS];
-    let mut by_raw = [Shard { start: 0, cap: 0 }; PARTITIONS];
+    let mut by_raw = [Shard { start: 0, len: 0 }; PARTITIONS];
     let mut mapped_count = 0;
-    for (p, roots, mapped) in root_counts.into_iter().flatten() {
-        roots_by_part[p] = roots;
-        // Keep <= 55% load across 8-slot (64B) AVX2 groups; >= 1 empty slot guaranteed.
-        by_raw[p].cap = if mapped == 0 {
-            0
-        } else {
-            (mapped * 2 + 1).next_multiple_of(8)
-        };
+    for (p, _roots, mapped) in root_counts.into_iter().flatten() {
+        by_raw[p].len = mapped;
         mapped_count += mapped;
     }
 
-    let mut table_len = 0;
-    let mut canonical_len = 0;
-    let mut root_start = [0; PARTITIONS];
+    let mut pairs_len = 0;
     for p in 0..PARTITIONS {
-        by_raw[p].start = table_len;
-        table_len += by_raw[p].cap;
-        root_start[p] = canonical_len;
-        canonical_len += roots_by_part[p];
+        by_raw[p].start = pairs_len;
+        pairs_len += by_raw[p].len;
     }
 
-    let table = persistent
-        .slice(table_len, 0u64)
-        .ok_or("compact link table arena exhausted")?;
-    let canonical = persistent
-        .slice(canonical_len, 0u64)
-        .ok_or("canonical link ID arena exhausted")?;
-    let dict_index = scratch
-        .slice(2 * edges, 0u32)
-        .ok_or("canonical index arena exhausted")?;
-    let canonical_write = par::SyncPtr(canonical.as_mut_ptr());
-    let index_write = par::SyncPtr(dict_index.as_mut_ptr());
-    par::run(
-        threads,
-        PARTITIONS,
-        |_| (),
-        |_, p| {
-            let start = offsets[p];
-            let end = start + counts_by_part[p];
-            let mut idx = root_start[p];
-            for i in start..end {
-                if parent[i].load(Relaxed) as usize == i {
-                    // Store pre-permuted 43-bit canonical key: (canon_q << 35) | canon_perm35.
-                    let perm43 = hash(keys[i]) >> LOW_HASH_BITS;
-                    unsafe {
-                        canonical_write.write(idx, perm43);
-                        index_write.write(i, idx as u32);
-                    }
-                    idx += 1;
-                }
-            }
-        },
-    );
-    let table_write = par::SyncPtr(table.as_mut_ptr());
+    let out_pairs = persistent
+        .uninit::<(u64, u64)>(pairs_len)
+        .ok_or("compact link pairs arena exhausted")?;
+    let pairs_write = par::SyncPtr(out_pairs.as_mut_ptr().cast::<(u64, u64)>());
     par::run(
         threads,
         PARTITIONS,
         |_| (),
         |_, p| {
             let shard = by_raw[p];
-            let start = offsets[p];
-            let end = start + counts_by_part[p];
-            if shard.cap == 0 {
+            if shard.len == 0 {
                 return;
             }
-            // Tables have disjoint write ranges by raw-key shard.
-            let slots = unsafe { table_write.slice(shard.start, shard.cap) };
+            let start = offsets[p];
+            let end = start + counts_by_part[p];
+            let dst = unsafe { pairs_write.slice(shard.start, shard.len) };
+            let mut w = 0usize;
             for i in start..end {
                 let root = parent[i].load(Relaxed) as usize;
                 if root == i {
                     continue;
                 }
                 let perm35 = packed::record_person(keys[i], hash(keys[i]));
-                let mut g = shard.perm_group(perm35) - shard.start;
-                'ins: loop {
-                    for lane in 0..8 {
-                        if slots[g + lane] == 0 {
-                            // dict_index + 1 is always non-zero, so 0 unambiguously marks an empty slot.
-                            slots[g + lane] = perm35 | ((u64::from(dict_index[root]) + 1) << PERSON_BITS);
-                            break 'ins;
-                        }
-                    }
-                    g += 8;
-                    if g == shard.cap {
-                        g = 0;
-                    }
-                }
+                let canon43 = hash(keys[root]) >> LOW_HASH_BITS;
+                dst[w] = (perm35, canon43);
+                w += 1;
             }
+            debug_assert_eq!(w, shard.len);
         },
     );
+    let out_pairs = unsafe { std::slice::from_raw_parts(out_pairs.as_ptr().cast::<(u64, u64)>(), pairs_len) };
 
-    let bloom = &[];
     eprintln!(
-        "[links] edges={edges} linked_ids={} mapped={mapped_count} table_bytes={} canonical_bytes={} bloom_bytes=0",
-        counts_by_part.iter().sum::<usize>(), table.len() * 8, canonical.len() * 8
+        "[links] edges={edges} linked_ids={} mapped={mapped_count} pair_bytes={}",
+        counts_by_part.iter().sum::<usize>(), out_pairs.len() * 16
     );
     timer.lap("links-uf");
     Ok(Links {
-        table,
+        pairs: out_pairs,
         by_raw,
-        canonical,
-        bloom,
     })
 }
 
@@ -516,7 +387,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_links_and_bloom() {
+    fn exact_links_and_reloc_map() {
         let a = packed::encode(b"U1", b'u').unwrap();
         let b = packed::encode(b"u1", b'u').unwrap();
         let c = packed::encode(b"u00", b'u').unwrap();
@@ -528,42 +399,20 @@ mod tests {
         assert_eq!(find(&parent, 0), 2);
         assert_eq!(find(&parent, 1), 2);
 
-        let mut map = [0; 16];
-        let mut shards = [Shard { start: 0, cap: 0 }; PARTITIONS];
-        let h = hash(b);
-        let shard = Shard {
-            start: 0,
-            cap: map.len(),
-        };
-        shards[partition(h)] = shard;
-        map[shard.slot(h)] = b | (1 << ID_BITS);
-        let mut bloom = [0; 1024];
-        let (i, bits) = bloom_bits(h, bloom.len());
-        bloom[i] = bits;
-        let links = Links {
-            table: &map,
-            by_raw: shards,
-            canonical: &[c, a],
-            bloom: &bloom,
-        };
-        assert!(links.possible(h));
-        assert_eq!(links.resolve(b, h), a);
-        assert_eq!(links.resolve(d, hash(d)), d);
-
-        let mut seen = Vec::new();
-        let mut seed = 12;
-        for _ in 0..8192 {
-            seed = hash(seed);
-            let (block, bits) = bloom_bits(seed, bloom.len());
-            bloom[block] |= bits;
-            seen.push(seed);
-        }
-        let links = Links {
-            table: &map,
-            by_raw: shards,
-            canonical: &[c, a],
-            bloom: &bloom,
-        };
-        assert!(seen.into_iter().all(|h| links.possible(h)));
+        let hb = hash(b);
+        let ha = hash(a);
+        let hd = hash(d);
+        let pb = packed::record_person(b, hb);
+        let ca = ha >> LOW_HASH_BITS;
+        let mut map = RelocMap::default();
+        map.reset(&[(pb, ca)]);
+        let s1 = map.prefetch(pb);
+        assert_eq!(
+            map.resolve_slot(pb, s1),
+            Some(((ca >> PERSON_BITS) as usize, ca & PERSON_MASK))
+        );
+        let pd = packed::record_person(d, hd);
+        let s2 = map.prefetch(pd);
+        assert_eq!(map.resolve_slot(pd, s2), None);
     }
 }

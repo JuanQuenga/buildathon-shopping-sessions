@@ -311,7 +311,6 @@ extern "C" {
 /// Whole-process user seconds, system seconds and minor faults, including workers.
 pub fn rusage_self() -> (f64, f64, i64) {
     let mut usage = MaybeUninit::<Rusage>::uninit();
-    // RUSAGE_SELF includes all threads on Linux.
     assert_eq!(unsafe { getrusage(0, usage.as_mut_ptr()) }, 0);
     let usage = unsafe { usage.assume_init() };
     (usage.utime.seconds(), usage.stime.seconds(), usage.minflt)

@@ -1,7 +1,7 @@
 use super::direct::{self, EventOutput, RawClick};
-use super::links::{partition, Links};
+use super::links::{partition, Links, RelocMap};
 use super::{par, read, Chunks, Kind, ParseRows, ReadBuffers, Result, PARTITIONS};
-use crate::proto_c::arena::{Bucket, Region, WriteLine, BLOCK};
+use crate::proto_c::arena::{Bucket, LocalAlloc, Region, WriteLine, BLOCK};
 use crate::proto_c::packed::{self, hash, RecC, StoredEvent, StoredTok, INVALID_LOC};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -80,7 +80,7 @@ impl<'a> Rows<'a> {
     #[inline(always)]
     fn push_event_extra(
         &mut self,
-        region: &'a Region<'_>,
+        alloc: &mut LocalAlloc<'a>,
         q: usize,
         person: u64,
         seconds: u32,
@@ -99,14 +99,14 @@ impl<'a> Rows<'a> {
             let ex = unsafe { self.event_extras.get_unchecked_mut(q) };
             let index = ex
                 .extras
-                .push(region, extra)
+                .push_local(alloc, extra)
                 .ok_or("event extras arena exhausted")?;
             (index - *ex.offsets.last().unwrap() + 1) as u8
         };
         let record = StoredEvent::new(person, seconds, side);
         match staging {
-            Some(line) => unsafe { raw_bucket.push_staged(region, record, line) },
-            None => raw_bucket.push(region, record),
+            Some(line) => unsafe { raw_bucket.push_staged(alloc, record, line) },
+            None => raw_bucket.push_local(alloc, record),
         }
         .ok_or("event arena exhausted")
     }
@@ -114,7 +114,7 @@ impl<'a> Rows<'a> {
     #[inline(always)]
     fn push_event(
         &mut self,
-        region: &'a Region<'_>,
+        alloc: &mut LocalAlloc<'a>,
         q: usize,
         person: u64,
         ts: u32,
@@ -128,13 +128,13 @@ impl<'a> Rows<'a> {
         } else {
             u64::from(cc) | (u64::from(millis) << 32)
         };
-        self.push_event_extra(region, q, person, seconds, extra, staging)
+        self.push_event_extra(alloc, q, person, seconds, extra, staging)
     }
 
     #[inline(always)]
     fn push_click(
         &mut self,
-        region: &'a Region<'_>,
+        alloc: &mut LocalAlloc<'a>,
         q: usize,
         row: RawClick,
         staging: Option<&mut WriteLine<64>>,
@@ -142,8 +142,8 @@ impl<'a> Rows<'a> {
         let record = RecC::new(row.person, row.cid, row.ts, row.campaign);
         let bucket = unsafe { self.clicks.get_unchecked_mut(q) };
         match staging {
-            Some(line) => unsafe { bucket.push_staged(region, record, line) },
-            None => bucket.push(region, record),
+            Some(line) => unsafe { bucket.push_staged(alloc, record, line) },
+            None => bucket.push_local(alloc, record),
         }
         .map(|_| ())
         .ok_or("click arena exhausted")
@@ -202,13 +202,13 @@ struct Worker<'r, 't> {
     token_lines: Vec<WriteLine<320>>,
     event_lines: Vec<WriteLine<64>>,
     click_lines: Vec<WriteLine<64>>,
+    rec_alloc: LocalAlloc<'r>,
+    tok_alloc: LocalAlloc<'t>,
     error: Result<()>,
 }
 
 struct Emit<'w, 'r, 't> {
     worker: &'w mut Worker<'r, 't>,
-    records: &'r Region<'r>,
-    tokens: &'t Region<'t>,
 }
 
 impl<'r, 't> Emit<'_, 'r, 't> {
@@ -222,12 +222,14 @@ impl<'r, 't> Emit<'_, 'r, 't> {
         let bucket = unsafe { w.tokens.get_unchecked_mut(p) };
         let inserted = if cfg!(feature = "swcb") {
             unsafe {
-                bucket
-                    .raw
-                    .push_staged(self.tokens, tok, w.token_lines.get_unchecked_mut(p))
+                bucket.raw.push_staged(
+                    &mut w.tok_alloc,
+                    tok,
+                    w.token_lines.get_unchecked_mut(p),
+                )
             }
         } else {
-            bucket.raw.push(self.tokens, tok)
+            bucket.raw.push_local(&mut w.tok_alloc, tok)
         };
         let index = inserted.ok_or("token arena exhausted")?;
         if packed::needs_loc_side(loc) {
@@ -247,13 +249,54 @@ impl<'r, 't> Emit<'_, 'r, 't> {
         } else {
             None
         };
-        let idx = w.live.push_event(self.records, q, person, ts, cc, line)?;
+        let idx = w.live.push_event(&mut w.rec_alloc, q, person, ts, cc, line)?;
         if idx >= ROW_MASK as usize {
             return Err("event row count exceeds the worker partition location's range");
         }
         // Loc = tid:3 | raw partition:8 | 0:1 | index:18.
         let loc = (w.tid << 27) | ((q as u32) << 19) | idx as u32;
         self.token(eid, ingest, loc)
+    }
+
+    #[inline(always)]
+    fn add_event_sec(&mut self, eid: u64, ingest: u32, user: u64, seconds: u32, cc: u32) -> Result<()> {
+        let h = hash(user);
+        let q = partition(h);
+        let person = packed::record_person(user, h);
+        let w = &mut self.worker;
+        let line = if cfg!(feature = "swcb") {
+            Some(unsafe { w.event_lines.get_unchecked_mut(q) })
+        } else {
+            None
+        };
+        let idx = w
+            .live
+            .push_event_extra(&mut w.rec_alloc, q, person, seconds, u64::from(cc), line)?;
+        if idx >= ROW_MASK as usize {
+            return Err("event row count exceeds the worker partition location's range");
+        }
+        let eh = hash(eid);
+        let p = (eh >> (64 - TOKEN_PARTITIONS.trailing_zeros())) as usize;
+        let tok = packed::Tok10::pack_valid_fast(eh, ingest, q, idx)
+            .ok_or("ingest exceeds the narrow token window")?;
+        let bucket = unsafe { w.tokens.get_unchecked_mut(p) };
+        let inserted = if cfg!(feature = "swcb") {
+            unsafe {
+                bucket.raw.push_staged(
+                    &mut w.tok_alloc,
+                    tok,
+                    w.token_lines.get_unchecked_mut(p),
+                )
+            }
+        } else {
+            bucket.raw.push_local(&mut w.tok_alloc, tok)
+        };
+        let index = inserted.ok_or("token arena exhausted")?;
+        if idx >= (1 << 16) - 2 {
+            let loc = (w.tid << 27) | ((q as u32) << 19) | idx as u32;
+            bucket.overflow.push((index, loc));
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -267,7 +310,7 @@ impl<'r, 't> Emit<'_, 'r, 't> {
         } else {
             None
         };
-        w.live.push_click(self.records, q, row, line)
+        w.live.push_click(&mut w.rec_alloc, q, row, line)
     }
 }
 
@@ -275,6 +318,13 @@ impl EventOutput for Emit<'_, '_, '_> {
     #[inline(always)]
     fn valid(&mut self, eid: u64, ingest: u32, person: u64, ts: u32, cc: u32) {
         if let Err(limit) = self.add_event(eid, ingest, person, ts, cc) {
+            self.worker.error = Err(limit);
+        }
+    }
+
+    #[inline(always)]
+    fn valid_sec(&mut self, eid: u64, ingest: u32, person: u64, sec: u32, cc: u32) {
+        if let Err(limit) = self.add_event_sec(eid, ingest, person, sec, cc) {
             self.worker.error = Err(limit);
         }
     }
@@ -294,11 +344,16 @@ impl EventOutput for Emit<'_, '_, '_> {
 pub fn parse<'r, 't>(
     ctx: &ParseRows,
     chunks: &Chunks,
-    buffers: &ReadBuffers<'_>,
+    buffers: &ReadBuffers,
     records: &'r Region<'r>,
     tokens: &'t Region<'t>,
     threads: usize,
 ) -> Result<Parsed<'r, 't>> {
+    let slab_pop = std::env::var("PROTO_C_SLAB_POP").as_deref() == Ok("1");
+    let slab_bytes = std::env::var("PROTO_C_SLAB_KIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(256 << 10, |kb| kb.clamp(16, 4096) << 10);
     let workers = par::run_fini(
         threads,
         chunks.main.len(),
@@ -323,6 +378,8 @@ pub fn parse<'r, 't>(
             } else {
                 Vec::new()
             },
+            rec_alloc: LocalAlloc::new(records, slab_bytes, slab_pop),
+            tok_alloc: LocalAlloc::new(tokens, slab_bytes, slab_pop),
             error: Ok(()),
         },
         |worker, i| {
@@ -337,11 +394,7 @@ pub fn parse<'r, 't>(
                     return;
                 }
             };
-            let mut emit = Emit {
-                worker,
-                records,
-                tokens,
-            };
+            let mut emit = Emit { worker };
             match chunks.files[chunk.file as usize].kind {
                 Kind::Events => direct::events(ctx, buf, lo, hi, &mut emit),
                 Kind::Clicks => {
@@ -626,21 +679,54 @@ pub fn relocate<'a, 'b>(
     live: &[Rows<'_>],
     dead: &Dead<'_>,
     links: &Links<'_>,
-    phase: &'a Region<'_>,
+    phase: &'a Region<'a>,
     persistent: &'b Region<'_>,
     threads: usize,
 ) -> Result<(Vec<Rows<'a>>, Dead<'b>)> {
     let dead_clicks = Dead::build_clicks(live, persistent)?;
-    let workers = par::run(
+    struct RelocWorker<'a> {
+        out: Rows<'a>,
+        alloc: LocalAlloc<'a>,
+        map: RelocMap,
+        event_lines: Vec<WriteLine<64>>,
+        click_lines: Vec<WriteLine<64>>,
+        error: Result<()>,
+    }
+    let workers = par::run_fini(
         threads,
         PARTITIONS,
-        |_| (Rows::new(PARTITIONS), Ok(())),
-        |(out, error), q| {
-            if error.is_err() || links.shard_empty(q) {
+        |_| RelocWorker {
+            out: Rows::new(PARTITIONS),
+            alloc: LocalAlloc::new(phase, 256 << 10, false),
+            map: RelocMap::default(),
+            event_lines: if cfg!(feature = "swcb") {
+                (0..PARTITIONS).map(|_| WriteLine::default()).collect()
+            } else {
+                Vec::new()
+            },
+            click_lines: if cfg!(feature = "swcb") {
+                (0..PARTITIONS).map(|_| WriteLine::default()).collect()
+            } else {
+                Vec::new()
+            },
+            error: Ok(()),
+        },
+        |w, q| {
+            if w.error.is_err() {
                 return;
             }
+            let shard = links.shard(q);
+            if shard.is_empty() {
+                return;
+            }
+            w.map.reset(shard);
+            let map = &w.map;
+            let out = &mut w.out;
+            let alloc = &mut w.alloc;
+            let ev_lines = &mut w.event_lines;
+            let ck_lines = &mut w.click_lines;
             for (tid, rows) in live.iter().enumerate() {
-                // Events: 8-wide prefetch into L2-hot shard q; move only linked rows.
+                // Events: 8-wide prefetch into L2-hot 4-wide AVX2 RelocMap; NT-stream moved rows.
                 let mut ewords = dead.workers[tid][q].iter();
                 for (bi, block) in rows.events[q].blocks().enumerate() {
                     for slice in block.chunks(64) {
@@ -650,27 +736,31 @@ pub fn relocate<'a, 'b>(
                         let mut done = 0usize;
                         for grp in slice.chunks_exact(8) {
                             let slots: [usize; 8] =
-                                std::array::from_fn(|i| links.prefetch_perm(q, grp[i].person()));
+                                std::array::from_fn(|i| map.prefetch(grp[i].person()));
                             let m8 = (mask >> done) as u8;
                             if m8 == 0 {
                                 for (i, (&row, slot)) in grp.iter().zip(slots).enumerate() {
-                                    if let Some((cq, cperm)) =
-                                        links.resolve_perm_slot(q, row.person(), slot)
+                                    if let Some((cq, cperm)) = map.resolve_slot(row.person(), slot)
                                     {
                                         let extra = if row.side() != 0 {
                                             rows.extra_of(q, bi, row.side())
                                         } else {
                                             0
                                         };
+                                        let line = if cfg!(feature = "swcb") {
+                                            Some(unsafe { ev_lines.get_unchecked_mut(cq) })
+                                        } else {
+                                            None
+                                        };
                                         if let Err(err) = out.push_event_extra(
-                                            phase,
+                                            alloc,
                                             cq,
                                             cperm,
                                             row.seconds(),
                                             extra,
-                                            None,
+                                            line,
                                         ) {
-                                            *error = Err(err);
+                                            w.error = Err(err);
                                             return;
                                         }
                                         moved |= 1u64 << (done + i);
@@ -680,22 +770,27 @@ pub fn relocate<'a, 'b>(
                                 for (i, (&row, slot)) in grp.iter().zip(slots).enumerate() {
                                     if (m8 & (1 << i)) == 0 {
                                         if let Some((cq, cperm)) =
-                                            links.resolve_perm_slot(q, row.person(), slot)
+                                            map.resolve_slot(row.person(), slot)
                                         {
                                             let extra = if row.side() != 0 {
                                                 rows.extra_of(q, bi, row.side())
                                             } else {
                                                 0
                                             };
+                                            let line = if cfg!(feature = "swcb") {
+                                                Some(unsafe { ev_lines.get_unchecked_mut(cq) })
+                                            } else {
+                                                None
+                                            };
                                             if let Err(err) = out.push_event_extra(
-                                                phase,
+                                                alloc,
                                                 cq,
                                                 cperm,
                                                 row.seconds(),
                                                 extra,
-                                                None,
+                                                line,
                                             ) {
-                                                *error = Err(err);
+                                                w.error = Err(err);
                                                 return;
                                             }
                                             moved |= 1u64 << (done + i);
@@ -707,24 +802,27 @@ pub fn relocate<'a, 'b>(
                         }
                         for (i, &row) in slice[done..].iter().enumerate() {
                             if (mask & (1u64 << (done + i))) == 0 {
-                                let slot = links.prefetch_perm(q, row.person());
-                                if let Some((cq, cperm)) =
-                                    links.resolve_perm_slot(q, row.person(), slot)
-                                {
+                                let slot = map.prefetch(row.person());
+                                if let Some((cq, cperm)) = map.resolve_slot(row.person(), slot) {
                                     let extra = if row.side() != 0 {
                                         rows.extra_of(q, bi, row.side())
                                     } else {
                                         0
                                     };
+                                    let line = if cfg!(feature = "swcb") {
+                                        Some(unsafe { ev_lines.get_unchecked_mut(cq) })
+                                    } else {
+                                        None
+                                    };
                                     if let Err(err) = out.push_event_extra(
-                                        phase,
+                                        alloc,
                                         cq,
                                         cperm,
                                         row.seconds(),
                                         extra,
-                                        None,
+                                        line,
                                     ) {
-                                        *error = Err(err);
+                                        w.error = Err(err);
                                         return;
                                     }
                                     moved |= 1u64 << (done + i);
@@ -737,7 +835,7 @@ pub fn relocate<'a, 'b>(
                     }
                 }
 
-                // Clicks: 8-wide prefetch into L2-hot shard q; move only linked clicks.
+                // Clicks: 8-wide prefetch into L2-hot 4-wide AVX2 RelocMap; NT-stream moved clicks.
                 let mut cwords = dead_clicks.workers[tid][q].iter();
                 for block in rows.clicks[q].blocks() {
                     for slice in block.chunks(64) {
@@ -746,19 +844,22 @@ pub fn relocate<'a, 'b>(
                         let mut done = 0usize;
                         for grp in slice.chunks_exact(8) {
                             let slots: [usize; 8] =
-                                std::array::from_fn(|i| links.prefetch_perm(q, grp[i].person()));
+                                std::array::from_fn(|i| map.prefetch(grp[i].person()));
                             for (i, (&row, slot)) in grp.iter().zip(slots).enumerate() {
-                                if let Some((cq, cperm)) =
-                                    links.resolve_perm_slot(q, row.person(), slot)
-                                {
+                                if let Some((cq, cperm)) = map.resolve_slot(row.person(), slot) {
                                     let click = RawClick {
                                         person: cperm,
                                         cid: row.cid(),
                                         ts: row.ts(),
                                         campaign: row.campaign(),
                                     };
-                                    if let Err(err) = out.push_click(phase, cq, click, None) {
-                                        *error = Err(err);
+                                    let line = if cfg!(feature = "swcb") {
+                                        Some(unsafe { ck_lines.get_unchecked_mut(cq) })
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(err) = out.push_click(alloc, cq, click, line) {
+                                        w.error = Err(err);
                                         return;
                                     }
                                     moved |= 1u64 << (done + i);
@@ -767,18 +868,21 @@ pub fn relocate<'a, 'b>(
                             done += 8;
                         }
                         for (i, &row) in slice[done..].iter().enumerate() {
-                            let slot = links.prefetch_perm(q, row.person());
-                            if let Some((cq, cperm)) =
-                                links.resolve_perm_slot(q, row.person(), slot)
-                            {
+                            let slot = map.prefetch(row.person());
+                            if let Some((cq, cperm)) = map.resolve_slot(row.person(), slot) {
                                 let click = RawClick {
                                     person: cperm,
                                     cid: row.cid(),
                                     ts: row.ts(),
                                     campaign: row.campaign(),
                                 };
-                                if let Err(err) = out.push_click(phase, cq, click, None) {
-                                    *error = Err(err);
+                                let line = if cfg!(feature = "swcb") {
+                                    Some(unsafe { ck_lines.get_unchecked_mut(cq) })
+                                } else {
+                                    None
+                                };
+                                if let Err(err) = out.push_click(alloc, cq, click, line) {
+                                    w.error = Err(err);
                                     return;
                                 }
                                 moved |= 1u64 << (done + i);
@@ -791,10 +895,23 @@ pub fn relocate<'a, 'b>(
                 }
             }
         },
+        |w| {
+            if cfg!(feature = "swcb") {
+                unsafe {
+                    for (bucket, line) in w.out.events.iter_mut().zip(&w.event_lines) {
+                        bucket.finish_staged(line);
+                    }
+                    for (bucket, line) in w.out.clicks.iter_mut().zip(&w.click_lines) {
+                        bucket.finish_staged(line);
+                    }
+                    std::arch::x86_64::_mm_sfence();
+                }
+            }
+        },
     );
     let relocated = workers
         .into_iter()
-        .map(|(rows, status)| status.map(|_| rows))
+        .map(|w| w.error.map(|()| w.out))
         .collect::<Result<Vec<_>>>()?;
     Ok((relocated, dead_clicks))
 }

@@ -37,8 +37,7 @@ pub fn hash(key: u64) -> u64 {
     let x = key.wrapping_mul(H1) & ID_MASK;
     let y = (x ^ (x >> 21)).wrapping_mul(H2) & ID_MASK;
     let permuted = y ^ (y >> 22);
-    let low = ((x as u32).rotate_left(13) ^ ((y >> 17) as u32)) & ((1 << LOW_HASH_BITS) - 1);
-    (permuted << LOW_HASH_BITS) | u64::from(low)
+    permuted << LOW_HASH_BITS
 }
 
 #[inline(always)]
@@ -134,6 +133,164 @@ fn encode_upper(tail: &[u8]) -> Option<u64> {
         }
     }
     Some(rank)
+}
+
+const BASE_36_8: u64 = 36u64.pow(8);
+const BASE_36_7: u64 = 36u64.pow(7);
+const EID_SHORT_BASE: u64 = 3 * BASE_36_8;
+const _: () = assert!(EID_SHORT_BASE + 3 * SUB36[7] <= ID_MASK);
+
+/// Fast injective 43-bit encoder for `event_id` (equality-only: no order needed,
+/// skips `_mm_sad_epu8` and `/ 35` on the hot 8-char and 7-char lowercase paths).
+#[inline(always)]
+pub fn encode_eid_short(prefix: u8, tail: u64, suffix_len: usize) -> Option<u64> {
+    debug_assert!(matches!(suffix_len, 7 | 8));
+    if prefix != b'e' {
+        return encode_eid(&[
+            prefix,
+            tail as u8,
+            (tail >> 8) as u8,
+            (tail >> 16) as u8,
+            (tail >> 24) as u8,
+            (tail >> 32) as u8,
+            (tail >> 40) as u8,
+            (tail >> 48) as u8,
+            (tail >> 56) as u8,
+        ][..=suffix_len]);
+    }
+    unsafe {
+        let src = _mm_cvtsi64_si128(tail as i64);
+        let digit_range = _mm_and_si128(
+            _mm_cmpgt_epi8(src, _mm_set1_epi8(b'0' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'9' as i8 + 1), src),
+        );
+        let letter_range = _mm_and_si128(
+            _mm_cmpgt_epi8(src, _mm_set1_epi8(b'a' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'z' as i8 + 1), src),
+        );
+        let valid = _mm_movemask_epi8(_mm_or_si128(digit_range, letter_range)) as u32;
+        let keep = (1 << suffix_len) - 1;
+        if valid & keep != keep {
+            return None;
+        }
+        let numbers = _mm_sub_epi8(src, _mm_set1_epi8(b'0' as i8));
+        let alpha = _mm_sub_epi8(src, _mm_set1_epi8(b'a' as i8 - 10));
+        let digits = _mm_blendv_epi8(alpha, numbers, digit_range);
+        if suffix_len == 8 {
+            let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x0124));
+            let quads = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) | 1296));
+            let packed = _mm_cvtsi128_si64(quads) as u64;
+            Some((packed as u32 as u64) * BASE_36_4 + (packed >> 32))
+        } else {
+            let masked = _mm_and_si128(digits, _mm_cvtsi64_si128(0x00ff_ffff_ffff_ffff));
+            let pairs = _mm_maddubs_epi16(masked, _mm_set1_epi16(0x0124));
+            let quads = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) | 1296));
+            let packed = _mm_cvtsi128_si64(quads) as u64;
+            // Last lane is 0, so packed_hi = d4*36^3 + d5*36^2 + d6*36 + 0 -> divide by 36 via
+            // pre-shifted sum: n7 = (packed_lo * 36^3) + (packed_hi / 36); simpler: shift digits right 1?
+            // Actually packed_lo * BASE_36_4 + packed_hi = 36 * n7, and we don't even need to divide by 36
+            // unless we match encode_eid! Just compute exact n7 in encode_eid_short:
+            let n7 = (packed as u32 as u64) * (36 * 36 * 36) + ((packed >> 32) / 36);
+            Some(EID_SHORT_BASE + n7)
+        }
+    }
+}
+
+/// Scalar counterpart to `encode_eid_short` (must return identical 43-bit codes for all valid IDs).
+#[inline]
+pub fn encode_eid(id: &[u8]) -> Option<u64> {
+    let (&prefix, tail) = id.split_first()?;
+    if !(1..=8).contains(&tail.len()) {
+        return None;
+    }
+    if tail.len() == 8 {
+        if prefix == b'e' {
+            let mut n = 0u64;
+            for &b in tail {
+                n = n * 36 + symbol(b, b'a')?;
+            }
+            return Some(n);
+        }
+        if prefix == b'E' {
+            let mut n = 0u64;
+            let mut alpha = 0u8;
+            for &b in tail {
+                let d = if b.is_ascii_digit() {
+                    u64::from(b - b'0')
+                } else if b.is_ascii_uppercase() {
+                    if alpha == b'a' {
+                        return None;
+                    }
+                    alpha = b'A';
+                    u64::from(b - b'A' + 10)
+                } else if b.is_ascii_lowercase() {
+                    if alpha == b'A' {
+                        return None;
+                    }
+                    alpha = b'a';
+                    u64::from(b - b'a' + 10)
+                } else {
+                    return None;
+                };
+                n = n * 36 + d;
+            }
+            let base = if alpha == b'a' { 2 * BASE_36_8 } else { BASE_36_8 };
+            return Some(base + n);
+        }
+        return None;
+    }
+    if tail.len() == 7 && prefix == b'e' {
+        let mut n = 0u64;
+        for &b in tail {
+            n = n * 36 + symbol(b, b'a')?;
+        }
+        return Some(EID_SHORT_BASE + n);
+    }
+    // Lengths 1..=6 (any valid e/E) or length 7 with prefix 'E': pack into [EID_SHORT_BASE + BASE_36_7, ID_MASK].
+    // Map via prefix/case tag (0='e', 1='E' upper/digit, 2='E' lower) + dense length<=7 rank.
+    let mut n = 0u64;
+    let mut alpha = if prefix == b'e' { b'a' } else if prefix == b'E' { 0 } else { return None };
+    let mut mult = 1u64;
+    for &b in tail {
+        let d = if b.is_ascii_digit() {
+            u64::from(b - b'0')
+        } else if alpha == 0 {
+            if b.is_ascii_uppercase() {
+                alpha = b'A';
+                u64::from(b - b'A' + 10)
+            } else if b.is_ascii_lowercase() {
+                alpha = b'a';
+                u64::from(b - b'a' + 10)
+            } else {
+                return None;
+            }
+        } else {
+            symbol(b, alpha)?
+        };
+        n = n * 36 + d;
+        mult *= 36;
+    }
+    let tag: u64 = if prefix == b'e' {
+        0
+    } else if alpha == b'a' {
+        2
+    } else {
+        1
+    };
+    // Distinct per (len 1..=7, tag): offset by sum_{k=1}^{len-1} 36^k = (mult - 36)/35 + 1?
+    // Simpler: use SUB36[7] per tag (3 * SUB36[7] fits comfortably after EID_SHORT_BASE + BASE_36_7? Wait:
+    // EID_SHORT_BASE + BASE_36_7 + 2 * SUB36[7] = 8.463e12 + 78.36e9 + 161.19e9 = 8.703e12 < 8.796e12 = 2^43!)
+    // Since tag==0 never has len==7 here, tag==0 uses [0, SUB36[6]), tag==1 uses [SUB36[6], SUB36[6]+SUB36[7]),
+    // tag==2 uses [SUB36[6]+SUB36[7], SUB36[6]+2*SUB36[7]).
+    let rank_within_tag = (mult - 1) / 35 + n;
+    let tag_off = match tag {
+        0 => 0,
+        1 => SUB36[6],
+        _ => SUB36[6] + SUB36[7],
+    };
+    let code = EID_SHORT_BASE + BASE_36_7 + tag_off + rank_within_tag;
+    debug_assert!(code <= ID_MASK);
+    Some(code)
 }
 
 /// SIMD equivalent for the usual seven- and eight-byte suffixes.
@@ -378,7 +535,7 @@ pub fn needs_loc_side(loc: u32) -> bool {
 }
 
 #[cfg(any(test, feature = "narrow"))]
-/// 34-bit exact event key within its partition, 21-bit ingest seconds and
+/// 34-bit exact event key within its 512-way partition, 21-bit ingest seconds and
 /// a 25-bit worker-local location. The token block identifies the worker.
 #[derive(Clone, Copy)]
 #[repr(C, packed(2))]
@@ -403,7 +560,25 @@ impl Tok10 {
         } else if loc == OVERFLOW_LOC || (loc & FULL_ROW_MASK) >= NARROW_ROW_MASK - 1 {
             (1 << 25) - 2
         } else {
-            ((loc >> 18) & 511) << 16 | (loc & NARROW_ROW_MASK)
+            (((loc >> 18) & 511) << 16) | (loc & NARROW_ROW_MASK)
+        };
+        Some(Self {
+            head: ((h >> LOW_HASH_BITS) & TOKEN_MASK)
+                | (u64::from(ingest) << TOKEN_BITS)
+                | (u64::from(location) << (TOKEN_BITS + 21)),
+            tail: (location >> 9) as u16,
+        })
+    }
+
+    #[inline(always)]
+    pub fn pack_valid_fast(h: u64, ingest: u32, q: usize, idx: usize) -> Option<Self> {
+        if ingest >= NARROW_INGEST_LIMIT {
+            return None;
+        }
+        let location = if idx >= (NARROW_ROW_MASK as usize - 1) {
+            (1u32 << 25) - 2
+        } else {
+            ((q as u32) << 17) | (idx as u32)
         };
         Some(Self {
             head: ((h >> LOW_HASH_BITS) & TOKEN_MASK)
@@ -487,10 +662,14 @@ mod tests {
         assert_eq!(size_of::<Tok10>(), 10);
         assert_eq!(size_of::<RecB8>(), 8);
         let compact =
-            Tok10::pack(0, u64::MAX, 1_234_567, (7 << 27) | (500 << 18) | 65_533).unwrap();
+            Tok10::pack(0, u64::MAX, 1_234_567, (7 << 27) | (250 << 19) | 65_533).unwrap();
         assert_eq!(compact.key(), TOKEN_MASK);
         assert_eq!(compact.ingest(), 1_234_567);
-        assert_eq!(compact.location(7), (7 << 27) | (500 << 18) | 65_533);
+        assert_eq!(compact.location(7), (7 << 27) | (250 << 19) | 65_533);
+        let fast = Tok10::pack_valid_fast(u64::MAX, 1_234_567, 250, 65_533).unwrap();
+        assert_eq!(fast.key(), compact.key());
+        assert_eq!(fast.ingest(), compact.ingest());
+        assert_eq!(fast.location(7), compact.location(7));
         let overflow = Tok10::pack(0, 0, 0, 110_000).unwrap();
         assert_eq!(overflow.location(0), OVERFLOW_LOC);
         let invalid = Tok10::pack(0, 0, INVALID_INGEST, INVALID_LOC).unwrap();
@@ -582,5 +761,69 @@ mod tests {
         }
         assert!(encode(b"u123456789", b'u').is_none());
         assert!(encode(b"U00Zz", b'u').is_none());
+    }
+
+    #[test]
+    fn eid_fast_matches_scalar_and_injective() {
+        let mut seen = std::collections::HashSet::new();
+        let mut samples: Vec<Vec<u8>> = [
+            b"e0".as_slice(),
+            b"e00",
+            b"e0000000",
+            b"e00000000",
+            b"ezzzzzzz",
+            b"ezzzzzzzz",
+            b"E0",
+            b"E0000000",
+            b"E00000000",
+            b"EZZZZZZZZ",
+            b"Ezzzzzzzz",
+            b"E00a",
+            b"E00A",
+        ]
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+        let mut rng = 77u64;
+        for i in 0..50_000 {
+            rng = rng.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+            let upper_prefix = i % 5 == 0;
+            let upper_body = i % 3 == 0;
+            let mut id = vec![if upper_prefix { b'E' } else { b'e' }];
+            let len = if i % 4 == 0 { 1 + i % 7 } else { 7 + (i & 1) };
+            let mut n = rng;
+            for _ in 0..len {
+                let d = (n % 36) as u8;
+                id.push(if d < 10 {
+                    b'0' + d
+                } else if upper_prefix && upper_body {
+                    b'A' + d - 10
+                } else {
+                    b'a' + d - 10
+                });
+                n /= 36;
+            }
+            samples.push(id);
+        }
+        samples.sort_unstable();
+        samples.dedup();
+        for id in samples {
+            let code = encode_eid(&id).expect("valid eid");
+            assert!(code <= ID_MASK);
+            assert!(seen.insert(code), "collision for {:?}", String::from_utf8_lossy(&id));
+            if id.len() >= 8 {
+                let mut tail = [0u8; 8];
+                tail[..id.len() - 1].copy_from_slice(&id[1..]);
+                assert_eq!(
+                    encode_eid_short(id[0], u64::from_le_bytes(tail), id.len() - 1),
+                    Some(code),
+                    "mismatch for {:?}",
+                    String::from_utf8_lossy(&id)
+                );
+            }
+        }
+        assert!(encode_eid(b"e123456789").is_none());
+        assert!(encode_eid(b"E00Zz").is_none());
+        assert!(encode_eid(b"u00000001").is_none());
     }
 }

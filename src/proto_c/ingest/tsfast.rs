@@ -172,8 +172,9 @@ impl DateTable {
     }
 
     /// Both fields have an independently checked F1 terminator and delimiter.
+    /// Returns `(event_sec, ingest_sec)` directly in UTC epoch seconds.
     #[inline(always)]
-    pub(super) unsafe fn parse_f1_pair(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
+    pub(super) unsafe fn parse_f1_pair_sec(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
         let prefix = ld8(a);
         let ddt = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
         let date = self.entries.get_unchecked(Self::slot(prefix, ddt));
@@ -181,12 +182,12 @@ impl DateTable {
             if (ld8(b) == prefix) & (b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF == ddt) {
                 let (event, ingest) = Self::clock_pair(a, b)?;
                 let day = date.day_sec as i64;
-                return Some(((day + event) * 1000, day + ingest));
+                return Some((day + event, day + ingest));
             }
             let event = date.day_sec as i64 + Self::clock_sec(a)?;
-            return Some((event * 1000, self.civil19_sec(b)?));
+            return Some((event, self.civil19_sec(b)?));
         }
-        Some((civil19_sec_cold(a)? * 1000, self.civil19_sec(b)?))
+        Some((civil19_sec_cold(a)?, self.civil19_sec(b)?))
     }
 
     /// Fast path for `ingest_ts` (guaranteed valid F1): returns `Some(epoch_seconds)` if whole

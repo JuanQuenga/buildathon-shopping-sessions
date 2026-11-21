@@ -51,18 +51,23 @@ impl Arena {
             aligned,
             len,
         };
-        let advice = if std::env::var("PROTO_C_PAGE_MODE").as_deref() == Ok("4k")
+        let page_mode = std::env::var("PROTO_C_PAGE_MODE").unwrap_or_default();
+        let advice = if page_mode == "none" {
+            None
+        } else if page_mode == "4k"
             || std::env::var("INGEST_SINK_THP").as_deref() == Ok("0")
         {
-            MADV_NOHUGEPAGE
+            Some(MADV_NOHUGEPAGE)
         } else {
-            MADV_HUGEPAGE
+            Some(MADV_HUGEPAGE)
         };
-        if unsafe { madvise(aligned.as_ptr().cast(), len, advice) } != 0 {
-            eprintln!(
-                "[arena] madvise({advice}): {}",
-                std::io::Error::last_os_error()
-            );
+        if let Some(advice) = advice {
+            if unsafe { madvise(aligned.as_ptr().cast(), len, advice) } != 0 {
+                eprintln!(
+                    "[arena] madvise({advice}): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
         Ok(arena)
     }
@@ -158,6 +163,32 @@ impl Region<'_> {
         self.cursor.load(Ordering::Relaxed)
     }
 
+    pub fn alloc_slab(&self, bytes: usize, populate: bool) -> Option<(*mut u8, usize)> {
+        let align = 4096usize;
+        let bytes = bytes.next_multiple_of(align);
+        let mut cur = self.cursor.load(Ordering::Relaxed);
+        loop {
+            let start = cur.next_multiple_of(align);
+            if start > self.len || bytes > self.len - start {
+                return None;
+            }
+            let end = start + bytes;
+            match self
+                .cursor
+                .compare_exchange_weak(cur, end, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    let ptr = unsafe { self.base.add(start).as_ptr() };
+                    if populate {
+                        unsafe { madvise(ptr, bytes, MADV_POPULATE_WRITE) };
+                    }
+                    return Some((ptr, bytes));
+                }
+                Err(next) => cur = next,
+            }
+        }
+    }
+
     fn alloc<T>(&self, count: usize) -> Option<NonNull<T>> {
         assert!(align_of::<T>() <= CACHE_LINE && size_of::<T>() > 0);
         let bytes = count
@@ -193,6 +224,47 @@ impl Region<'_> {
             unsafe { ptr.add(i).write(value(i)) };
         }
         Some(unsafe { std::slice::from_raw_parts_mut(ptr, count) })
+    }
+}
+
+/// Per-worker thread-local bump allocator refilled in 256 KiB page-aligned slabs
+/// from a shared `Region`, eliminating cross-thread page contention and false sharing.
+pub struct LocalAlloc<'a> {
+    region: &'a Region<'a>,
+    ptr: *mut u8,
+    rem: usize,
+    slab_bytes: usize,
+    populate: bool,
+}
+unsafe impl Send for LocalAlloc<'_> {}
+
+impl<'a> LocalAlloc<'a> {
+    pub fn new(region: &'a Region<'a>, slab_bytes: usize, populate: bool) -> Self {
+        Self {
+            region,
+            ptr: std::ptr::null_mut(),
+            rem: 0,
+            slab_bytes: slab_bytes.max(4096).next_multiple_of(4096),
+            populate,
+        }
+    }
+
+    #[inline(always)]
+    pub fn alloc<T>(&mut self, count: usize) -> Option<NonNull<T>> {
+        assert!(align_of::<T>() <= CACHE_LINE && size_of::<T>() > 0);
+        let bytes = count
+            .checked_mul(size_of::<T>())?
+            .checked_next_multiple_of(CACHE_LINE)?;
+        if bytes > self.rem {
+            let ask = bytes.max(self.slab_bytes);
+            let (p, got) = self.region.alloc_slab(ask, self.populate)?;
+            self.ptr = p;
+            self.rem = got;
+        }
+        let out = self.ptr;
+        self.ptr = unsafe { out.add(bytes) };
+        self.rem -= bytes;
+        NonNull::new(out.cast())
     }
 }
 
@@ -234,6 +306,20 @@ impl<'a, T: Copy, const SIZE: usize> Bucket<'a, T, SIZE> {
         Some(index)
     }
 
+    #[inline]
+    pub fn push_local(&mut self, alloc: &mut LocalAlloc<'a>, value: T) -> Option<usize> {
+        debug_assert_eq!(self.initialized, self.len);
+        let index = self.len;
+        let offset = index & (SIZE - 1);
+        if offset == 0 && !self.add_block_local(alloc) {
+            return None;
+        }
+        self.len = index + 1;
+        unsafe { self.cur.add(offset).write(value) };
+        self.initialized = index + 1;
+        Some(index)
+    }
+
     #[inline(always)]
     fn next_slot(&mut self, region: &'a Region<'_>) -> Option<(usize, *mut T)> {
         debug_assert!(SIZE.is_power_of_two());
@@ -249,6 +335,16 @@ impl<'a, T: Copy, const SIZE: usize> Bucket<'a, T, SIZE> {
     #[cold]
     fn add_block(&mut self, region: &'a Region<'_>) -> bool {
         let Some(block) = region.alloc(SIZE) else {
+            return false;
+        };
+        self.cur = block.as_ptr();
+        self.blocks.push(block);
+        true
+    }
+
+    #[cold]
+    fn add_block_local(&mut self, alloc: &mut LocalAlloc<'a>) -> bool {
+        let Some(block) = alloc.alloc(SIZE) else {
             return false;
         };
         self.cur = block.as_ptr();
@@ -305,18 +401,18 @@ impl<'a, T: StreamRecord, const SIZE: usize> Bucket<'a, T, SIZE> {
     #[inline(always)]
     pub unsafe fn push_staged<const BYTES: usize>(
         &mut self,
-        region: &'a Region<'_>,
+        alloc: &mut LocalAlloc<'a>,
         value: T,
         line: &mut WriteLine<BYTES>,
     ) -> Option<usize> {
         if !cfg!(feature = "swcb") {
-            return self.push(region, value);
+            return self.push_local(alloc, value);
         }
         debug_assert_eq!(SIZE % T::FLUSH_ROWS, 0);
         debug_assert_eq!(T::FLUSH_ROWS * size_of::<T>(), BYTES);
         let index = self.len;
         let in_block = index & (SIZE - 1);
-        if in_block == 0 && !self.add_block(region) {
+        if in_block == 0 && !self.add_block_local(alloc) {
             return None;
         }
         self.len = index + 1;

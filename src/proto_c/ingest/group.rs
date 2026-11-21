@@ -6,7 +6,6 @@ use crate::proto_c::aggregate::{self, output, CampStore, NO_CATEGORY};
 use crate::proto_c::arena::{Region, Scratch};
 use crate::proto_c::packed::{decode, hash, restore_person};
 use std::path::Path;
-use std::sync::Mutex;
 
 const WEEK_MS_U32: u32 = super::WEEK as u32;
 const GAP_MS_U32: u32 = 1_800_000;
@@ -461,19 +460,6 @@ pub fn run(
     let mut q_order: [usize; PARTITIONS] = std::array::from_fn(|i| i);
     q_order.sort_unstable_by_key(|&q| std::cmp::Reverse(cost(q)));
 
-    // Place the largest partitions first. Then only the worker assigned
-    // a large partition reserves scratch large enough to process it.
-    let mut jobs = vec![Vec::new(); threads];
-    let mut load = vec![0; threads];
-    for q in q_order {
-        if ev_cnt_part[q] == 0 {
-            break;
-        }
-        let (tid, _) = load.iter().enumerate().min_by_key(|&(_, &n)| n).unwrap();
-        jobs[tid].push(q);
-        load[tid] += cost(q);
-    }
-
     let day0 = aggregate::day_of(ctx.ws);
     let ws_rem = ctx.ws.rem_euclid(super::ts::DAY_MS) as u32;
     let ndays = if ctx.we > ctx.ws {
@@ -490,300 +476,299 @@ pub fn run(
     let campaign_file = region
         .uninit(8 << 20)
         .ok_or("campaign output arena exhausted")?;
+    let max_events = ev_cnt_part.iter().copied().max().unwrap_or(0);
+    let max_clicks = click_cnt_part.iter().copied().max().unwrap_or(0);
 
-    let mut work = Vec::with_capacity(threads);
-    for (tid, partitions) in jobs.iter().enumerate() {
-        let max_events = partitions
-            .iter()
-            .map(|&q| ev_cnt_part[q])
-            .max()
-            .unwrap_or(0);
-        let max_clicks = partitions
-            .iter()
-            .map(|&q| click_cnt_part[q])
-            .max()
-            .unwrap_or(0);
-        let scratch = "grouping scratch arena exhausted";
-        work.push(Mutex::new(Some(FusedWorker {
-            map: GroupMap::new(),
-            fill: Vec::with_capacity(2048),
-            pid: Scratch::new(region, max_events).ok_or(scratch)?,
-            ev_flat: Scratch::new(region, max_events).ok_or(scratch)?,
-            ev_buf: Scratch::new(region, max_events).ok_or(scratch)?,
-            ev_tmp: Vec::new(),
-            cl_raw: Scratch::new(region, max_clicks).ok_or(scratch)?,
-            ck_cnt: Vec::with_capacity(2048),
-            ck_off: Vec::with_capacity(2048),
-            cl_buf: Scratch::new(region, max_clicks).ok_or(scratch)?,
-            camp: CampStore::new(region, campaigns.len() + 1, day0, ndays).ok_or(scratch)?,
-            writer: output::UserWriter::new(&ud, tid, region, max_cat, file_cap)
-                .ok_or("user output arena exhausted")?,
-            cat_sum: vec![0; categories.len()],
-            cat_touched: Vec::with_capacity(32),
-            assists: FusedAssists::new(campaigns.len()),
-            np: 0,
-            nc: 0,
-            written: 0,
-        })));
-    }
     std::fs::create_dir_all(&ud).expect("create user_daily");
     std::fs::create_dir_all(&cd).expect("create campaign_daily");
 
-    let workers = par::run(
-        threads,
-        threads,
-        |_| Vec::new(),
-        |done, job| {
-            let mut worker = work[job].lock().unwrap().take().unwrap();
-            let w = &mut worker;
-            for &q in &jobs[job] {
-                let n = ev_cnt_part[q];
-                w.map.reset(n / 25 + 16);
-                w.pid.clear();
-                w.pid.reserve(n);
-                w.ev_flat.clear();
-                w.ev_flat.reserve(n);
-                let pid = w.pid.as_mut_ptr();
-                let ev_flat = w.ev_flat.as_mut_ptr();
-                let mut live = 0;
-                let mut visit = |r: LiveEvent| {
-                    let id = w.map.count(r.key);
-                    let ev = CompactEv::new(r.ts, r.cc);
-                    // The count pass reserved exactly one slot per live event.
-                    unsafe {
-                        pid.add(live).write(id);
-                        ev_flat.add(live).write(ev);
-                    }
-                    live += 1;
-                };
-                for (tid, rows) in input.iter().enumerate() {
-                    dead.for_live(rows, tid, q, &mut visit);
-                }
-                for rows in relocated {
-                    rows.for_events(q, &mut visit);
-                }
-                debug_assert_eq!(live, n);
-                unsafe {
-                    w.pid.set_len(live);
-                    w.ev_flat.set_len(live);
-                }
-                let np = w.map.person_slots.len();
-                w.np += np;
-                w.fill.clear();
-                w.fill.reserve(np);
-                let mut acc = 0u32;
-                for i in 0..np {
-                    w.fill.push(acc);
-                    acc += w.map.person(i).count;
-                }
-                w.ev_buf.clear();
-                w.ev_buf.reserve(n);
-                let ev_ptr = w.ev_buf.as_mut_ptr();
-                for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
-                    let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
-                    unsafe { ev_ptr.add(*pos as usize).write(ev) };
-                    *pos += 1;
-                }
-                // The prefix counts assigned each live event one distinct slot.
-                unsafe { w.ev_buf.set_len(n) };
+    let q_order = &q_order;
+    let ev_cnt_part = &ev_cnt_part;
+    let active_parts = q_order
+        .iter()
+        .take_while(|&&q| ev_cnt_part[q] > 0)
+        .count();
 
-                // Collect & count-scatter clicks for persons present in partition `q`.
-                w.cl_raw.clear();
-                w.ck_cnt.clear();
-                w.ck_cnt.resize(np, 0);
-                let mut visit_ck = |r: crate::proto_c::packed::RecC| {
-                    if let Some(id) = w.map.get(r.person()) {
-                        w.cl_raw.push((
-                            id,
-                            CompactClick {
-                                ts: r.ts(),
-                                campaign: r.campaign(),
-                                cid: r.cid(),
-                            },
-                        ));
-                        w.ck_cnt[id as usize] += 1;
-                    }
-                };
-                if let Some(dc) = dead_clicks {
-                    for (tid, rows) in input.iter().enumerate() {
-                        dc.for_live_clicks(rows, tid, q, &mut visit_ck);
-                    }
-                } else {
-                    for rows in input {
-                        for &r in rows.clicks[q].rows() {
-                            visit_ck(r);
-                        }
-                    }
+    let workers = par::run_fini(
+        threads,
+        active_parts,
+        |tid| -> Result<FusedWorker<'_>> {
+            let scratch = "grouping scratch arena exhausted";
+            Ok(FusedWorker {
+                map: GroupMap::new(),
+                fill: Vec::with_capacity(2048),
+                pid: Scratch::new(region, max_events).ok_or(scratch)?,
+                ev_flat: Scratch::new(region, max_events).ok_or(scratch)?,
+                ev_buf: Scratch::new(region, max_events).ok_or(scratch)?,
+                ev_tmp: Vec::new(),
+                cl_raw: Scratch::new(region, max_clicks).ok_or(scratch)?,
+                ck_cnt: Vec::with_capacity(2048),
+                ck_off: Vec::with_capacity(2048),
+                cl_buf: Scratch::new(region, max_clicks).ok_or(scratch)?,
+                camp: CampStore::new(region, campaigns.len() + 1, day0, ndays).ok_or(scratch)?,
+                writer: output::UserWriter::new(&ud, tid, region, max_cat, file_cap)
+                    .ok_or("user output arena exhausted")?,
+                cat_sum: vec![0; categories.len()],
+                cat_touched: Vec::with_capacity(32),
+                assists: FusedAssists::new(campaigns.len()),
+                np: 0,
+                nc: 0,
+                written: 0,
+            })
+        },
+        |worker, idx| {
+            let Ok(w) = worker.as_mut() else {
+                return;
+            };
+            let q = q_order[idx];
+            let n = ev_cnt_part[q];
+            w.map.reset(n / 25 + 16);
+            w.pid.clear();
+            w.pid.reserve(n);
+            w.ev_flat.clear();
+            w.ev_flat.reserve(n);
+            let pid = w.pid.as_mut_ptr();
+            let ev_flat = w.ev_flat.as_mut_ptr();
+            let mut live = 0;
+            let mut visit = |r: LiveEvent| {
+                let id = w.map.count(r.key);
+                let ev = CompactEv::new(r.ts, r.cc);
+                // The count pass reserved exactly one slot per live event.
+                unsafe {
+                    pid.add(live).write(id);
+                    ev_flat.add(live).write(ev);
                 }
-                for rows in relocated {
+                live += 1;
+            };
+            for (tid, rows) in input.iter().enumerate() {
+                dead.for_live(rows, tid, q, &mut visit);
+            }
+            for rows in relocated {
+                rows.for_events(q, &mut visit);
+            }
+            debug_assert_eq!(live, n);
+            unsafe {
+                w.pid.set_len(live);
+                w.ev_flat.set_len(live);
+            }
+            let np = w.map.person_slots.len();
+            w.np += np;
+            w.fill.clear();
+            w.fill.reserve(np);
+            let mut acc = 0u32;
+            for i in 0..np {
+                w.fill.push(acc);
+                acc += w.map.person(i).count;
+            }
+            w.ev_buf.clear();
+            w.ev_buf.reserve(n);
+            let ev_ptr = w.ev_buf.as_mut_ptr();
+            for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
+                let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
+                unsafe { ev_ptr.add(*pos as usize).write(ev) };
+                *pos += 1;
+            }
+            // The prefix counts assigned each live event one distinct slot.
+            unsafe { w.ev_buf.set_len(n) };
+
+            // Collect & count-scatter clicks for persons present in partition `q`.
+            w.cl_raw.clear();
+            w.ck_cnt.clear();
+            w.ck_cnt.resize(np, 0);
+            let mut visit_ck = |r: crate::proto_c::packed::RecC| {
+                if let Some(id) = w.map.get(r.person()) {
+                    w.cl_raw.push((
+                        id,
+                        CompactClick {
+                            ts: r.ts(),
+                            campaign: r.campaign(),
+                            cid: r.cid(),
+                        },
+                    ));
+                    w.ck_cnt[id as usize] += 1;
+                }
+            };
+            if let Some(dc) = dead_clicks {
+                for (tid, rows) in input.iter().enumerate() {
+                    dc.for_live_clicks(rows, tid, q, &mut visit_ck);
+                }
+            } else {
+                for rows in input {
                     for &r in rows.clicks[q].rows() {
                         visit_ck(r);
                     }
                 }
-                let ncl_raw = w.cl_raw.len();
-                w.ck_off.clear();
-                if ncl_raw > 0 {
-                    w.ck_off.reserve(np + 1);
-                    let mut cacc = 0u32;
-                    for i in 0..np {
-                        w.ck_off.push(cacc);
-                        cacc += w.ck_cnt[i];
-                    }
-                    w.ck_off.push(cacc);
-                    w.fill.clear();
-                    w.fill.extend_from_slice(&w.ck_off[..np]);
-                    w.cl_buf.clear();
-                    w.cl_buf.reserve(ncl_raw);
-                    let cl_ptr = w.cl_buf.as_mut_ptr();
-                    for &(id, ck) in w.cl_raw.iter() {
-                        let pos = unsafe { *w.fill.get_unchecked(id as usize) } as usize;
-                        unsafe {
-                            cl_ptr.add(pos).write(ck);
-                            *w.fill.get_unchecked_mut(id as usize) = (pos + 1) as u32;
-                        }
-                    }
-                    // Each of the ncl_raw clicks initialized one distinct offset.
-                    unsafe { w.cl_buf.set_len(ncl_raw) };
-                }
-
-                // Per-person sort + sessionize + credit + assists while hot in L1/L2 cache!
-                let mut ev_st = 0usize;
-                let mut id_buf = [0u8; 16];
-                for pi in 0..np {
-                    let person = w.map.person(pi);
-                    let ev_en = ev_st + person.count as usize;
-                    sort_ev_slice(&mut w.ev_buf[ev_st..ev_en], &mut w.ev_tmp);
-                    let (cl_st, cl_len) = if ncl_raw > 0 {
-                        let cs = w.ck_off[pi] as usize;
-                        let ce = w.ck_off[pi + 1] as usize;
-                        let len = sort_and_dedup_clicks(&mut w.cl_buf[cs..ce]);
-                        w.nc += len;
-                        (cs, len)
-                    } else {
-                        (0, 0)
-                    };
-                    let id_len = decode(restore_person(q, person.key), b'u', &mut id_buf);
-                    let id_bytes = &id_buf[..id_len];
-
-                    w.assists.s_start.clear();
-                    w.assists.s_day.clear();
-                    let mut i = ev_st;
-                    let mut cj = cl_st;
-                    let cl_end = cl_st + cl_len;
-                    let mut grp_first = cl_end;
-                    // The exclusive window end reserves u32::MAX as a sentinel.
-                    let mut last_ts = u32::MAX;
-                    let mut rel_day = 0u32;
-                    let mut next_day_s = DAY_MS_U32 - ws_rem;
-                    let (mut ud_sessions, mut ud_events, mut ud_revenue) = (0u32, 0u32, 0i64);
-
-                    while i < ev_en {
-                        let first = unsafe { *w.ev_buf.get_unchecked(i) };
-                        let s = first.ts();
-                        if s >= next_day_s {
-                            if ud_sessions != 0 {
-                                w.flush_user_day(
-                                    id_bytes,
-                                    categories,
-                                    day0.wrapping_add(rel_day as i32),
-                                    ud_sessions,
-                                    ud_events,
-                                    ud_revenue,
-                                );
-                                ud_sessions = 0;
-                                ud_events = 0;
-                                ud_revenue = 0;
-                            }
-                            // The compact window is at most u32::MAX - WEEK_MS long,
-                            // leaving room to add the window's time of day.
-                            rel_day = (ws_rem + s) / DAY_MS_U32;
-                            next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
-                        }
-                        let mut prev = s;
-                        let mut k = i + 1;
-                        let mut cc = first.cc();
-                        let mut rev = 0u64;
-                        loop {
-                            let cents = cc & 0x00FF_FFFF;
-                            if cents != 0 {
-                                rev += cents as u64;
-                                let cat = cc >> 24;
-                                let slot = unsafe { w.cat_sum.get_unchecked_mut(cat as usize) };
-                                if *slot == 0 {
-                                    w.cat_touched.push(cat);
-                                }
-                                *slot += cents as u64;
-                            }
-                            if k == ev_en {
-                                break;
-                            }
-                            let e = unsafe { *w.ev_buf.get_unchecked(k) };
-                            let ets = e.ts();
-                            if ets - prev > GAP_MS_U32 {
-                                break;
-                            }
-                            prev = ets;
-                            cc = e.cc();
-                            k += 1;
-                        }
-                        let nev = (k - i) as u32;
-                        i = k;
-
-                        let s_ck = s + WEEK_MS_U32;
-                        while cj < cl_end {
-                            let ct = unsafe { w.cl_buf.get_unchecked(cj).ts };
-                            if ct > s_ck {
-                                break;
-                            }
-                            if ct != last_ts {
-                                last_ts = ct;
-                                grp_first = cj;
-                            }
-                            cj += 1;
-                        }
-                        let credit = if grp_first != cl_end && last_ts >= s {
-                            unsafe { w.cl_buf.get_unchecked(grp_first).campaign }
-                        } else {
-                            organic
-                        };
-                        // Credit is a known campaign (or organic) and the start is in the window.
-                        let cell = unsafe { w.camp.cell_in_window(credit, rel_day as usize) };
-                        cell.sessions += 1;
-                        if rev != 0 {
-                            cell.purchasing += 1;
-                            cell.revenue += rev as i64;
-                        }
-
-                        ud_sessions += 1;
-                        ud_events += nev;
-                        ud_revenue += rev as i64;
-                        if cl_len > 0 {
-                            w.assists.s_start.push(s);
-                            w.assists.s_day.push(rel_day as u16);
-                        }
-                    }
-                    w.flush_user_day(
-                        id_bytes,
-                        categories,
-                        day0.wrapping_add(rel_day as i32),
-                        ud_sessions,
-                        ud_events,
-                        ud_revenue,
-                    );
-
-                    if cl_len > 0 {
-                        w.assists.count(&mut w.camp, &w.cl_buf[cl_st..cl_end]);
-                    }
-                    ev_st = ev_en;
+            }
+            for rows in relocated {
+                for &r in rows.clicks[q].rows() {
+                    visit_ck(r);
                 }
             }
-            w.written = w.writer.finish();
-            done.push(worker);
+            let ncl_raw = w.cl_raw.len();
+            w.ck_off.clear();
+            if ncl_raw > 0 {
+                w.ck_off.reserve(np + 1);
+                let mut cacc = 0u32;
+                for i in 0..np {
+                    w.ck_off.push(cacc);
+                    cacc += w.ck_cnt[i];
+                }
+                w.ck_off.push(cacc);
+                w.fill.clear();
+                w.fill.extend_from_slice(&w.ck_off[..np]);
+                w.cl_buf.clear();
+                w.cl_buf.reserve(ncl_raw);
+                let cl_ptr = w.cl_buf.as_mut_ptr();
+                for &(id, ck) in w.cl_raw.iter() {
+                    let pos = unsafe { *w.fill.get_unchecked(id as usize) } as usize;
+                    unsafe {
+                        cl_ptr.add(pos).write(ck);
+                        *w.fill.get_unchecked_mut(id as usize) = (pos + 1) as u32;
+                    }
+                }
+                // Each of the ncl_raw clicks initialized one distinct offset.
+                unsafe { w.cl_buf.set_len(ncl_raw) };
+            }
+
+            // Per-person sort + sessionize + credit + assists while hot in L1/L2 cache!
+            let mut ev_st = 0usize;
+            let mut id_buf = [0u8; 16];
+            for pi in 0..np {
+                let person = w.map.person(pi);
+                let ev_en = ev_st + person.count as usize;
+                sort_ev_slice(&mut w.ev_buf[ev_st..ev_en], &mut w.ev_tmp);
+                let (cl_st, cl_len) = if ncl_raw > 0 {
+                    let cs = w.ck_off[pi] as usize;
+                    let ce = w.ck_off[pi + 1] as usize;
+                    let len = sort_and_dedup_clicks(&mut w.cl_buf[cs..ce]);
+                    w.nc += len;
+                    (cs, len)
+                } else {
+                    (0, 0)
+                };
+                let id_len = decode(restore_person(q, person.key), b'u', &mut id_buf);
+                let id_bytes = &id_buf[..id_len];
+
+                w.assists.s_start.clear();
+                w.assists.s_day.clear();
+                let mut i = ev_st;
+                let mut cj = cl_st;
+                let cl_end = cl_st + cl_len;
+                let mut grp_first = cl_end;
+                // The exclusive window end reserves u32::MAX as a sentinel.
+                let mut last_ts = u32::MAX;
+                let mut rel_day = 0u32;
+                let mut next_day_s = DAY_MS_U32 - ws_rem;
+                let (mut ud_sessions, mut ud_events, mut ud_revenue) = (0u32, 0u32, 0i64);
+
+                while i < ev_en {
+                    let first = unsafe { *w.ev_buf.get_unchecked(i) };
+                    let s = first.ts();
+                    if s >= next_day_s {
+                        if ud_sessions != 0 {
+                            w.flush_user_day(
+                                id_bytes,
+                                categories,
+                                day0.wrapping_add(rel_day as i32),
+                                ud_sessions,
+                                ud_events,
+                                ud_revenue,
+                            );
+                            ud_sessions = 0;
+                            ud_events = 0;
+                            ud_revenue = 0;
+                        }
+                        // The compact window is at most u32::MAX - WEEK_MS long,
+                        // leaving room to add the window's time of day.
+                        rel_day = (ws_rem + s) / DAY_MS_U32;
+                        next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
+                    }
+                    let mut prev = s;
+                    let mut k = i + 1;
+                    let mut cc = first.cc();
+                    let mut rev = 0u64;
+                    loop {
+                        let cents = cc & 0x00FF_FFFF;
+                        if cents != 0 {
+                            rev += cents as u64;
+                            let cat = cc >> 24;
+                            let slot = unsafe { w.cat_sum.get_unchecked_mut(cat as usize) };
+                            if *slot == 0 {
+                                w.cat_touched.push(cat);
+                            }
+                            *slot += cents as u64;
+                        }
+                        if k == ev_en {
+                            break;
+                        }
+                        let e = unsafe { *w.ev_buf.get_unchecked(k) };
+                        let ets = e.ts();
+                        if ets - prev > GAP_MS_U32 {
+                            break;
+                        }
+                        prev = ets;
+                        cc = e.cc();
+                        k += 1;
+                    }
+                    let nev = (k - i) as u32;
+                    i = k;
+
+                    let s_ck = s + WEEK_MS_U32;
+                    while cj < cl_end {
+                        let ct = unsafe { w.cl_buf.get_unchecked(cj).ts };
+                        if ct > s_ck {
+                            break;
+                        }
+                        if ct != last_ts {
+                            last_ts = ct;
+                            grp_first = cj;
+                        }
+                        cj += 1;
+                    }
+                    let credit = if grp_first != cl_end && last_ts >= s {
+                        unsafe { w.cl_buf.get_unchecked(grp_first).campaign }
+                    } else {
+                        organic
+                    };
+                    // Credit is a known campaign (or organic) and the start is in the window.
+                    let cell = unsafe { w.camp.cell_in_window(credit, rel_day as usize) };
+                    cell.sessions += 1;
+                    if rev != 0 {
+                        cell.purchasing += 1;
+                        cell.revenue += rev as i64;
+                    }
+
+                    ud_sessions += 1;
+                    ud_events += nev;
+                    ud_revenue += rev as i64;
+                    if cl_len > 0 {
+                        w.assists.s_start.push(s);
+                        w.assists.s_day.push(rel_day as u16);
+                    }
+                }
+                w.flush_user_day(
+                    id_bytes,
+                    categories,
+                    day0.wrapping_add(rel_day as i32),
+                    ud_sessions,
+                    ud_events,
+                    ud_revenue,
+                );
+
+                if cl_len > 0 {
+                    w.assists.count(&mut w.camp, &w.cl_buf[cl_st..cl_end]);
+                }
+                ev_st = ev_en;
+            }
+        },
+        |worker| {
+            if let Ok(w) = worker.as_mut() {
+                w.written = w.writer.finish();
+            }
         },
     )
     .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    .collect::<Result<Vec<_>>>()?;
     let np = workers.iter().map(|w| w.np).sum::<usize>();
     let nc = workers.iter().map(|w| w.nc).sum::<usize>();
     let user_rows = workers.iter().map(|w| w.written).sum::<usize>();
