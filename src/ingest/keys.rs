@@ -1,11 +1,11 @@
 //! Exact fixed-width id keys, generic over width.
 //!
 //! * `u128` ("wide"): any id of at most 15 bytes (bytes big-endian + length byte).
-//! * `u64` ("compact"): ids of 1..=10 chars from `[0-9A-Za-z]`, 6 bits per char,
-//!   first char in the top bits, code 0 = padding. Order-preserving and injective.
+//! * `u64` ("compact"): ids of 1..=9 non-NUL ASCII bytes, 7 bits per byte,
+//!   first byte in the high byte, code 0 = padding. Order-preserving and injective.
 //!
 //! In both, key equality == byte equality and key order == byte-wise order. The
-//! empty id maps to 0, which is used as the empty-slot marker and never stored.
+//! zero key is used as the empty-slot marker and never stored.
 use super::key as wide;
 
 pub trait Key: Copy + Eq + Ord + Default + Send + Sync + std::fmt::Debug + 'static {
@@ -65,73 +65,30 @@ impl Key for u128 {
     }
 }
 
-#[repr(align(16))]
-struct LiveMasks([[u8; 16]; 11]);
-
-static LIVE_MASKS: LiveMasks = LiveMasks([
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0],
-    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0],
-]);
-
-static DEC_LUT: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut c = 1usize;
-    while c <= 10 {
-        t[c] = (c as u8) + 0x2F;
-        c += 1;
-    }
-    while c <= 36 {
-        t[c] = (c as u8) + 0x36;
-        c += 1;
-    }
-    while c <= 62 {
-        t[c] = (c as u8) + 0x3C;
-        c += 1;
-    }
-    t
-};
+const ASCII_BITS: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+const TAIL_MASKS: [u64; 10] = [
+    0, 0, 0xFF, 0xFFFF, 0xFF_FFFF, 0xFFFF_FFFF, 0xFF_FFFF_FFFF,
+    0xFFFF_FFFF_FFFF, 0xFF_FFFF_FFFF_FFFF, u64::MAX,
+];
 
 impl Key for u64 {
     #[inline(always)]
     unsafe fn enc(p: *const u8, len: usize) -> Option<u64> {
-        if len > 10 {
+        if !(1..=9).contains(&len) {
             return None;
         }
-        use std::arch::x86_64::*;
-        let v = _mm_loadu_si128(p as *const __m128i);
-        let live = _mm_load_si128(LIVE_MASKS.0.as_ptr().add(len) as *const __m128i);
-        // Unsigned range checks via signed shift by -128: (x - base - 128) < (-128 + width)
-        // Digits '0'..='9' (0x30..=0x39): base = 0x30, width = 10 -> sub 0xB0 (-80), cmpgt -118
-        let dig = _mm_cmpgt_epi8(_mm_set1_epi8(-118), _mm_sub_epi8(v, _mm_set1_epi8(0xB0u8 as i8)));
-        // Alpha 'A'..='Z' or 'a'..='z': (v | 0x20) in 0x61..=0x7A -> sub 0xE1 (-31), cmpgt -102
-        let v_lo = _mm_or_si128(v, _mm_set1_epi8(0x20));
-        let alpha = _mm_cmpgt_epi8(_mm_set1_epi8(-102), _mm_sub_epi8(v_lo, _mm_set1_epi8(0xE1u8 as i8)));
-        let bad = _mm_andnot_si128(_mm_or_si128(dig, alpha), live);
-        if _mm_movemask_epi8(bad) != 0 {
+        let first = *p;
+        let live = *TAIL_MASKS.get_unchecked(len);
+        let tail = p.add(1).cast::<u64>().read_unaligned() & live;
+        // Fill inactive lanes before testing for NUL in the active ones.
+        let filled = tail | !live;
+        let zero = filled.wrapping_sub(0x0101_0101_0101_0101) & !filled;
+        if (first.wrapping_sub(1) >= 127) | (((tail | zero) & HIGH_BITS) != 0) {
             return None;
         }
-        // Single-cycle pshufb offset LUT indexed by high nibble (3->0x2F, 4..5->0x36, 6..7->0x3C).
-        let hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
-        let off_lut = _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3C, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0);
-        let off = _mm_shuffle_epi8(off_lut, hi);
-        let code = _mm_and_si128(_mm_sub_epi8(v, off), live);
-        // pairs: c0*64 + c1 (12 bits) in 16-bit lanes
-        let pairs = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
-        // quads: p0*4096 + p1 (24 bits) in 32-bit lanes
-        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_1000));
-        let l0 = _mm_cvtsi128_si32(quads) as u32 as u64;
-        let l1 = _mm_extract_epi32::<1>(quads) as u32 as u64;
-        let l2 = _mm_extract_epi32::<2>(quads) as u32 as u64;
-        Some((l0 << 36) | (l1 << 12) | (l2 >> 12))
+        let packed = std::arch::x86_64::_pext_u64(tail.swap_bytes(), ASCII_BITS);
+        Some((u64::from(first) << 56) | packed)
     }
     #[inline(always)]
     fn h(self) -> u64 {
@@ -144,15 +101,10 @@ impl Key for u64 {
     }
     #[inline(always)]
     fn unpack_buf(self, dst: &mut [u8; 16]) -> usize {
-        let mut x = self << 4;
-        let mut n = 0usize;
-        while x != 0 {
-            let c = (x >> 58) as usize;
-            unsafe { *dst.get_unchecked_mut(n) = *DEC_LUT.get_unchecked(c) };
-            n += 1;
-            x <<= 6;
-        }
-        n
+        dst[0] = (self >> 56) as u8;
+        let tail = unsafe { std::arch::x86_64::_pdep_u64(self, ASCII_BITS) };
+        unsafe { dst.as_mut_ptr().add(1).cast::<u64>().write_unaligned(tail.swap_bytes()) };
+        usize::from(dst[0] != 0) + (8 - (tail.trailing_zeros() as usize >> 3))
     }
     #[inline(always)]
     fn is_zero(self) -> bool {
@@ -228,37 +180,38 @@ mod tests {
     use super::*;
     #[test]
     fn compact_order_and_roundtrip() {
-        let mut ids: Vec<Vec<u8>> = vec![
-            b"0".to_vec(), b"9".to_vec(), b"A".to_vec(), b"Z".to_vec(), b"a".to_vec(), b"z".to_vec(),
-            b"u1".to_vec(), b"U1".to_vec(), b"u10".to_vec(), b"u1a".to_vec(), b"zzzzzzzzzz".to_vec(),
-            b"0000000000".to_vec(), b"e42huhoug".to_vec(), b"k1q2awe54".to_vec(), b"uduffvac".to_vec(),
-        ];
-        let mut rng = 0x9e3779b97f4a7c15u64;
-        let alpha = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-        for _ in 0..3000 {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            let len = 1 + (rng % 10) as usize;
-            ids.push((0..len).map(|i| alpha[((rng >> (i * 6)) % 62) as usize]).collect());
-        }
-        for a in &ids {
-            let ka = u64::enc_slice(a).unwrap();
-            let mut out = Vec::new();
-            ka.unpack(&mut out);
-            assert_eq!(&out, a);
-        }
-        for a in ids.iter().take(300) {
-            for b in &ids {
-                let (ka, kb) = (u64::enc_slice(a).unwrap(), u64::enc_slice(b).unwrap());
-                assert_eq!(a.cmp(b), ka.cmp(&kb), "{a:?} {b:?}");
-                let (wa, wb) = (u128::enc_slice(a).unwrap(), u128::enc_slice(b).unwrap());
-                assert_eq!(a.cmp(b), wa.cmp(&wb));
+        // Exhaust every byte at every position for all supported lengths.
+        // Equal prefixes, byte boundaries, and lexicographic ordering are all
+        // covered by comparing adjacent entries in the sorted byte strings.
+        let mut ids = Vec::new();
+        for len in 1..=9 {
+            for pos in 0..len {
+                for byte in 0..=u8::MAX {
+                    let mut id = vec![b'a'; len];
+                    id[pos] = byte;
+                    let key = u64::enc_slice(&id);
+                    if (1..=127).contains(&byte) {
+                        let key = key.unwrap();
+                        assert_ne!(key, 0);
+                        let mut buf = [0; 16];
+                        let n = key.unpack_buf(&mut buf);
+                        assert_eq!(&buf[..n], id);
+                        ids.push((id, key));
+                    } else {
+                        assert_eq!(key, None, "{id:?}");
+                        assert!(u128::enc_slice(&id).is_some());
+                    }
+                }
             }
         }
-        for bad in [&b"u 1"[..], b"u-1", b"u_1", b"\xc3\xa9", b"zzzzzzzzzzz", b"u1\r", b"\"u1"] {
-            assert!(u64::enc_slice(bad).is_none(), "{bad:?}");
+        ids.sort_unstable();
+        ids.dedup();
+        assert!(ids.windows(2).all(|p| p[0].0 < p[1].0 && p[0].1 < p[1].1));
+        assert_eq!(unsafe { u64::enc([1; 64].as_ptr(), 0) }, None);
+        for len in 10..=15 {
+            let id = vec![b'a'; len];
+            assert_eq!(u64::enc_slice(&id), None);
+            assert!(u128::enc_slice(&id).is_some());
         }
-        assert!(u128::enc_slice(b"u 1").is_some());
     }
 }

@@ -147,6 +147,12 @@ impl DateTable {
     /// fast path plus a cold fallback.
     #[inline(always)]
     pub unsafe fn parse(&self, p: *const u8, len: usize) -> Option<i64> {
+        if len == 20 {
+            if *p.add(19) == b'Z' {
+                return self.civil19_sec(p).map(|s| s * 1000);
+            }
+            return parse_cold(p, len);
+        }
         if len == 13 {
             const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
             const DIGIT_LIMIT: u64 = 0x7676_7676_7676_7676;
@@ -163,12 +169,6 @@ impl DateTable {
                 return Some((hi * 100_000_000 + lo) as i64);
             }
             return None;
-        }
-        if len == 20 {
-            if *p.add(19) == b'Z' {
-                return self.civil19_sec(p).map(|s| s * 1000);
-            }
-            return parse_cold(p, len);
         }
         if len == 25 {
             let s = *p.add(19);

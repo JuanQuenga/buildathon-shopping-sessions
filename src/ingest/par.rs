@@ -398,6 +398,8 @@ fn sink_thp() -> bool {
     *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
+        // In always mode, let the kernel try THP without explicit advice
+        // that can trigger synchronous compaction on first writes.
         _ => !matches!(thp_enabled(), "always" | "never") && probe_sink_thp(),
     })
 }

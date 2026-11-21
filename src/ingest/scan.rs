@@ -6,7 +6,10 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub const PAD: usize = 64;
-const TILE: usize = 24 * 1024;
+const TILE: usize = 16 * 1024;
+const POSITION: u16 = 0x3FFF;
+const CLOSE_QUOTE: u32 = 14;
+const OPEN_NEXT: u32 = 15;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -255,7 +258,7 @@ pub struct Scratch {
     seps: Vec<u32>,
     lfs: Vec<(u32, u32)>,
     seps16: Vec<u16>,
-    lfs16: Vec<(u16, u16)>,
+    lfs16: Vec<u16>,
 }
 
 #[derive(Clone, Copy)]
@@ -324,15 +327,14 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
     let scanner = scanner();
     let mut cur = lo;
     while cur < hi {
-        let tile_end = if cur + TILE >= hi {
+        // Leave room to reach the next row boundary within 14 offset bits.
+        let target = cur + TILE - 256;
+        let tile_end = if target >= hi {
             hi
         } else {
-            match memchr(b'\n', &buf[cur + TILE..hi]) {
-                Some(p) => cur + TILE + p + 1,
-                None => hi,
-            }
+            memchr(b'\n', &buf[target..hi]).map_or(hi, |p| target + p + 1)
         };
-        if tile_end - cur <= 65_000 {
+        let quotes = if tile_end - cur <= 16_380 {
             match scanner {
                 Scanner::Avx2 => scan_tile_stage1_u16(buf, cur, tile_end, sc, masks),
                 #[cfg(target_arch = "x86_64")]
@@ -340,10 +342,13 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
                 #[cfg(target_arch = "x86_64")]
                 Scanner::Avx512Vl256 => unsafe { scan_tile_stage1_u16_avx512vl(buf, cur, tile_end, sc) },
             }
-            scan_tile_stage2_u16::<N, F>(buf, cur, sc, &mut f);
         } else {
-            scan_tile_stage1(buf, cur, tile_end, sc);
-            scan_tile_stage2::<N, F>(buf, cur, sc, &mut f);
+            None
+        };
+        if let Some(first_open) = quotes {
+            scan_tile_stage2_u16::<N, F>(&buf[cur..], sc, first_open, &mut f);
+        } else {
+            scan_tile_fallback::<N, F>(buf, cur, tile_end, sc, &mut f);
         }
         cur = tile_end;
     }
@@ -351,7 +356,7 @@ pub fn scan_with<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn scan_tile_stage1_u16_avx512(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+unsafe fn scan_tile_stage1_u16_avx512(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) -> Option<u32> {
     use std::arch::x86_64::*;
     let comma = _mm512_set1_epi8(b',' as i8);
     let nl = _mm512_set1_epi8(b'\n' as i8);
@@ -362,12 +367,12 @@ unsafe fn scan_tile_stage1_u16_avx512(buf: &[u8], lo: usize, hi: usize, sc: &mut
         let n = _mm512_cmpeq_epi8_mask(v, nl);
         let q = _mm512_cmpeq_epi8_mask(v, qt);
         (c | n, q, n)
-    });
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn scan_tile_stage1_u16_avx512vl(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) {
+unsafe fn scan_tile_stage1_u16_avx512vl(buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch) -> Option<u32> {
     use std::arch::x86_64::*;
     let comma = _mm256_set1_epi8(b',' as i8);
     let nl = _mm256_set1_epi8(b'\n' as i8);
@@ -397,7 +402,7 @@ unsafe fn scan_tile_stage1_u16_avx512vl(buf: &[u8], lo: usize, hi: usize, sc: &m
         let combine = |lo: u32, hi: u32| u64::from(lo) | (u64::from(hi) << 32);
         let n = combine(n0, n1);
         (combine(c0, c1) | n, combine(q0, q1), n)
-    });
+    })
 }
 
 #[inline(always)]
@@ -407,168 +412,137 @@ fn scan_tile_stage1_u16(
     hi: usize,
     sc: &mut Scratch,
     block_masks: impl Fn(*const u8) -> (u64, u64, u64),
-) {
+) -> Option<u32> {
     let ptr = unsafe { buf.as_ptr().add(lo) };
     let tile_len = hi - lo;
     let seps = &mut sc.seps16;
     let lfs = &mut sc.lfs16;
-    let need_seps = tile_len + 72;
-    if seps.capacity() < need_seps {
-        seps.clear();
-        seps.reserve(need_seps);
-    }
-    let need_lfs = tile_len + 64;
-    if lfs.capacity() < need_lfs {
-        lfs.clear();
-        lfs.reserve(need_lfs);
-    }
+    seps.clear();
+    lfs.clear();
+    seps.reserve(tile_len + 8);
+    lfs.reserve(tile_len);
     let sep_base = seps.as_mut_ptr();
     let lf_base = lfs.as_mut_ptr();
     let mut sep_len = 0usize;
     let mut lf_len = 0usize;
-    let mut qb = 0u32;
+    let mut prev_sep63 = 1;
+    let mut prev_q63 = 0;
+    let mut bad_q = 0;
     let mut rel = 0usize;
     while rel < tile_len {
-        let (sep, q, nl) = block_masks(unsafe { ptr.add(rel) });
+        let (sep, quote, nl) = block_masks(unsafe { ptr.add(rel) });
         let rem = tile_len - rel;
-        let (m, q, n) = if rem >= 64 {
-            (sep, q, nl)
-        } else {
-            let valid = below(rem as u32);
-            (sep & valid, q & valid, nl & valid)
-        };
-        let mut m0 = m as u32;
-        let mut m1 = (m >> 32) as u32;
-        let c0 = m0.count_ones() as usize;
-        let c1 = m1.count_ones() as usize;
-        let b0 = rel as u16;
-        let b1 = b0.wrapping_add(32);
-        unsafe {
-            let o0 = sep_base.add(sep_len);
-            let o1 = o0.add(c0);
-            for k in 0..4 {
-                *o0.add(k) = b0.wrapping_add(m0.trailing_zeros() as u16);
-                m0 &= m0.wrapping_sub(1);
+        let valid = below(rem as u32);
+        let (m, q, n) = (sep & valid, quote & valid, nl & valid);
+        let next = if rem > 64 { unsafe { *ptr.add(rel + 64) } } else { 0 };
+        let after_sep = (m << 1) | prev_sep63;
+        let before_sep = (m >> 1) | (u64::from((next == b',') | (next == b'\n')) << 63);
+        bad_q |= q & !(after_sep ^ before_sep);
+        let close = (q << 1) | prev_q63;
+        let open = (q >> 1) | (u64::from(next == b'"') << 63);
+        prev_sep63 = m >> 63;
+        prev_q63 = q >> 63;
+
+        use std::arch::x86_64::{_pdep_u64, _pext_u64};
+        let mut remaining = m;
+        let count = m.count_ones() as usize;
+        // Keep one quote bit per delimiter. PDEP writes four flags at a time
+        // into the high bits of the corresponding four u16 positions.
+        let mut closes = unsafe { _pext_u64(close, m) };
+        let mut opens = unsafe { _pext_u64(open, m) };
+        let base = (rel as u64) * 0x0001_0001_0001_0001;
+        let mut out = unsafe { sep_base.add(sep_len) };
+        // The last store can fill up to three padding lanes. The next block
+        // overwrites them, and sep_len counts only the real delimiters.
+        loop {
+            let x0 = remaining.trailing_zeros() as u64;
+            remaining &= remaining.wrapping_sub(1);
+            let x1 = remaining.trailing_zeros() as u64;
+            remaining &= remaining.wrapping_sub(1);
+            let x2 = remaining.trailing_zeros() as u64;
+            remaining &= remaining.wrapping_sub(1);
+            let x3 = remaining.trailing_zeros() as u64;
+            remaining &= remaining.wrapping_sub(1);
+            let positions = base + (x0 | (x1 << 16) | (x2 << 32) | (x3 << 48));
+            let flags = unsafe {
+                _pdep_u64(closes, 0x4000_4000_4000_4000)
+                    | _pdep_u64(opens, 0x8000_8000_8000_8000)
+            };
+            unsafe { out.cast::<u64>().write_unaligned(positions | flags) };
+            if remaining == 0 {
+                break;
             }
-            if m0 != 0 {
-                let mut o = o0.add(4);
-                while m0 != 0 {
-                    *o = b0.wrapping_add(m0.trailing_zeros() as u16);
-                    o = o.add(1);
-                    m0 &= m0.wrapping_sub(1);
-                }
-            }
-            for k in 0..4 {
-                *o1.add(k) = b1.wrapping_add(m1.trailing_zeros() as u16);
-                m1 &= m1.wrapping_sub(1);
-            }
-            if m1 != 0 {
-                let mut o = o1.add(4);
-                while m1 != 0 {
-                    *o = b1.wrapping_add(m1.trailing_zeros() as u16);
-                    o = o.add(1);
-                    m1 &= m1.wrapping_sub(1);
-                }
-            }
+            closes >>= 4;
+            opens >>= 4;
+            out = unsafe { out.add(4) };
         }
-        sep_len += c0 + c1;
+        sep_len += count;
 
         let mut nm = n;
         while nm != 0 {
-            let i = nm.trailing_zeros();
-            unsafe {
-                *lf_base.add(lf_len) = (b0 + i as u16, (qb + (q & below_lt64(i)).count_ones()) as u16);
-            }
+            unsafe { *lf_base.add(lf_len) = (rel + nm.trailing_zeros() as usize) as u16 };
             lf_len += 1;
             nm &= nm - 1;
         }
-        qb += q.count_ones();
         rel += 64;
     }
     unsafe {
         seps.set_len(sep_len);
         lfs.set_len(lf_len);
     }
+    if bad_q == 0 {
+        Some(u32::from(unsafe { *ptr } == b'"'))
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
 fn scan_tile_stage2_u16<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
-    buf: &[u8],
-    lo: usize,
+    tile: &[u8],
     sc: &Scratch,
+    mut open: u32,
     f: &mut F,
 ) {
-    // Keep the tail padding readable for the callback. Derive the pointer from
-    // the original buffer so the preceding byte can also be read when lo > 0.
-    let tile_buf = &buf[lo..];
-    let tile_ptr = unsafe { buf.as_ptr().add(lo) };
-    let seps_sl = &sc.seps16[..];
-    let lfs_sl = &sc.lfs16[..];
-    let sep_len = seps_sl.len();
+    let seps = &sc.seps16;
     let mut k = 0usize;
-    let mut row_start = 0u32;
-    let mut q_prev = 0u32;
-    if lo > 0 {
-        for &(lf16, qc16) in lfs_sl {
-            let lf = lf16 as u32;
-            let qc = qc16 as u32;
-            if k + N <= sep_len && unsafe { *seps_sl.get_unchecked(k + N - 1) } as u32 == lf {
-                let mut fields = [(0u32, 0u32); N];
-                let mut wrapped = 0u32;
-                let mut s = row_start;
-                for j in 0..N {
-                    let e = unsafe { *seps_sl.get_unchecked(k + j) } as u32;
-                    let b0 = unsafe { *tile_ptr.add(s as usize) };
-                    let b1 = unsafe { *tile_ptr.offset(e as isize - 1) };
-                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
-                    wrapped += w;
-                    fields[j] = (s + w, e - w);
-                    s = e + 1;
-                }
-                if qc - q_prev == 2 * wrapped {
-                    f(tile_buf, &fields);
-                }
-                k += N;
-            } else {
-                while unsafe { *seps_sl.get_unchecked(k) } as u32 != lf {
-                    k += 1;
-                }
+    let mut row_start = 0;
+    for &lf in &sc.lfs16 {
+        if k + N <= seps.len() && unsafe { *seps.get_unchecked(k + N - 1) } & POSITION == lf {
+            let mut fields = [(0, 0); N];
+            let mut mismatch = 0;
+            let mut start = row_start;
+            for j in 0..N {
+                let sep = u32::from(unsafe { *seps.get_unchecked(k + j) });
+                let end = sep & u32::from(POSITION);
+                let close = (sep >> CLOSE_QUOTE) & 1;
+                mismatch |= open ^ close;
+                fields[j] = (start + open, end.wrapping_sub(close));
+                open = sep >> OPEN_NEXT;
+                start = end + 1;
+            }
+            if mismatch == 0 {
+                f(tile, &fields);
+            }
+            k += N;
+        } else {
+            while unsafe { *seps.get_unchecked(k) } & POSITION != lf {
                 k += 1;
             }
-            row_start = lf + 1;
-            q_prev = qc;
+            open = u32::from(unsafe { *seps.get_unchecked(k) }) >> OPEN_NEXT;
+            k += 1;
         }
-    } else {
-        for &(lf16, qc16) in lfs_sl {
-            let lf = lf16 as u32;
-            let qc = qc16 as u32;
-            if k + N <= sep_len && unsafe { *seps_sl.get_unchecked(k + N - 1) } as u32 == lf {
-                let mut fields = [(0u32, 0u32); N];
-                let mut wrapped = 0u32;
-                let mut s = row_start;
-                for j in 0..N {
-                    let e = unsafe { *seps_sl.get_unchecked(k + j) } as u32;
-                    let b0 = unsafe { *tile_ptr.add(s as usize) };
-                    let b1 = unsafe { *tile_ptr.add(e.saturating_sub(1) as usize) };
-                    let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
-                    wrapped += w;
-                    fields[j] = (s + w, e - w);
-                    s = e + 1;
-                }
-                if qc - q_prev == 2 * wrapped {
-                    f(tile_buf, &fields);
-                }
-                k += N;
-            } else {
-                while unsafe { *seps_sl.get_unchecked(k) } as u32 != lf {
-                    k += 1;
-                }
-                k += 1;
-            }
-            row_start = lf + 1;
-            q_prev = qc;
-        }
+        row_start = u32::from(lf) + 1;
     }
+}
+
+#[cold]
+#[inline(never)]
+fn scan_tile_fallback<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
+    buf: &[u8], lo: usize, hi: usize, sc: &mut Scratch, f: &mut F,
+) {
+    scan_tile_stage1(buf, lo, hi, sc);
+    scan_tile_stage2::<N, F>(buf, lo, sc, f);
 }
 
 #[inline(always)]
@@ -763,6 +737,80 @@ mod tests {
             });
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn quote_bits_match_reference_on_csv_rows() {
+        fn check<const N: usize>(buf: &mut Vec<u8>, lo: usize, expect_fast: bool) {
+            let hi = buf.len();
+            // Nonzero padding also checks that the following byte outside the
+            // tile cannot influence the last separator.
+            buf.resize(hi + PAD, b'"');
+            if expect_fast {
+                let mut scratch = Scratch::default();
+                assert!(hi - lo <= 16_380);
+                assert!(scan_tile_stage1_u16(buf, lo, hi, &mut scratch, masks).is_some());
+            }
+            let base = buf.as_ptr() as usize;
+            let (mut expected, mut actual) = (Vec::new(), Vec::new());
+            scan_ref::<N, _>(buf, lo, hi, |b, ranges| {
+                let off = (b.as_ptr() as usize - base) as u32;
+                expected.push(ranges.map(|(s, e)| (s + off, e + off)));
+            });
+            scan::<N, _>(buf, lo, hi, |b, ranges| {
+                let off = (b.as_ptr() as usize - base) as u32;
+                actual.push(ranges.map(|(s, e)| (s + off, e + off)));
+            });
+            assert_eq!(actual, expected);
+        }
+
+        fn fuzz<const N: usize>() {
+            let mut rng = 0xc65b_590d_5649_260bu64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng as usize
+            };
+            let valid_fields = [b"".as_slice(), b"x", b"xy", b"\"\"", b"\"x\"", b"\"x,y\""];
+            let bad_fields = [b"\"".as_slice(), b"x\"", b"\"x", b"x\"y", b"\"x\"y\"", b"\"x\ny\"", b"\"\"\"\"", b"\", x\""];
+
+            // The first half contains only boundary quotes, so it exercises
+            // the compact path. The rest also exercises the fallback scanner.
+            for batch in 0..100 {
+                let lo = batch % 4;
+                let mut buf = vec![b'"'; lo];
+                for row in 0..200 {
+                    let fields = if row % 17 == 0 { next() % (N + 3) } else { N };
+                    for col in 0..fields {
+                        if col != 0 {
+                            buf.push(b',');
+                        }
+                        if row % 31 == 0 && col == 0 {
+                            // Drive opening/closing quotes and separators on
+                            // both sides of the AVX2 block boundary.
+                            buf.push(b'"');
+                            let offset = (buf.len() - lo) % 64;
+                            let target = 62 + row % 4;
+                            buf.resize(buf.len() + (target + 64 - offset) % 64, b'x');
+                            buf.push(b'"');
+                        } else {
+                            let field = if batch >= 50 && next() % 11 == 0 {
+                                bad_fields[next() % bad_fields.len()]
+                            } else {
+                                valid_fields[next() % valid_fields.len()]
+                            };
+                            buf.extend_from_slice(field);
+                        }
+                    }
+                    buf.push(b'\n');
+                }
+                check::<N>(&mut buf, lo, batch < 50);
+            }
+        }
+        fuzz::<2>();
+        fuzz::<4>();
+        fuzz::<7>();
     }
 
     #[test]
