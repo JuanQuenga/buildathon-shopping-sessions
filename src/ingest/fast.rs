@@ -3,13 +3,12 @@
 //! caller then uses the generic slow path) if neither can carry the input exactly.
 //! Pipeline (docs/ingest.md):
 //!   links  : parse -> flat parallel scatter/intern -> parallel union-find -> canonical maps + L3 Bloom
-//!   parse  : reader pool feeds SIMD scan; event tokens -> P1 by event id; valid
+//!   parse  : chunked pread + SIMD scan; event tokens -> P1 by event id; valid
 //!            events and clicks -> P2 by canonical person (prefetched through Links)
 //!   dedup  : per P1 partition, exact open addressing marks loser locations in P2
 //!   group  : per P2 partition, skip losers, build CSR and sort by timestamp
 //! The wide-key and Loaded paths use a two-pass dedup with canonicalization after
 //! winner selection.
-use super::io::{env_usize, FilledChunk, Input};
 use super::key::IdLookup;
 use super::keys::{Key, Map};
 use super::par::{self, Sinks, SyncPtr, Timer};
@@ -20,6 +19,7 @@ use crate::aggregate::{self, output, CampStore, NO_CATEGORY};
 use crate::types::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::Instant;
 
@@ -27,6 +27,7 @@ const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
 const DAY_MS_U64: u64 = ts::DAY_MS as u64;
+const CHUNK: u64 = 256 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
@@ -152,9 +153,13 @@ struct Ctx<'scope> {
     we: i64,
     dt: DateTable,
     lookups: LookupTask<'scope>,
-    input: Input,
+    files: Arc<Vec<FileInfo>>,
+    prefetch: par::Prefetch,
+    link_chunks: Vec<Chunk>,
+    main_chunks: Vec<Chunk>,
     event_bytes: u64,
     click_bytes: u64,
+    chunk_bytes: u64,
     parse_threads: usize,
     p1_bits_override: Option<u32>,
 }
@@ -173,26 +178,35 @@ fn scan_chunk<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
     }
 }
 
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
+}
+
 fn build_ctx<'scope, 'env>(
     data_dir: &'env Path,
     threads: usize,
     scope: &'scope Scope<'scope, 'env>,
     tm: &mut Timer,
 ) -> Option<Ctx<'scope>> {
-    let start = Instant::now();
     let (ws, we) = small::read_manifest(data_dir);
     // Representation limits of the compact records (else: generic path).
     if we < ws || we.checked_sub(ws)? > u32::MAX as i64 - WEEK_MS {
         return None;
     }
-    let input = Input::open(data_dir, threads, start);
+    let files = Arc::new(scan::open_csv_files(data_dir));
     let dt = DateTable::build(ws, we);
     let lookups = LookupTask::Pending(Some(scope.spawn(|| {
         let (categories, _, prod) = small::read_products_lookup(data_dir);
         let (campaigns, camp) = small::read_campaigns_lookup(data_dir);
         Lookups { categories, campaigns, prod, camp }
     })));
-    let files = input.files();
+    let prefetch = par::Prefetch::start(&files, threads);
+    let chunk_bytes = env_usize("INGEST_CHUNK_KB")
+        .map(|kb| (kb.clamp(32, 4096) as u64) << 10)
+        .unwrap_or(CHUNK);
+    let chunks = scan::plan(&files, chunk_bytes);
+    let link_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
+    let main_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind != Kind::Links).collect();
     let event_bytes = files.iter().filter(|f| f.kind == Kind::Events).map(|f| f.len).sum();
     let click_bytes = files.iter().filter(|f| f.kind == Kind::Clicks).map(|f| f.len).sum();
     let parse_threads = env_usize("INGEST_PARSE_THREADS").unwrap_or(0);
@@ -202,9 +216,13 @@ fn build_ctx<'scope, 'env>(
         we,
         dt,
         lookups,
-        input,
+        files,
+        prefetch,
+        link_chunks,
+        main_chunks,
         event_bytes,
         click_bytes,
+        chunk_bytes,
         parse_threads,
         p1_bits_override,
     };
@@ -231,7 +249,6 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) -> bool
             }
             Err(Need::Wide) => {
                 eprintln!("[ingest] compact keys not applicable: retrying with wide keys");
-                ctx.input.restart();
                 match ingest_to_sinks::<false, u128>(&mut ctx, threads, &plan, &mut tm) {
                     Ok(deduped) => {
                         run_fused(&ctx, deduped, output_dir, threads, &mut tm);
@@ -255,7 +272,6 @@ fn ingest_compact(
         match ingest_single_pass(ctx, threads, plan, tm) {
             Err(Need::TwoPass) => {
                 eprintln!("[ingest] event location overflow: retrying with two passes");
-                ctx.input.restart();
             }
             result => return result,
         }
@@ -272,7 +288,6 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
             Ok(l) => Some(l),
             Err(Need::Wide) => {
                 eprintln!("[ingest] compact keys not applicable: retrying with wide keys");
-                ctx.input.restart();
                 run::<u128>(&mut ctx, threads, &mut tm).ok()
             }
             Err(Need::Slow | Need::TwoPass) => None,
@@ -290,8 +305,8 @@ struct Deduped<K: Key> {
 
 fn read_links<K: Key>(ctx: &Ctx<'_>, threads: usize, tm: &mut Timer) -> Result<Links<K>, Need> {
     let flag = Flag(AtomicU8::new(0));
-    let files = ctx.input.files();
-    let link_chunks = ctx.input.link_chunks();
+    let files = &ctx.files;
+    let link_chunks = &ctx.link_chunks;
     let link_pairs: Vec<Vec<(K, K)>> = par::run(
         threads,
         link_chunks.len(),
@@ -389,13 +404,14 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
     let flag = Flag(AtomicU8::new(0));
     let (ws, we) = (ctx.ws, ctx.we);
     let dt = &ctx.dt;
-    let stream = ctx.input.take_stream();
+    let files = &ctx.files;
     let lookups = ctx.lookups.wait();
     if lookups.categories.len() > 256 {
-        stream.cancel();
         return Err(Need::Slow);
     }
     tm.lap("small-wait");
+    let main_chunks = &ctx.main_chunks;
+    let chunk_bytes = ctx.chunk_bytes;
     let PartitionPlan { parse_threads, p1_bits, p2_bits, p2, cap_ck, .. } = *plan;
 
     #[derive(Clone, Copy)]
@@ -412,24 +428,27 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
         ck: Sinks<RecC<K>>,
         ck_ring: [PendingClick<K>; CK_RING],
         ck_cnt: usize,
+        buf: Vec<u8>,
     }
     let states = par::run_fini(
         parse_threads,
-        stream.len(),
+        main_chunks.len(),
         |tid| ParseState {
             ev: E::new(tid, plan),
             ck: Sinks::new(p2, cap_ck),
             ck_ring: [PendingClick { user: K::default(), uh: 0, cid: K::default(), ts: 0, campaign: 0 }; CK_RING],
             ck_cnt: 0,
+            buf: Vec::with_capacity(chunk_bytes as usize + 8192),
         },
-        |st, _| {
+        |st, i| {
             if flag.get().is_some() {
                 return;
             }
-            let Some(FilledChunk { chunk_idx, buf, lo, hi }) = stream.pop() else { return };
-            let bytes = buf.as_slice(hi + scan::PAD);
-            match stream.kind(chunk_idx) {
-                Kind::Events => scan::scan::<7, _>(bytes, lo, hi, |b, f| {
+            let c = main_chunks[i];
+            let fi = &files[c.file as usize];
+            let mut buf = std::mem::take(&mut st.buf);
+            match fi.kind {
+                Kind::Events => scan_chunk::<7, _>(files, c, &mut buf, |b, f| {
                     if let Err(n) = parse_event::<ALL_CAT, K>(
                         dt, b, f, ws, we, &lookups.prod, p1_bits, |p, rec| st.ev.push(p, rec, links, plan, &flag),
                     ) {
@@ -439,7 +458,7 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
                 Kind::Clicks => {
                     let ck_base = ws - WEEK_MS;
                     let has_links = links.has_links;
-                    scan::scan::<4, _>(bytes, lo, hi, |b, f| {
+                    scan_chunk::<4, _>(files, c, &mut buf, |b, f| {
                         if flen(f[0]) == 0 || flen(f[1]) == 0 {
                             return;
                         }
@@ -489,10 +508,7 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
                 }
                 Kind::Links => unreachable!(),
             }
-            if flag.get().is_some() {
-                stream.request_stop();
-            }
-            stream.recycle(buf);
+            st.buf = buf;
         },
         |st| {
             let n_rem = st.ck_cnt.min(CK_RING);
@@ -506,14 +522,14 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
             st.ck_cnt = 0;
             st.ev.finish(links, plan, &flag);
             st.ck.finish();
+            drop(std::mem::take(&mut st.buf));
         },
     );
+    ctx.prefetch.stop();
     if let Some(n) = flag.get() {
-        stream.cancel();
         par::drop_par(parse_threads, states);
         return Err(n);
     }
-    stream.finish();
     Ok(states.into_iter().map(|s| (s.ev, s.ck)).collect())
 }
 
