@@ -7,6 +7,7 @@
 pub mod parquet;
 
 use super::{CampRow, Tables, UserRow, NO_CATEGORY};
+use crate::ingest::par::{ArenaVec, Scratch};
 use crate::types::Loaded;
 use parquet::{FileBuilder, RowGroupFile};
 use std::io;
@@ -28,29 +29,33 @@ fn bytes_of<T: Copy>(v: &[T]) -> &[u8] {
 
 /// user_daily rows accumulated directly as PLAIN Parquet column page bodies.
 #[derive(Default)]
-pub struct UserCols {
+pub struct UserCols<'a> {
     n: usize,
-    ids: Vec<u8>,
-    day: Vec<i32>,
-    sessions: Vec<u32>,
-    events: Vec<u32>,
-    revenue: Vec<i64>,
-    defs: Vec<u8>,
-    top: Vec<u8>,
+    ids: ArenaVec<'a, u8>,
+    day: ArenaVec<'a, i32>,
+    sessions: ArenaVec<'a, u32>,
+    events: ArenaVec<'a, u32>,
+    revenue: ArenaVec<'a, i64>,
+    defs: ArenaVec<'a, u8>,
+    top: ArenaVec<'a, u8>,
 }
 
-impl UserCols {
+impl<'a> UserCols<'a> {
     pub fn with_capacity(rows: usize) -> Self {
+        Self::in_scratch(rows, &mut Scratch::default())
+    }
+
+    fn in_scratch(rows: usize, scratch: &mut Scratch<'a>) -> Self {
         let cap = rows.min(MAX_ROWS);
         UserCols {
             n: 0,
-            ids: Vec::with_capacity(cap * 14),
-            day: Vec::with_capacity(cap),
-            sessions: Vec::with_capacity(cap),
-            events: Vec::with_capacity(cap),
-            revenue: Vec::with_capacity(cap),
-            defs: Vec::with_capacity(cap.div_ceil(8) + 1),
-            top: Vec::with_capacity(cap * 4),
+            ids: scratch.buffer(cap * 14),
+            day: scratch.buffer(cap),
+            sessions: scratch.buffer(cap),
+            events: scratch.buffer(cap),
+            revenue: scratch.buffer(cap),
+            defs: scratch.buffer(cap.div_ceil(8) + 1),
+            top: scratch.buffer(cap * 4),
         }
     }
     pub fn len(&self) -> usize {
@@ -158,19 +163,24 @@ impl UserCols {
 pub struct UserWriter<'a> {
     dir: &'a Path,
     worker: usize,
-    cols: UserCols,
-    file: FileBuilder,
+    cols: UserCols<'a>,
+    file: FileBuilder<'a>,
     stream: Option<RowGroupFile>,
     total_written: usize,
 }
 
 impl<'a> UserWriter<'a> {
     pub fn new(dir: &'a Path, worker: usize, est_rows: usize) -> Self {
+        Self::in_scratch(dir, worker, est_rows, &mut Scratch::default())
+    }
+
+    pub(crate) fn in_scratch(dir: &'a Path, worker: usize, est_rows: usize, scratch: &mut Scratch<'a>) -> Self {
+        let group_rows = est_rows.min(USER_GROUP_ROWS);
         UserWriter {
             dir,
             worker,
-            cols: UserCols::with_capacity(est_rows.min(USER_GROUP_ROWS)),
-            file: FileBuilder::default(),
+            cols: UserCols::in_scratch(group_rows, scratch),
+            file: FileBuilder::in_scratch(scratch, group_rows),
             stream: None,
             total_written: 0,
         }
@@ -244,7 +254,7 @@ pub fn write_empty_user(dir: &Path) -> io::Result<()> {
     )
 }
 
-fn encode_user_cols(cols: &mut UserCols, file: &mut FileBuilder) {
+fn encode_user_cols(cols: &mut UserCols<'_>, file: &mut FileBuilder<'_>) {
     cols.sync_lens();
     file.reset(cols.n);
     file.col_user_id(&cols.ids);
@@ -255,7 +265,7 @@ fn encode_user_cols(cols: &mut UserCols, file: &mut FileBuilder) {
     file.col_category(&cols.defs, &cols.top);
 }
 
-fn write_user_cols_to(path: &Path, cols: &mut UserCols, file: &mut FileBuilder) -> io::Result<()> {
+fn write_user_cols_to(path: &Path, cols: &mut UserCols<'_>, file: &mut FileBuilder<'_>) -> io::Result<()> {
     encode_user_cols(cols, file);
     std::fs::write(path, file.finish())
 }
@@ -278,7 +288,7 @@ pub fn write_campaign_raw(
     Ok(())
 }
 
-fn encode_campaign(rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)], file: &mut FileBuilder) {
+fn encode_campaign(rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)], file: &mut FileBuilder<'_>) {
     let id = |c: u32| -> &[u8] {
         campaigns
             .get(c as usize)
@@ -426,17 +436,17 @@ mod tests {
         // The next row grows the fixed columns while their Vec lengths are stale.
         cols.push(b"second", 11, 5, 6, 70, None);
         cols.sync_lens();
-        assert_eq!(cols.day, [10, 11]);
-        assert_eq!(cols.sessions, [2, 5]);
-        assert_eq!(cols.events, [3, 6]);
-        assert_eq!(cols.revenue, [40, 70]);
+        assert_eq!(*cols.day, [10, 11]);
+        assert_eq!(*cols.sessions, [2, 5]);
+        assert_eq!(*cols.events, [3, 6]);
+        assert_eq!(*cols.revenue, [40, 70]);
 
         cols.clear();
         cols.push(b"third", 12, 8, 9, 100, None);
         cols.sync_lens();
-        assert_eq!(cols.day, [12]);
-        assert_eq!(cols.sessions, [8]);
-        assert_eq!(cols.events, [9]);
-        assert_eq!(cols.revenue, [100]);
+        assert_eq!(*cols.day, [12]);
+        assert_eq!(*cols.sessions, [8]);
+        assert_eq!(*cols.events, [9]);
+        assert_eq!(*cols.revenue, [100]);
     }
 }

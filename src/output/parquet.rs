@@ -1,5 +1,6 @@
 //! Dependency-free Parquet v1 page and row group writer.
 
+use crate::ingest::par::{ArenaVec, Scratch};
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -73,18 +74,18 @@ impl ColMeta {
 
 /// Reuses the file and page buffers across parts. Columns are added in schema order.
 #[derive(Default)]
-pub struct FileBuilder {
-    buf: Vec<u8>,
+pub struct FileBuilder<'a> {
+    buf: ArenaVec<'a, u8>,
     start: usize,
-    page: Vec<u8>,
-    compressed: Vec<u8>,
+    page: ArenaVec<'a, u8>,
+    compressed: ArenaVec<'a, u8>,
     indices: Vec<u16>,
     cols: Vec<ColMeta>,
     num_rows: usize,
 }
 
 #[inline]
-fn uvarint(out: &mut Vec<u8>, mut v: u64) {
+fn uvarint(out: &mut ArenaVec<'_, u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -98,14 +99,14 @@ fn zz(v: i64) -> u64 {
 }
 
 /// Thrift compact protocol writer (only what the footer and page headers need).
-struct Tw<'a> {
-    out: &'a mut Vec<u8>,
+struct Tw<'a, 'b> {
+    out: &'a mut ArenaVec<'b, u8>,
     last: Vec<i16>,
     cur: i16,
 }
 
-impl<'a> Tw<'a> {
-    fn new(out: &'a mut Vec<u8>) -> Self {
+impl<'a, 'b> Tw<'a, 'b> {
+    fn new(out: &'a mut ArenaVec<'b, u8>) -> Self {
         Tw {
             out,
             last: Vec::new(),
@@ -165,7 +166,17 @@ impl<'a> Tw<'a> {
     }
 }
 
-impl FileBuilder {
+impl<'a> FileBuilder<'a> {
+    pub(crate) fn in_scratch(scratch: &mut Scratch<'a>, rows: usize) -> Self {
+        Self {
+            buf: scratch.buffer(4096 + 14 * rows),
+            page: scratch.buffer(512 + 2 * rows),
+            compressed: scratch.buffer(6 * rows),
+            indices: Vec::with_capacity(rows),
+            ..Self::default()
+        }
+    }
+
     pub fn reset(&mut self, num_rows: usize) {
         self.num_rows = num_rows;
         self.start = 0;
@@ -263,7 +274,7 @@ impl FileBuilder {
         // body into the final buffer and backfill the header immediately before
         // it once we know the compressed length. The file starts at that prefix.
         const HEADER_SPACE: usize = 64;
-        debug_assert_eq!(self.buf, PAR1);
+        debug_assert_eq!(&*self.buf, PAR1);
         self.buf.resize(HEADER_SPACE, 0);
         if plain.len() <= self.num_rows * 32 {
             snappy_user_ids(plain, &mut self.buf);
@@ -295,10 +306,10 @@ impl FileBuilder {
         });
     }
 
-    pub fn col_utf8<'a>(
+    pub fn col_utf8<'v>(
         &mut self,
         name: &'static str,
-        vals: impl Iterator<Item = &'a [u8]> + Clone,
+        vals: impl Iterator<Item = &'v [u8]> + Clone,
     ) {
         self.page.clear();
         if let Some(dict) = string_dictionary(vals.clone(), &mut self.indices) {
@@ -432,8 +443,13 @@ impl FileBuilder {
 
     pub fn into_bytes(mut self) -> Vec<u8> {
         self.finish();
-        self.buf.drain(..self.start);
-        self.buf
+        match self.buf {
+            ArenaVec::Heap(mut buf) => {
+                buf.drain(..self.start);
+                buf
+            }
+            ArenaVec::Borrowed(_) => self.buf[self.start..].to_vec(),
+        }
     }
 }
 
@@ -455,7 +471,7 @@ impl RowGroupFile {
         })
     }
 
-    pub fn append(&mut self, group: &FileBuilder) -> std::io::Result<()> {
+    pub fn append(&mut self, group: &FileBuilder<'_>) -> std::io::Result<()> {
         use std::io::Write;
         debug_assert!(self.groups.first().is_none_or(|(_, cols)| {
             cols.len() == group.cols.len()
@@ -480,7 +496,7 @@ impl RowGroupFile {
 
     pub fn finish(mut self) -> std::io::Result<()> {
         use std::io::Write;
-        let mut tail = Vec::new();
+        let mut tail = ArenaVec::default();
         let groups = self.groups.iter().map(|(rows, cols)| (*rows, cols.as_slice()));
         footer(&mut tail, self.rows, &self.groups[0].1, groups);
         self.file.write_all(&tail)
@@ -498,7 +514,7 @@ fn integer_kind(vals: &[i64]) -> Kind {
     }
 }
 
-fn write_i32_values(vals: &[i64], out: &mut Vec<u8>) {
+fn write_i32_values(vals: &[i64], out: &mut ArenaVec<'_, u8>) {
     let start = out.len();
     out.resize(start + vals.len() * 4, 0);
     for (&value, bytes) in vals.iter().zip(out[start..].chunks_exact_mut(4)) {
@@ -506,7 +522,7 @@ fn write_i32_values(vals: &[i64], out: &mut Vec<u8>) {
     }
 }
 
-fn plain_string(out: &mut Vec<u8>, value: &[u8]) {
+fn plain_string(out: &mut ArenaVec<'_, u8>, value: &[u8]) {
     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
     out.extend_from_slice(value);
 }
@@ -603,7 +619,7 @@ fn integer_dictionary<T: Copy + Into<i64> + Eq + Hash>(
 
 /// Data page v1 definition levels carry a length prefix. Each byte in `bits` is
 /// already one group of eight levels in little-endian bit order.
-fn definition_levels(out: &mut Vec<u8>, rows: usize, bits: &[u8]) {
+fn definition_levels(out: &mut ArenaVec<'_, u8>, rows: usize, bits: &[u8]) {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
     if rows != 0 {
@@ -619,7 +635,7 @@ fn definition_levels(out: &mut Vec<u8>, rows: usize, bits: &[u8]) {
     out[start..start + 4].copy_from_slice(&size.to_le_bytes());
 }
 
-fn dictionary_indices(out: &mut Vec<u8>, indices: &[u16], count: usize) {
+fn dictionary_indices(out: &mut ArenaVec<'_, u8>, indices: &[u16], count: usize) {
     let width = usize::BITS - (count - 1).leading_zeros();
     out.push(width as u8);
     if width == 0 {
@@ -648,7 +664,7 @@ fn dictionary_indices(out: &mut Vec<u8>, indices: &[u16], count: usize) {
     }
 }
 
-fn pack_groups<const WIDTH: usize>(out: &mut Vec<u8>, indices: &[u16]) {
+fn pack_groups<const WIDTH: usize>(out: &mut ArenaVec<'_, u8>, indices: &[u16]) {
     let start = out.len();
     out.resize(start + indices.len().div_ceil(8) * WIDTH, 0);
     let (groups, tail) = indices.as_chunks::<8>();
@@ -690,8 +706,8 @@ fn pack_eight<const WIDTH: usize>(indices: &[u16; 8]) -> u128 {
 }
 
 fn append_page(
-    out: &mut Vec<u8>,
-    compressed: &mut Vec<u8>,
+    out: &mut ArenaVec<'_, u8>,
+    compressed: &mut ArenaVec<'_, u8>,
     data: &[u8],
     codec: Compression,
     num_values: usize,
@@ -725,7 +741,7 @@ fn append_page(
 }
 
 fn page_header(
-    out: &mut Vec<u8>,
+    out: &mut ArenaVec<'_, u8>,
     uncompressed: usize,
     compressed: usize,
     num_values: usize,
@@ -764,14 +780,14 @@ fn read_u64(bytes: &[u8]) -> u64 {
 }
 
 /// Raw Snappy block with 64 KiB matching windows and a 4K-entry position table.
-fn snappy(input: &[u8], out: &mut Vec<u8>) {
+fn snappy(input: &[u8], out: &mut ArenaVec<'_, u8>) {
     uvarint(out, input.len() as u64);
     for block in input.chunks(1 << 16) {
         snappy_block(block, out);
     }
 }
 
-fn snappy_block(input: &[u8], out: &mut Vec<u8>) {
+fn snappy_block(input: &[u8], out: &mut ArenaVec<'_, u8>) {
     let mut table = [0u16; 1 << 12];
     let mut literal = 0;
     let mut pos = 1;
@@ -811,7 +827,7 @@ fn snappy_block(input: &[u8], out: &mut Vec<u8>) {
 }
 
 /// The PLAIN ID stream places identical length-prefixed records side by side.
-fn snappy_user_ids(input: &[u8], out: &mut Vec<u8>) {
+fn snappy_user_ids(input: &[u8], out: &mut ArenaVec<'_, u8>) {
     out.reserve(input.len() / 2);
     uvarint(out, input.len() as u64);
     let mut literal = 0;
@@ -844,7 +860,7 @@ fn snappy_user_ids(input: &[u8], out: &mut Vec<u8>) {
 }
 
 /// Copy runs of zero words in PLAIN integer pages.
-fn snappy_zero_words(input: &[u8], out: &mut Vec<u8>) {
+fn snappy_zero_words(input: &[u8], out: &mut ArenaVec<'_, u8>) {
     out.reserve(input.len() * 3 / 4);
     uvarint(out, input.len() as u64);
     let (pairs, _) = input.as_chunks::<8>();
@@ -864,7 +880,7 @@ fn snappy_zero_words(input: &[u8], out: &mut Vec<u8>) {
 
 /// Short literals and short copies account for most ID and zero-word runs.
 #[inline]
-fn snappy_literal_and_copy(literal: &[u8], offset: usize, matched: usize, out: &mut Vec<u8>) {
+fn snappy_literal_and_copy(literal: &[u8], offset: usize, matched: usize, out: &mut ArenaVec<'_, u8>) {
     if !(1..=60).contains(&literal.len()) || matched > 64 {
         snappy_literals(literal, out);
         snappy_copy(offset, matched, out);
@@ -891,13 +907,13 @@ fn snappy_literal_and_copy(literal: &[u8], offset: usize, matched: usize, out: &
     }
 }
 
-fn snappy_literals(bytes: &[u8], out: &mut Vec<u8>) {
+fn snappy_literals(bytes: &[u8], out: &mut ArenaVec<'_, u8>) {
     for literal in bytes.chunks(1 << 16) {
         snappy_literal(literal, out);
     }
 }
 
-fn snappy_literal(bytes: &[u8], out: &mut Vec<u8>) {
+fn snappy_literal(bytes: &[u8], out: &mut ArenaVec<'_, u8>) {
     if bytes.is_empty() {
         return;
     }
@@ -912,7 +928,7 @@ fn snappy_literal(bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-fn snappy_copy(offset: usize, mut len: usize, out: &mut Vec<u8>) {
+fn snappy_copy(offset: usize, mut len: usize, out: &mut ArenaVec<'_, u8>) {
     let [low, high] = (offset as u16).to_le_bytes();
     while len > 64 {
         out.extend_from_slice(&[(63 << 2) | 2, low, high]);
@@ -927,7 +943,7 @@ fn snappy_copy(offset: usize, mut len: usize, out: &mut Vec<u8>) {
 
 /// Appends FileMetaData, its length and the trailing magic.
 fn footer<'a>(
-    out: &mut Vec<u8>,
+    out: &mut ArenaVec<'_, u8>,
     num_rows: usize,
     cols: &[ColMeta],
     groups: impl ExactSizeIterator<Item = (usize, &'a [ColMeta])>,
@@ -1094,7 +1110,7 @@ mod tests {
         let mut patterned = random[..8192].repeat(20);
         patterned.extend_from_slice(&[0; 32768]);
         patterned.extend_from_slice(b"123ab123ab3bab");
-        let mut encoded = Vec::new();
+        let mut encoded = ArenaVec::default();
         for input in [
             &[][..],
             &b"abc"[..],
@@ -1114,7 +1130,7 @@ mod tests {
 
     #[test]
     fn snappy_user_ids_roundtrip_with_mixed_record_lengths() {
-        let mut input = Vec::new();
+        let mut input = ArenaVec::default();
         let long_id = vec![b'x'; 70_000];
         for id in [
             &b"u"[..],
@@ -1131,14 +1147,14 @@ mod tests {
         ] {
             plain_string(&mut input, id);
         }
-        let mut encoded = Vec::new();
+        let mut encoded = ArenaVec::default();
         snappy_user_ids(&input, &mut encoded);
-        assert_eq!(decode_snappy(&encoded), input);
+        assert_eq!(decode_snappy(&encoded), &*input);
     }
 
     #[test]
     fn snappy_zero_words_preserves_runs_at_either_boundary() {
-        let mut encoded = Vec::new();
+        let mut encoded = ArenaVec::default();
         for vals in [
             &[][..],
             &[0][..],
@@ -1170,9 +1186,9 @@ mod tests {
         let mut indices = Vec::new();
         let dict = integer_dictionary(&[123; 19], &mut indices, 0).unwrap();
         assert_eq!(dict, [123]);
-        let mut encoded = Vec::new();
+        let mut encoded = ArenaVec::default();
         dictionary_indices(&mut encoded, &indices, dict.len());
-        assert_eq!(encoded, [0, 38]);
+        assert_eq!(*encoded, [0, 38]);
     }
 
     #[test]
@@ -1180,7 +1196,7 @@ mod tests {
         for width in 1..=14 {
             let mask = (1 << width) - 1;
             let indices: Vec<_> = (1..=19).map(|i| (i * 397) & mask).collect();
-            let mut encoded = Vec::new();
+            let mut encoded = ArenaVec::default();
             dictionary_indices(&mut encoded, &indices, 1 << width);
             assert_eq!(&encoded[..2], &[width as u8, 7]);
             for i in 0..24 {
@@ -1232,7 +1248,7 @@ mod tests {
 
     #[test]
     fn category_dictionary_over_limit_keeps_plain_values_and_levels() {
-        let mut plain = Vec::new();
+        let mut plain = ArenaVec::default();
         for category in 0..=DICTIONARY_LIMIT {
             plain_string(&mut plain, category.to_string().as_bytes());
         }
@@ -1245,7 +1261,7 @@ mod tests {
         let page = decode_snappy(&file.compressed);
         let prefix = 4 + read_u32(&page) as usize;
         assert_eq!(&page[prefix - defs.len()..prefix], defs);
-        assert_eq!(&page[prefix..], plain);
+        assert_eq!(&page[prefix..], &*plain);
     }
 
     #[test]

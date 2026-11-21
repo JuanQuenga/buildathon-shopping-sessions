@@ -15,6 +15,7 @@
 #[path = "../output/mod.rs"]
 pub mod output;
 
+use crate::ingest::par::{ArenaVec, Scratch};
 use crate::types::{Click, Event, Loaded};
 use std::collections::HashMap;
 use std::path::Path;
@@ -93,27 +94,32 @@ pub fn day_of(ts: i64) -> i32 {
 }
 
 /// Campaign x day accumulator: dense over the window's days, sparse overflow otherwise.
-pub struct CampStore {
+pub struct CampStore<'a> {
     pub day0: i32,
     pub ndays: u32,
-    pub dense: Vec<CampCell>,
+    pub dense: ArenaVec<'a, CampCell>,
     pub sparse: HashMap<(u32, i32), CampCell>,
 }
 
-impl CampStore {
+impl<'a> CampStore<'a> {
     pub fn new(ncamp_total: usize, day0: i32, ndays: u32) -> Self {
-        // Cap dense size (~32 MB per worker); beyond that everything goes sparse.
-        let (ndays, dense) = match ncamp_total.checked_mul(ndays as usize) {
-            Some(n) if n <= (1 << 20) => (ndays, vec![CampCell::default(); n]),
-            _ => (0, Vec::new()),
-        };
-        CampStore {
-            day0,
-            ndays,
-            dense,
-            sparse: HashMap::new(),
-        }
+        Self::in_scratch(ncamp_total, day0, ndays, &mut Scratch::default())
     }
+
+    pub(crate) fn in_scratch(ncamp_total: usize, day0: i32, ndays: u32, scratch: &mut Scratch<'a>) -> Self {
+        // Cap dense size (~32 MB per worker); beyond that everything goes sparse.
+        let mut dense = ArenaVec::default();
+        let ndays = match ncamp_total.checked_mul(ndays as usize) {
+            Some(n) if n <= (1 << 20) => {
+                dense = scratch.buffer(n);
+                dense.resize(n, CampCell::default());
+                ndays
+            }
+            _ => 0,
+        };
+        CampStore { day0, ndays, dense, sparse: HashMap::new() }
+    }
+
     #[inline(always)]
     pub fn cell(&mut self, camp: u32, day: i32) -> &mut CampCell {
         let di = day.wrapping_sub(self.day0) as u32;
@@ -150,8 +156,8 @@ impl CampStore {
 }
 
 /// Merge per-worker `CampStore`s into non-empty `CampRow`s.
-pub fn merge_camps(stores: impl IntoIterator<Item = CampStore>) -> Vec<CampRow> {
-    let mut merged: Option<CampStore> = None;
+pub fn merge_camps<'a>(stores: impl IntoIterator<Item = CampStore<'a>>) -> Vec<CampRow> {
+    let mut merged: Option<CampStore<'_>> = None;
     for camp in stores {
         match merged.as_mut() {
             None => merged = Some(camp),
@@ -198,7 +204,7 @@ pub fn merge_camps(stores: impl IntoIterator<Item = CampStore>) -> Vec<CampRow> 
 struct Worker<'a> {
     loaded: &'a Loaded,
     organic: u32,
-    camp: CampStore,
+    camp: CampStore<'a>,
     rows: Vec<UserRow>,
     /// When set, rows go straight into Parquet column buffers (split before page limits).
     writer: Option<output::UserWriter<'a>>,

@@ -552,11 +552,10 @@ pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
 }
 
-/// Two cache lines amortize each flush at the compact path's partition counts.
-const SWCB_BYTES: usize = 128;
+const CACHE_LINE_BYTES: usize = 64;
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct SwcbLine([u8; SWCB_BYTES]);
+struct SwcbLine([u8; CACHE_LINE_BYTES]);
 
 /// Fixed-capacity per-partition append regions inside one huge-page arena,
 /// fronted by L2-resident software write-combining buffers (SWCBs) that emit
@@ -602,6 +601,10 @@ impl SinkArena {
         Self { base, bytes, mapping: Arc::new(SinkMapping { raw, len }) }
     }
 
+    pub(super) fn len_bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub(super) fn split_at(self, offset: usize) -> (Self, Self) {
         assert!(offset <= self.bytes && offset % 64 == 0);
         let rest = Self {
@@ -616,7 +619,7 @@ impl SinkArena {
 /// The unallocated tail of an exclusively borrowed arena. Typed allocations
 /// are disjoint and can outlive the cursor, up to the arena borrow.
 #[derive(Default)]
-pub(super) struct Scratch<'a>(&'a mut [MaybeUninit<u8>]);
+pub(crate) struct Scratch<'a>(&'a mut [MaybeUninit<u8>]);
 
 impl SinkArena {
     pub(super) fn scratch(&mut self) -> Scratch<'_> {
@@ -625,7 +628,18 @@ impl SinkArena {
 }
 
 impl<'a> Scratch<'a> {
-    pub(super) fn buffer<T>(&mut self, capacity: usize) -> ArenaVec<'a, T> {
+    pub(super) fn take_prefix(&mut self, bytes: usize) -> Self {
+        let bytes = bytes.next_multiple_of(64).min(self.0.len());
+        let (prefix, rest) = std::mem::take(&mut self.0).split_at_mut(bytes);
+        self.0 = rest;
+        Self(prefix)
+    }
+
+    pub(super) fn reborrow(&mut self) -> Scratch<'_> {
+        Scratch(self.0)
+    }
+
+    pub(crate) fn buffer<T>(&mut self, capacity: usize) -> ArenaVec<'a, T> {
         let align = std::mem::align_of::<T>().max(64);
         let pad = self.0.as_ptr().align_offset(align);
         let bytes = capacity.checked_mul(std::mem::size_of::<T>()).unwrap();
@@ -640,7 +654,7 @@ impl<'a> Scratch<'a> {
     }
 }
 
-pub(super) struct ArenaBuffer<'a, T> {
+pub(crate) struct ArenaBuffer<'a, T> {
     slots: &'a mut [MaybeUninit<T>],
     len: usize,
 }
@@ -654,7 +668,7 @@ impl<T> Drop for ArenaBuffer<'_, T> {
 
 /// A vector using scratch space until it needs more capacity. Growth uses
 /// the heap so skewed partitions do not need fixed arena capacity limits.
-pub(super) enum ArenaVec<'a, T> {
+pub(crate) enum ArenaVec<'a, T> {
     Borrowed(ArenaBuffer<'a, T>),
     Heap(Vec<T>),
 }
@@ -667,7 +681,25 @@ impl<T> Default for ArenaVec<'_, T> {
 
 impl<T> ArenaVec<'_, T> {
     #[inline]
-    pub(super) fn as_mut_ptr(&mut self) -> *mut T {
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::Borrowed(a) => a.slots.len(),
+            Self::Heap(v) => v.capacity(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn extend_from_slice(&mut self, values: &[T]) where T: Copy {
+        self.reserve(values.len());
+        let len = self.len();
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), self.as_mut_ptr().add(len), values.len());
+            self.set_len(len + values.len());
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut T {
         match self {
             Self::Borrowed(a) => a.slots.as_mut_ptr().cast(),
             Self::Heap(v) => v.as_mut_ptr(),
@@ -676,7 +708,7 @@ impl<T> ArenaVec<'_, T> {
 
     /// All elements in the new initialized range must be valid `T`s.
     #[inline]
-    pub(super) unsafe fn set_len(&mut self, len: usize) {
+    pub(crate) unsafe fn set_len(&mut self, len: usize) {
         match self {
             Self::Borrowed(a) => {
                 debug_assert!(len <= a.slots.len());
@@ -686,7 +718,7 @@ impl<T> ArenaVec<'_, T> {
         }
     }
 
-    pub(super) fn reserve(&mut self, additional: usize) {
+    pub(crate) fn reserve(&mut self, additional: usize) {
         match self {
             Self::Borrowed(a) if additional > a.slots.len() - a.len => {
                 let mut heap = Vec::with_capacity((a.len + additional).max(a.slots.len() * 2));
@@ -704,7 +736,7 @@ impl<T> ArenaVec<'_, T> {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         match self {
             Self::Borrowed(a) => {
                 let initialized = std::ptr::slice_from_raw_parts_mut(a.slots.as_mut_ptr().cast::<T>(), a.len);
@@ -716,7 +748,7 @@ impl<T> ArenaVec<'_, T> {
     }
 
     #[inline]
-    pub(super) fn push(&mut self, value: T) {
+    pub(crate) fn push(&mut self, value: T) {
         self.reserve(1);
         let len = self.len();
         unsafe {
@@ -725,7 +757,7 @@ impl<T> ArenaVec<'_, T> {
         }
     }
 
-    pub(super) fn resize(&mut self, len: usize, value: T) where T: Copy {
+    pub(crate) fn resize(&mut self, len: usize, value: T) where T: Copy {
         let old = self.len();
         self.reserve(len.saturating_sub(old));
         for i in old..len {
@@ -760,10 +792,22 @@ impl<T> std::ops::DerefMut for ArenaVec<'_, T> {
 impl<T: Copy> Sinks<T> {
     #[inline(always)]
     const fn per_line() -> usize {
-        let sz = std::mem::size_of::<T>();
-        assert!(sz == 16 || sz == 32 || sz == 64);
-        assert!(std::mem::align_of::<T>() >= 16);
-        SWCB_BYTES / sz
+        match std::mem::size_of::<T>() {
+            16 | 24 | 40 => 8,
+            32 | 48 => 4,
+            64 => 2,
+            _ => panic!("unsupported sink record size"),
+        }
+    }
+
+    #[inline(always)]
+    const fn line_bytes() -> usize {
+        Self::per_line() * std::mem::size_of::<T>()
+    }
+
+    #[inline(always)]
+    const fn lines_per_partition() -> usize {
+        Self::line_bytes() / CACHE_LINE_BYTES
     }
 
     fn aligned_cap(cap: usize) -> usize {
@@ -773,11 +817,13 @@ impl<T: Copy> Sinks<T> {
     pub(super) fn in_arena(parts: usize, cap: usize, arena: SinkArena) -> Self {
         assert_eq!(arena.bytes, Self::arena_bytes(parts, cap));
         let cap = Self::aligned_cap(cap);
+        debug_assert_eq!(arena.base as usize % CACHE_LINE_BYTES, 0);
+        debug_assert_eq!((cap * std::mem::size_of::<T>()) % CACHE_LINE_BYTES, 0);
         Sinks {
             base: arena.base.cast(),
             arena,
             cap,
-            swcb: vec![SwcbLine([0u8; SWCB_BYTES]); parts],
+            swcb: vec![SwcbLine([0u8; CACHE_LINE_BYTES]); parts * Self::lines_per_partition()],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
         }
@@ -795,22 +841,6 @@ impl<T: Copy> Sinks<T> {
         self.arena
     }
 
-    pub(super) fn reuse_pair<U: Copy>(
-        parts: usize, cap: usize, other_cap: usize, arena: Option<SinkArena>,
-    ) -> (Self, Sinks<U>, Option<SinkArena>) {
-        let bytes = Self::arena_bytes(parts, cap);
-        let other_bytes = Sinks::<U>::arena_bytes(parts, other_cap);
-        if let Some(arena) = arena {
-            if bytes + other_bytes <= arena.bytes {
-                let (first, rest) = arena.split_at(bytes);
-                let (second, tail) = rest.split_at(other_bytes);
-                return (Self::in_arena(parts, cap, first), Sinks::in_arena(parts, other_cap, second), Some(tail));
-            }
-            return (Self::new(parts, cap), Sinks::new(parts, other_cap), Some(arena));
-        }
-        (Self::new(parts, cap), Sinks::new(parts, other_cap), None)
-    }
-
     /// Append to partition `p`'s SWCB. When full, stream it to the arena or
     /// copy it to the overflow vector.
     #[inline(always)]
@@ -824,7 +854,7 @@ impl<T: Copy> Sinks<T> {
         let pl = Self::per_line();
         let l = unsafe { *self.len.get_unchecked(p) };
         let slot = l & (pl - 1);
-        let line_ptr = unsafe { self.swcb.as_mut_ptr().add(p) as *mut T };
+        let line_ptr = unsafe { self.swcb.as_mut_ptr().add(p * Self::lines_per_partition()).cast::<T>() };
         unsafe { line_ptr.add(slot).write(x) };
         let nl = l + 1;
         unsafe { *self.len.get_unchecked_mut(p) = nl };
@@ -845,7 +875,7 @@ impl<T: Copy> Sinks<T> {
                 let src = line_ptr as *const __m256i;
                 debug_assert_eq!(dst as usize & 63, 0);
                 debug_assert_eq!(src as usize & 63, 0);
-                for i in 0..(SWCB_BYTES / 32) {
+                for i in 0..(Self::line_bytes() / 32) {
                     _mm256_stream_si256(dst.add(i), _mm256_load_si256(src.add(i)));
                 }
             }
@@ -870,7 +900,10 @@ impl<T: Copy> Sinks<T> {
             let rem = l & (pl - 1);
             if rem != 0 {
                 let base_idx = l - rem;
-                let src = unsafe { std::slice::from_raw_parts(self.swcb.as_ptr().add(p) as *const T, rem) };
+                let src = unsafe {
+                    let ptr = self.swcb.as_ptr().add(p * Self::lines_per_partition()).cast();
+                    std::slice::from_raw_parts(ptr, rem)
+                };
                 if l <= self.cap {
                     unsafe {
                         std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.cap + base_idx), rem);

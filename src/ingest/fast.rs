@@ -87,9 +87,9 @@ struct RecB<K: Key> {
     cc: u32,
 }
 
-/// Valid click keyed by person. 32 bytes for u64 keys, 64 bytes for u128 keys.
+/// Valid click keyed by person. 24 bytes for u64 keys, 48 bytes for u128 keys.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
+#[repr(C)]
 struct RecC<K: Key> {
     person: K,
     cid: K,
@@ -308,52 +308,136 @@ struct Deduped<K: Key> {
 
 type CanonicalPart<'a, K> = (usize, ArenaVec<'a, (K, K)>);
 
-fn read_links<'a, K: Key, L>(
-    ctx: &Ctx<'_>, threads: usize, tm: &mut Timer, scratch: &mut Scratch<'a>,
-    build: impl FnOnce(Vec<CanonicalPart<'a, K>>) -> L,
-) -> Result<L, Need> {
+fn read_links<'a, K: Key>(
+    ctx: &Ctx<'_>, threads: usize, tm: &mut Timer, scratch: &mut Scratch<'_>,
+    canonical_space: &mut Scratch<'a>, partition_bits: u32,
+) -> Result<Vec<CanonicalPart<'a, K>>, Need> {
     let flag = Flag(AtomicU8::new(0));
     let files = &ctx.files;
-    let link_chunks = &ctx.link_chunks;
-    let link_pairs: Vec<Vec<(K, K)>> = par::run(
-        threads,
-        link_chunks.len(),
-        |tid| (Vec::<(K, K)>::new(), std::mem::take(&mut *ctx.readers[tid].lock().unwrap())),
-        |(pairs, buf), i| {
-            if flag.get().is_some() {
-                return;
-            }
-            let c = link_chunks[i];
-            scan_chunk::<2, _>(files, c, buf, |b, f| {
-                if flen(f[0]) == 0 || flen(f[1]) == 0 {
+    let chunks = &ctx.link_chunks;
+    // Two compact IDs and their delimiters usually take 19 CSV bytes.
+    // The final row can cross the chunk boundary, and shorter IDs can spill.
+    let estimates: Vec<_> = chunks.iter()
+        .map(|chunk| ((chunk.end - chunk.start) as usize).div_ceil(19) + 4)
+        .collect();
+    let pair_bytes = estimates.iter()
+        .map(|&n| (n * std::mem::size_of::<(K, K)>()).next_multiple_of(64))
+        .sum();
+    let mut pair_space = scratch.take_prefix(pair_bytes);
+    let mut scatter_space;
+    let mut endpoints;
+    let (keys_parts, nl) = {
+        let mut pair_space = pair_space.reborrow();
+        let pairs: Vec<_> = estimates.into_iter().map(|cap| Mutex::new(pair_space.buffer(cap))).collect();
+        let mut parsed: Vec<_> = par::run(
+            threads,
+            chunks.len(),
+            |tid| (Vec::new(), std::mem::take(&mut *ctx.readers[tid].lock().unwrap())),
+            |(parsed, buf), i| {
+                if flag.get().is_some() {
                     return;
                 }
-                match (fkey::<K>(b, f[0]), fkey::<K>(b, f[1])) {
-                    (Some(a), Some(c)) => pairs.push((a, c)),
-                    (None, _) => flag.set(key_need(f[0])),
-                    (_, None) => flag.set(key_need(f[1])),
+                let mut pairs = std::mem::take(&mut *pairs[i].lock().unwrap());
+                scan_chunk::<2, _>(files, chunks[i], buf, |b, f| {
+                    if flen(f[0]) == 0 || flen(f[1]) == 0 {
+                        return;
+                    }
+                    match (fkey::<K>(b, f[0]), fkey::<K>(b, f[1])) {
+                        (Some(a), Some(c)) => pairs.push((a, c)),
+                        (None, _) => flag.set(key_need(f[0])),
+                        (_, None) => flag.set(key_need(f[1])),
+                    }
+                });
+                if !pairs.is_empty() {
+                    parsed.push((i, pairs));
                 }
-            });
-        },
-    )
-    .into_iter()
-    .enumerate()
-    .map(|(tid, (pairs, buf))| {
-        *ctx.readers[tid].lock().unwrap() = buf;
-        pairs
-    })
-    .collect();
-    if let Some(n) = flag.get() {
-        return Err(n);
-    }
-    tm.lap("links-parse");
-    let canonical = Links::canonical_pairs(&link_pairs, threads, scratch);
-    drop(link_pairs);
-    let links = build(canonical);
-    tm.lap("links-uf");
+            },
+        )
+        .into_iter()
+        .enumerate()
+        .flat_map(|(tid, (pairs, buf))| {
+            *ctx.readers[tid].lock().unwrap() = buf;
+            pairs
+        })
+        .collect();
+        if let Some(n) = flag.get() {
+            return Err(n);
+        }
+        tm.lap("links-parse");
+        parsed.sort_unstable_by_key(|part| part.0);
+        let scatter_bytes = parsed.iter()
+            .map(|(_, p)| (2 * p.len() * std::mem::size_of::<(K, u32)>()).next_multiple_of(64))
+            .sum();
+        scatter_space = scratch.take_prefix(scatter_bytes);
+        let (scattered, nl) = scatter_link_pairs(parsed, threads, &mut scatter_space.reborrow());
+        if nl == 0 {
+            eprintln!("[ingest] links=0 linked_ids=0");
+            return Ok(Vec::new());
+        }
+        // The parsed pairs are dead after scattering.
+        endpoints = pair_space.buffer::<u64>(2 * nl);
+        (Links::intern_link_endpoints(&scattered, &mut endpoints, nl, threads, scratch), nl)
+    };
+    Ok(Links::canonical_pairs(keys_parts, endpoints, nl, threads, &mut scatter_space,
+        canonical_space, partition_bits))
+}
 
-    // ---------------- Events + clicks parse ----------------
-    Ok(links)
+struct ScatteredLinks<'a, K> {
+    flat: ArenaVec<'a, (K, u32)>,
+    pos: [usize; LP + 1],
+}
+
+fn scatter_link_pairs<'a, K: Key>(
+    parsed: Vec<(usize, ArenaVec<'_, (K, K)>)>, threads: usize, scratch: &mut Scratch<'a>,
+) -> (Vec<ScatteredLinks<'a, K>>, usize) {
+    // Scatter endpoints by high hash bits. Coalesce input chunks into at most
+    // one stream per worker so interning visits few slices per hash partition.
+    if parsed.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let chunks_per_task = parsed.len().div_ceil(threads);
+    let mut nl = 0;
+    let input: Vec<_> = parsed.chunks(chunks_per_task).map(|chunks| {
+        let off = nl;
+        let n: usize = chunks.iter().map(|(_, p)| p.len()).sum();
+        nl += n;
+        (chunks, off, Mutex::new(scratch.buffer::<(K, u32)>(2 * n)))
+    }).collect();
+    let scattered = par::run(threads, input.len(), |_| Vec::new(), |res, t| {
+        let (chunks, offset, flat) = &input[t];
+        let mut cnt = [0usize; LP];
+        for &(_, ref pairs) in *chunks {
+            for &(a, b) in pairs.iter() {
+                cnt[(a.h() >> (64 - LP_BITS)) as usize] += 1;
+                cnt[(b.h() >> (64 - LP_BITS)) as usize] += 1;
+            }
+        }
+        let mut pos = [0usize; LP + 1];
+        for p in 0..LP {
+            pos[p + 1] = pos[p] + cnt[p];
+        }
+        let mut cur = [0usize; LP];
+        cur.copy_from_slice(&pos[..LP]);
+        let mut flat = std::mem::take(&mut *flat.lock().unwrap());
+        let ptr = flat.as_mut_ptr();
+        let mut endpoint = 2 * *offset as u32;
+        for &(_, ref pairs) in *chunks {
+            for &(a, b) in pairs.iter() {
+                let pa = (a.h() >> (64 - LP_BITS)) as usize;
+                let pb = (b.h() >> (64 - LP_BITS)) as usize;
+                unsafe {
+                    ptr.add(cur[pa]).write((a, endpoint));
+                    cur[pa] += 1;
+                    ptr.add(cur[pb]).write((b, endpoint + 1));
+                    cur[pb] += 1;
+                }
+                endpoint += 2;
+            }
+        }
+        unsafe { flat.set_len(pos[LP]) };
+        res.push(ScatteredLinks { flat, pos });
+    }).into_iter().flatten().collect();
+    (scattered, nl)
 }
 
 struct PartitionPlan {
@@ -368,8 +452,8 @@ struct PartitionPlan {
 
 impl PartitionPlan {
     fn new(ctx: &Ctx<'_>, threads: usize) -> Self {
-        let est_ev = (ctx.event_bytes / 75) as usize + 1024;
-        let est_ck = (ctx.click_bytes / 40) as usize + 1024;
+        let est_ev = (ctx.event_bytes / 80) as usize + 1024;
+        let est_ck = (ctx.click_bytes / 48) as usize + 1024;
         let parse_threads = if ctx.parse_threads > 0 { ctx.parse_threads.clamp(1, MAX_THREADS) } else { threads };
         // Keep the write buffers small enough for sibling threads sharing L2.
         let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 11 });
@@ -595,7 +679,10 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(
     plan: &PartitionPlan,
     tm: &mut Timer,
 ) -> Result<Deduped<K>, Need> {
-    let links = read_links(ctx, threads, tm, &mut Scratch::default(), |pairs| Links::<K>::from_pairs(&pairs, threads))?;
+    let pairs = read_links(ctx, threads, tm, &mut Scratch::default(), &mut Scratch::default(), LP_BITS)?;
+    let links = Links::<K>::from_pairs(&pairs, threads);
+    drop(pairs);
+    tm.lap("links-uf");
     let parsed = parse_sinks::<ALL_CAT, K, Sinks<RecA<K>>>(ctx, plan, Some(&links), |_| {
         (Sinks::new(plan.p1, plan.cap_ev), LinkedClicks::new(plan))
     }, tm);
@@ -927,18 +1014,21 @@ struct LinkEntries {
 }
 
 #[derive(Default)]
-struct RelocationMap {
-    buckets: Vec<LinkEntries>,
+struct RelocationMap<'a> {
+    buckets: ArenaVec<'a, LinkEntries>,
     mask: usize,
 }
 
-impl RelocationMap {
+impl<'a> RelocationMap<'a> {
+    fn bucket_count(n: usize) -> usize {
+        n.div_ceil(2).next_power_of_two()
+    }
+
     fn reset(&mut self, n: usize) {
-        let len = n.div_ceil(2).next_power_of_two();
-        if self.buckets.len() < len {
-            self.buckets.resize(len, LinkEntries::default());
-        }
-        self.buckets[..len].fill(LinkEntries::default());
+        let len = Self::bucket_count(n);
+        let reuse = len.min(self.buckets.len());
+        self.buckets[..reuse].fill(LinkEntries::default());
+        self.buckets.resize(len, LinkEntries::default());
         self.mask = len - 1;
     }
 
@@ -991,59 +1081,20 @@ impl RelocationMap {
 }
 
 struct BucketLinks<'a> {
-    entries: ArenaVec<'a, (u64, u64)>,
-    offsets: Vec<usize>,
+    parts: Vec<ArenaVec<'a, (u64, u64)>>,
 }
 
 impl<'a> BucketLinks<'a> {
-    fn build(mut parts: Vec<CanonicalPart<'_, u64>>, p2_bits: u32, threads: usize, scratch: &mut Scratch<'a>) -> Self {
-        let split = 1 << (p2_bits - LP_BITS);
-        let shift = 64 - p2_bits;
-        let mut offsets = vec![0; (1 << p2_bits) + 1];
-        let mut entries = ArenaVec::default();
-        if !parts.is_empty() {
-            parts.sort_unstable_by_key(|part| part.0);
-            for (p, pairs) in &parts {
-                if split == 1 {
-                    offsets[p + 1] = pairs.len();
-                } else {
-                    for &(key, _) in pairs.iter() {
-                        offsets[((key.h() >> shift) as usize) + 1] += 1;
-                    }
-                }
-            }
-            for q in 0..offsets.len() - 1 {
-                offsets[q + 1] += offsets[q];
-            }
-            let len = *offsets.last().unwrap();
-            entries = scratch.buffer(len);
-            let dst = SyncPtr(entries.as_mut_ptr());
-            par::run(threads, parts.len(), |_| (), |_, i| {
-                let (p, pairs) = &parts[i];
-                let first = p * split;
-                if split == 1 {
-                    for (i, &pair) in pairs.iter().enumerate() {
-                        unsafe { dst.write(offsets[first] + i, pair) };
-                    }
-                } else {
-                    // The union-find already grouped keys by the high LP_BITS.
-                    let mut next = [0; 4];
-                    next[..split].copy_from_slice(&offsets[first..first + split]);
-                    for &(key, canon) in pairs.iter() {
-                        let bin = ((key.h() >> shift) as usize) & (split - 1);
-                        unsafe { dst.write(next[bin], (key, canon)) };
-                        next[bin] += 1;
-                    }
-                }
-            });
-            // Each worker filled its disjoint part of the array before returning.
-            unsafe { entries.set_len(len) };
+    fn new(pairs: Vec<CanonicalPart<'a, u64>>, partitions: usize) -> Self {
+        let mut parts: Vec<_> = (0..partitions).map(|_| ArenaVec::default()).collect();
+        for (partition, rows) in pairs {
+            parts[partition] = rows;
         }
-        Self { entries, offsets }
+        Self { parts }
     }
 
     fn bucket(&self, q: usize) -> &[(u64, u64)] {
-        &self.entries[self.offsets[q]..self.offsets[q + 1]]
+        &self.parts[q]
     }
 }
 
@@ -1139,9 +1190,11 @@ fn ingest_single_pass(
     let (arena, parse_mapping) = SinkArena::new(total).split_at(total);
     let (mut bucket_space, arena) = arena.split_at(link_bytes);
     let (mut tokens, mut arena) = arena.split_at(tok_bytes * workers);
-    let links = read_links(ctx, threads, tm, &mut tokens.scratch(), |pairs| {
-        BucketLinks::build(pairs, plan.p2_bits, threads, &mut bucket_space.scratch())
-    })?;
+    let pairs = read_links(ctx, threads, tm, &mut tokens.scratch(),
+        &mut bucket_space.scratch(), plan.p2_bits)?;
+    let has_links = !pairs.is_empty();
+    let links = BucketLinks::new(pairs, plan.p2);
+    tm.lap("links-uf");
     let mut slices = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tok, rest) = tokens.split_at(tok_bytes);
@@ -1175,17 +1228,14 @@ fn ingest_single_pass(
     let p2 = plan.p2;
     let mut dead = DeadEvents::new(&b_sinks, p2, threads);
     dedup_tokens(&tok_sinks, &dead, plan.p1, threads);
-    let (relocated, group_scratch) = if links.entries.is_empty() {
+    let (relocated, group_scratch) = if !has_links {
         let scratch = tok_sinks.into_iter().map(Sinks::into_arena).collect();
         tm.lap("dedup");
         (None, scratch)
     } else {
-        let arenas: Vec<_> = tok_sinks.into_iter()
-            .map(|sink| Mutex::new(Some(sink.into_arena())))
-            .collect();
+        let arenas = tok_sinks.into_iter().map(Sinks::into_arena).collect();
         tm.lap("dedup");
-        let (relocated, mut scratch) = relocate_linked(links, &b_sinks, &ck_sinks, &mut dead, plan, ne_raw, threads, &arenas);
-        scratch.extend(arenas.into_iter().filter_map(|a| a.into_inner().unwrap()));
+        let (relocated, scratch) = relocate_linked(links, &b_sinks, &ck_sinks, &mut dead, plan, ne_raw, threads, arenas);
         tm.lap("relocate");
         (Some(relocated), scratch)
     };
@@ -1204,7 +1254,7 @@ fn dedup_tokens(sinks: &[Sinks<Tok>], dead: &DeadEvents, p1: usize, threads: usi
 fn relocate_linked(
     links: BucketLinks<'_>, events: &[Sinks<RecB<u64>>], clicks: &[Sinks<RecC<u64>>],
     dead: &mut DeadEvents, plan: &PartitionPlan, ne_raw: usize, threads: usize,
-    arenas: &[Mutex<Option<par::SinkArena>>],
+    arenas: Vec<SinkArena>,
 ) -> (Relocated<u64>, Vec<SinkArena>) {
     let mut dead_clicks = DeadClicks::new(clicks, plan.p2, threads);
     let event_offsets = &dead.offsets;
@@ -1214,17 +1264,42 @@ fn relocate_linked(
     let stride = events.len();
     let shift = 64 - plan.p2_bits;
     let cap_b = ne_raw * 45 / 100 / threads / plan.p2 + 16;
-    let cap_c = (plan.cap_ck - 24) * plan.parse_threads * 45 / 100 / threads + 16;
+    let nc: usize = clicks.iter().flat_map(|sink| &sink.len).sum();
+    let cap_c = nc * 50 / 100 / threads / plan.p2 + 16;
+    let map_cap = RelocationMap::bucket_count(links.parts.iter().map(|p| p.len()).max().unwrap_or(0));
+    let b_bytes = Sinks::<RecB<u64>>::arena_bytes(plan.p2, cap_b);
+    let c_bytes = Sinks::<RecC<u64>>::arena_bytes(plan.p2, cap_c);
+    let mut output_spaces = Vec::with_capacity(threads);
+    let mut tails = Vec::with_capacity(arenas.len());
+    for arena in arenas {
+        if output_spaces.len() < threads && b_bytes + c_bytes <= arena.len_bytes() {
+            let (events, rest) = arena.split_at(b_bytes);
+            let (clicks, tail) = rest.split_at(c_bytes);
+            output_spaces.push(Mutex::new(Some((events, clicks))));
+            tails.push(tail);
+        } else {
+            tails.push(arena);
+        }
+    }
+    // Grouping reuses the same tails after the per-worker maps are dropped.
+    let map_spaces: Vec<_> = tails.iter_mut().take(threads)
+        .map(|tail| Mutex::new(tail.scratch().buffer(map_cap))).collect();
 
-    let mut workers = par::run_fini(
+    let workers = par::run_fini(
         threads,
         plan.p2,
         |tid| {
-            let arena = arenas.get(tid).and_then(|slot| slot.lock().unwrap().take());
-            let (b, c, tail) = Sinks::reuse_pair(plan.p2, cap_b, cap_c, arena);
-            (RelocationMap::default(), b, c, tail)
+            let (b, c) = if let Some(slot) = output_spaces.get(tid) {
+                let (events, clicks) = slot.lock().unwrap().take().unwrap();
+                (Sinks::in_arena(plan.p2, cap_b, events), Sinks::in_arena(plan.p2, cap_c, clicks))
+            } else {
+                (Sinks::new(plan.p2, cap_b), Sinks::new(plan.p2, cap_c))
+            };
+            let buckets = map_spaces.get(tid)
+                .map(|slot| std::mem::take(&mut *slot.lock().unwrap())).unwrap_or_default();
+            (RelocationMap { buckets, mask: 0 }, b, c)
         },
-        |(map, out_b, out_c, _), q| {
+        |(map, out_b, out_c), q| {
             let entries = links.bucket(q);
             if entries.is_empty() {
                 return;
@@ -1249,25 +1324,24 @@ fn relocate_linked(
                 });
             }
         },
-        |(_, b, c, _)| {
+        |(_, b, c)| {
             b.finish();
             c.finish();
         },
     );
     let mut reloc_b = Vec::with_capacity(workers.len());
     let mut reloc_c = Vec::with_capacity(workers.len());
-    let mut scratch = Vec::with_capacity(workers.len());
-    for (_, b, c, tail) in workers.drain(..) {
-        scratch.extend(tail);
+    for (_, b, c) in workers {
         reloc_b.push(b);
         reloc_c.push(c);
     }
-    (Relocated { events: reloc_b, clicks: reloc_c, dead_clicks }, scratch)
+    drop(map_spaces);
+    (Relocated { events: reloc_b, clicks: reloc_c, dead_clicks }, tails)
 }
 
 #[inline(always)]
 fn relocate_rows<T, W: DeadWord>(
-    (arena, overflow): (&[T], &[T]), dead: &mut [W], map: &RelocationMap,
+    (arena, overflow): (&[T], &[T]), dead: &mut [W], map: &RelocationMap<'_>,
     key: impl Fn(&T) -> u64, mut move_row: impl FnMut(&T, u64),
 ) {
     let len = arena.len() + overflow.len();
@@ -1292,7 +1366,7 @@ fn relocate_rows<T, W: DeadWord>(
 
 #[inline(always)]
 fn relocate_block<T>(
-    rows: &[T], mask: &mut u64, map: &RelocationMap,
+    rows: &[T], mask: &mut u64, map: &RelocationMap<'_>,
     key: &impl Fn(&T) -> u64, move_row: &mut impl FnMut(&T, u64),
 ) -> u64 {
     let mut moved = 0;
@@ -1384,15 +1458,19 @@ impl<K: Key> Default for GroupEntry<K> {
 }
 
 // Compact event counts share the probed slot with the person key and ID.
-struct GroupMap<K> {
-    entries: Vec<GroupEntry<K>>,
-    person_slots: Vec<usize>,
+struct GroupMap<'a, K> {
+    entries: ArenaVec<'a, GroupEntry<K>>,
+    person_slots: ArenaVec<'a, usize>,
     mask: usize,
 }
 
-impl<K: Key> GroupMap<K> {
-    fn new() -> Self {
-        Self { entries: Vec::new(), person_slots: Vec::new(), mask: 0 }
+impl<'a, K: Key> GroupMap<'a, K> {
+    fn new(keys: usize, scratch: &mut Scratch<'a>) -> Self {
+        Self {
+            entries: scratch.buffer((keys * 2).next_power_of_two().max(16)),
+            person_slots: scratch.buffer(keys),
+            mask: 0,
+        }
     }
 
     fn reset(&mut self, keys: usize) {
@@ -1406,9 +1484,10 @@ impl<K: Key> GroupMap<K> {
     #[cold]
     fn grow(&mut self) {
         let cap = self.entries.len() * 2;
-        let old = std::mem::replace(&mut self.entries, vec![GroupEntry::default(); cap]);
+        let old = std::mem::take(&mut self.entries);
+        self.entries.resize(cap, GroupEntry::default());
         self.mask = cap - 1;
-        for pos in &mut self.person_slots {
+        for pos in self.person_slots.iter_mut() {
             let entry = old[*pos];
             let mut i = entry.key.h() as usize & self.mask;
             while !self.entries[i].key.is_zero() {
@@ -1712,7 +1791,7 @@ impl FusedAssists {
     }
 
     #[inline]
-    fn count<K: Key>(&mut self, camp: &mut CampStore, clicks: &[CompactClick<K>]) {
+    fn count<K: Key>(&mut self, camp: &mut CampStore<'_>, clicks: &[CompactClick<K>]) {
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
             self.campaigns.fill((0, 0));
@@ -1809,7 +1888,7 @@ fn group_fused<K: Key, P: GroupProfile>(
 
     struct FusedWorker<'a, K: Key, P> {
         // Grouping scratch (reused across P2 partitions -> stays L2-hot!)
-        map: GroupMap<K>,
+        map: GroupMap<'a, K>,
         fill: Vec<u32>,
         pid: ArenaVec<'a, u32>,
         ev_flat: ArenaVec<'a, CompactEv>,
@@ -1820,7 +1899,7 @@ fn group_fused<K: Key, P: GroupProfile>(
         ck_off: Vec<u32>,
         cl_buf: ArenaVec<'a, CompactClick<K>>,
         // Aggregate state
-        camp: CampStore,
+        camp: CampStore<'a>,
         writer: output::UserWriter<'a>,
         cat_sum: Vec<u64>,
         cat_touched: Vec<u32>,
@@ -1883,11 +1962,18 @@ fn group_fused<K: Key, P: GroupProfile>(
         65536
     };
     let click_cap = if group_scratch_available {
-        let raw_clicks: usize = ck_sinks.iter().map(|s| s.len.iter().sum::<usize>()).sum();
-        (raw_clicks / p2 * 2).max(16384)
+        (0..p2).map(|q| {
+            let raw: usize = ck_sinks.iter().enumerate().map(|(tid, sink)| {
+                let removed = dead_ck.map_or(0, |dead| dead.words(tid, q)
+                    .iter().map(|w| w.count_ones() as usize).sum::<usize>());
+                sink.count(q) - removed
+            }).sum();
+            raw + reloc_c.iter().map(|sink| sink.count(q)).sum::<usize>()
+        }).max().unwrap_or(0)
     } else {
         16384
     };
+    let map_keys = event_cap / 25 + 16;
     let workers: Vec<FusedWorker<'_, K, P>> = par::run_fini(
         threads,
         p2,
@@ -1896,7 +1982,7 @@ fn group_fused<K: Key, P: GroupProfile>(
                 .map(|slot| std::mem::take(&mut *slot.lock().unwrap()))
                 .unwrap_or_default();
             FusedWorker {
-                map: GroupMap::new(),
+                map: GroupMap::new(map_keys, &mut scratch),
                 fill: Vec::with_capacity(2048),
                 pid: scratch.buffer(event_cap),
                 ev_flat: scratch.buffer(event_cap),
@@ -1906,8 +1992,8 @@ fn group_fused<K: Key, P: GroupProfile>(
                 ck_cnt: Vec::with_capacity(2048),
                 ck_off: Vec::with_capacity(2048),
                 cl_buf: scratch.buffer(click_cap),
-                camp: CampStore::new(ncamp + 1, day0, ndays),
-                writer: output::UserWriter::new(ud_ref, tid, est_user_rows),
+                camp: CampStore::in_scratch(ncamp + 1, day0, ndays, &mut scratch),
+                writer: output::UserWriter::in_scratch(ud_ref, tid, est_user_rows, &mut scratch),
                 cat_sum: vec![0u64; ncat],
                 cat_touched: Vec::with_capacity(32),
                 assists: FusedAssists::new(ncamp),
@@ -2513,75 +2599,22 @@ impl<K: Key> Links<K> {
         }
     }
 
-    fn canonical_pairs<'a>(
-        pairs: &[Vec<(K, K)>], threads: usize, scratch: &mut Scratch<'a>,
-    ) -> Vec<CanonicalPart<'a, K>> {
-        let mut off = vec![0usize; pairs.len() + 1];
-        for (i, v) in pairs.iter().enumerate() {
-            off[i + 1] = off[i] + v.len();
-        }
-        let nl = off[pairs.len()];
-        if nl == 0 {
-            eprintln!("[ingest] links=0 linked_ids=0");
-            return Vec::new();
-        }
-        let off = &off;
-
-        // 1. Flat 2-pass count + scatter per thread (1 allocation per thread instead of 256 Vecs).
-        struct Scattered<'a, K> {
-            flat: ArenaVec<'a, (K, u32)>,
-            pos: [usize; LP + 1],
-        }
-        let scatter_space: Vec<_> = pairs.iter()
-            .map(|p| Mutex::new(Some(scratch.buffer::<(K, u32)>(2 * p.len()))))
-            .collect();
-        let scattered: Vec<Scattered<'_, K>> = par::run(threads, pairs.len(), |_| Vec::new(), |res, t| {
-            let mut cnt = [0usize; LP];
-            for &(a, b) in &pairs[t] {
-                cnt[(a.h() >> (64 - LP_BITS)) as usize] += 1;
-                cnt[(b.h() >> (64 - LP_BITS)) as usize] += 1;
-            }
-            let mut pos = [0usize; LP + 1];
-            for p in 0..LP {
-                pos[p + 1] = pos[p] + cnt[p];
-            }
-            let mut cur = [0usize; LP];
-            cur.copy_from_slice(&pos[..LP]);
-            let mut flat = scatter_space[t].lock().unwrap().take().unwrap();
-            let ptr = flat.as_mut_ptr();
-            for (i, &(a, b)) in pairs[t].iter().enumerate() {
-                let e = 2 * (off[t] + i) as u32;
-                let pa = (a.h() >> (64 - LP_BITS)) as usize;
-                let pb = (b.h() >> (64 - LP_BITS)) as usize;
-                unsafe {
-                    ptr.add(cur[pa]).write((a, e));
-                    cur[pa] += 1;
-                    ptr.add(cur[pb]).write((b, e + 1));
-                    cur[pb] += 1;
-                }
-            }
-            unsafe { flat.set_len(pos[LP]) };
-            res.push(Scattered { flat, pos });
-        })
-        .into_iter()
-        .flatten()
-        .collect();
-
-        // 2. Per partition: intern; write endpoint -> (partition, local id) into uninit `ep`.
-        let mut ep = scratch.buffer::<u64>(2 * nl);
+    fn intern_link_endpoints<'a>(
+        scattered: &[ScatteredLinks<'_, K>], ep: &mut ArenaVec<'_, u64>,
+        nl: usize, threads: usize, scratch: &mut Scratch<'a>,
+    ) -> Vec<(usize, ArenaVec<'a, K>)> {
         let epp = SyncPtr(ep.as_mut_ptr());
-        let scattered_ref = &scattered;
         let key_space = Mutex::new(&mut *scratch);
         let key_space_ref = &key_space;
-        let mut keys_parts: Vec<(usize, ArenaVec<'_, K>)> = par::run(
+        let keys_parts: Vec<(usize, ArenaVec<'_, K>)> = par::run(
             threads,
             LP,
             |_| (Vec::new(), Map::<K, u32>::with_capacity(1024)),
             move |(res, m), p| {
-                let n: usize = scattered_ref.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
+                let n: usize = scattered.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
                 m.reset(n);
                 let mut keys = key_space_ref.lock().unwrap().buffer::<K>(n / 2 + 8);
-                for s in scattered_ref.iter() {
+                for s in scattered.iter() {
                     for &(k, e) in &s.flat[s.pos[p]..s.pos[p + 1]] {
                         let (id, ins) = m.insert(k, keys.len() as u32);
                         if ins {
@@ -2597,7 +2630,14 @@ impl<K: Key> Links<K> {
         .flat_map(|x| x.0)
         .collect();
         unsafe { ep.set_len(2 * nl) };
-        drop(scattered);
+        keys_parts
+    }
+
+    fn canonical_pairs<'a>(
+        mut keys_parts: Vec<(usize, ArenaVec<'_, K>)>, ep: ArenaVec<'_, u64>,
+        nl: usize, threads: usize, scratch: &mut Scratch<'_>,
+        canonical_space: &mut Scratch<'a>, partition_bits: u32,
+    ) -> Vec<CanonicalPart<'a, K>> {
         keys_parts.sort_unstable_by_key(|x| x.0);
         let mut base = vec![0u32; LP + 1];
         for p in 0..LP {
@@ -2605,7 +2645,7 @@ impl<K: Key> Links<K> {
         }
         let nn = base[LP] as usize;
 
-        // 3. Parallel copy of `keys` + parallel init of `parent` and `best` (zero serial overhead).
+        // Reuse the scatter area for flat keys and union-find state.
         let mut keys = scratch.buffer::<K>(nn);
         let mut parent = scratch.buffer::<AtomicU32>(nn);
         let mut best = scratch.buffer::<AtomicU32>(nn);
@@ -2631,7 +2671,7 @@ impl<K: Key> Links<K> {
         }
         drop(keys_parts);
 
-        // 4. Parallel lock-free union-find + smallest key per root.
+        // Parallel lock-free union-find + smallest key per root.
         let node = |code: u64| base[(code >> 32) as usize] + code as u32;
         let step = 1 << 16;
         let (parent_ref, ep_ref, keys_ref, best_ref) = (&parent, &ep, &keys, &best);
@@ -2657,23 +2697,35 @@ impl<K: Key> Links<K> {
             }
         });
 
-        // 5. Collect only keys whose canonical key differs, preserving raw partitions.
+        // Collect only keys whose canonical key differs, preserving raw partitions.
         let base_ref = &base;
-        let canon_space = Mutex::new(scratch);
+        let canon_space = Mutex::new(canonical_space);
         let canon_space_ref = &canon_space;
         let canon_parts: Vec<CanonicalPart<'_, K>> = par::run(threads, LP, |_| Vec::new(), move |res, p| {
             let (s, e) = (base_ref[p] as usize, base_ref[p + 1] as usize);
-            let mut canon = canon_space_ref.lock().unwrap().buffer::<(K, K)>((e - s) * 3 / 4 + 8);
+            let split = 1 << (partition_bits - LP_BITS);
+            let mut bins: [ArenaVec<'_, (K, K)>; 4] = std::array::from_fn(|_| ArenaVec::default());
+            {
+                let mut space = canon_space_ref.lock().unwrap();
+                for bin in &mut bins[..split] {
+                    *bin = space.buffer((e - s) * 3 / (4 * split) + 8);
+                }
+            }
             for i in s..e {
                 let r = uf_find(parent_ref, i as u32) as usize;
                 let c = keys_ref[best_ref[r].load(Ordering::Relaxed) as usize];
                 let k = keys_ref[i];
                 if c != k {
-                    canon.push((k, c));
+                    let bin = if split == 1 { 0 } else {
+                        (k.h() >> (64 - partition_bits)) as usize & (split - 1)
+                    };
+                    bins[bin].push((k, c));
                 }
             }
-            if !canon.is_empty() {
-                res.push((p, canon));
+            for (bin, canon) in bins.into_iter().take(split).enumerate() {
+                if !canon.is_empty() {
+                    res.push((p * split + bin, canon));
+                }
             }
         })
         .into_iter()
@@ -2886,6 +2938,36 @@ mod tests {
         events.extend_from_slice(&row.repeat(MAX_LOC_IDX + 1));
         std::fs::write(path, events).unwrap();
         assert_eq!(run(), (false, MAX_LOC_IDX + 1, vec![(user(b"c"), 0)]));
+    }
+
+    #[test]
+    fn click_sinks_stream_full_buffers_and_keep_overflow_in_order() {
+        fn check<K: Key + From<u32>>() {
+            let mut sinks = Sinks::<RecC<K>>::new(2, 9);
+            for i in 0..31u32 {
+                for p in 0..2u32 {
+                    let row = RecC { person: K::from(p + 1), cid: K::from(i + 1), ts: i, campaign: p };
+                    assert_eq!(sinks.push_idx(p as usize, row), i as usize);
+                }
+            }
+            sinks.finish();
+            for p in 0..2u32 {
+                let (arena, overflow) = sinks.part(p as usize);
+                assert_eq!(arena.as_ptr() as usize % 64, 0);
+                assert!(!overflow.is_empty());
+                assert_eq!(sinks.count(p as usize), 31);
+                for (i, row) in arena.iter().chain(overflow).enumerate() {
+                    assert_eq!(row.person, K::from(p + 1));
+                    assert_eq!(row.cid, K::from(i as u32 + 1));
+                    assert_eq!(row.ts, i as u32);
+                    assert_eq!(row.campaign, p);
+                }
+            }
+        }
+        assert_eq!(std::mem::size_of::<RecC<u64>>(), 24);
+        assert_eq!(std::mem::size_of::<RecC<u128>>(), 48);
+        check::<u64>();
+        check::<u128>();
     }
 
     #[test]

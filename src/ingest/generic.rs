@@ -1167,7 +1167,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
         ck_off: Vec<u32>,
         cl_buf: Vec<GenClick>,
         // Aggregate state
-        camp: CampStore,
+        camp: CampStore<'a>,
         writer: output::UserWriter<'a>,
         cat_sum: Vec<u64>,
         cat_touched: Vec<u32>,
