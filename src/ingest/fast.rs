@@ -3,8 +3,8 @@
 //! caller then uses the generic slow path) if neither can carry the input exactly.
 //! Pipeline (docs/ingest.md):
 //!   links  : parse -> partitioned interning -> parallel union-find -> canonical pairs
-//!   parse  : chunked pread + SIMD scan; event tokens -> P1 by event id; valid
-//!            events and clicks -> P2 by raw person
+//!   parse  : chunked pread + direct compact row parsing; event tokens -> P1 by
+//!            event id; valid events and clicks -> P2 by raw person
 //!   dedup  : per P1 partition, exact open addressing marks loser locations in P2
 //!   relocate: move surviving linked rows to their canonical P2 partition
 //!   group  : per P2 partition, process live rows, build CSR and sort by timestamp
@@ -20,9 +20,12 @@ use crate::aggregate::{self, output, CampStore, NO_CATEGORY};
 use crate::types::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, Scope, ScopedJoinHandle};
 use std::time::Instant;
+
+#[path = "direct.rs"]
+mod direct;
 
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
@@ -367,9 +370,9 @@ impl PartitionPlan {
         let est_ck = (ctx.click_bytes / 40) as usize + 1024;
         let parse_threads = if ctx.parse_threads > 0 { ctx.parse_threads.clamp(1, MAX_THREADS) } else { threads };
         // Keep the write buffers small enough for sibling threads sharing L2.
-        let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 10 } else { 11 });
+        let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 11 });
         let p2_bits = env_usize("INGEST_P2_BITS").map(|b| b.clamp(8, 10) as u32)
-            .unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 10 });
+            .unwrap_or(if est_ev <= 30_000_000 { 8 } else { 10 });
         let p1 = 1 << p1_bits;
         let p2 = 1 << p2_bits;
         Self {
@@ -380,33 +383,74 @@ impl PartitionPlan {
     }
 }
 
+struct ParseRows<'a, K: Key> {
+    dt: &'a DateTable,
+    ws: i64,
+    we: i64,
+    lookups: &'a Lookups,
+    plan: &'a PartitionPlan,
+    flag: &'a Flag,
+    links: Option<&'a Links<K>>,
+}
+
+impl<K: Key> ParseRows<'_, K> {
+    #[inline(always)]
+    fn clicks_base(&self) -> i64 {
+        self.ws - WEEK_MS
+    }
+
+    #[inline(always)]
+    fn p2_shift(&self) -> u32 {
+        64 - self.plan.p2_bits
+    }
+}
+
 trait EventSink<K: Key>: Send {
-    fn new(tid: usize, plan: &PartitionPlan) -> Self;
     type Clicks: ClickSink<K>;
-    fn push(
-        &mut self, eid: K, eid_h: u64, ingest: u32, user: K, ts: u32, cc: u32,
-        plan: &PartitionPlan, flag: &Flag,
-    );
+    fn new(tid: usize, plan: &PartitionPlan) -> Self;
     fn finish(&mut self);
+    fn parse_rows<const ALL_CAT: bool>(
+        &mut self, clicks: &mut Self::Clicks, rows: &ParseRows<'_, K>,
+        kind: Kind, buf: &[u8], lo: usize, hi: usize,
+    );
 }
 
 impl<K: Key> EventSink<K> for Sinks<RecA<K>> {
     type Clicks = LinkedClicks<K>;
+
     fn new(_: usize, plan: &PartitionPlan) -> Self {
         Sinks::new(plan.p1, plan.cap_ev)
     }
 
-    #[inline(always)]
-    fn push(
-        &mut self, eid: K, eid_h: u64, ingest: u32, user: K, ts: u32, cc: u32,
-        plan: &PartitionPlan, _: &Flag,
-    ) {
-        let p = (eid_h >> (64 - plan.p1_bits)) as usize;
-        Sinks::push(self, p, RecA { eid, user, ts, ingest, cc, eid_hash: eid_h as u32 });
-    }
-
     fn finish(&mut self) {
         Sinks::finish(self);
+    }
+
+    fn parse_rows<const ALL_CAT: bool>(
+        &mut self, clicks: &mut Self::Clicks, rows: &ParseRows<'_, K>,
+        kind: Kind, buf: &[u8], lo: usize, hi: usize,
+    ) {
+        match kind {
+            Kind::Events => scan::scan::<7, _>(buf, lo, hi, |b, f| {
+                if let Err(n) = parse_event::<ALL_CAT, K>(
+                    rows.dt, b, f, rows.ws, rows.we, &rows.lookups.prod,
+                    |eid, h, ingest, user, ts, cc| {
+                        let p = (h >> (64 - rows.plan.p1_bits)) as usize;
+                        self.push(p, RecA { eid, user, ts, ingest, cc, eid_hash: h as u32 });
+                    },
+                ) {
+                    rows.flag.set(n);
+                }
+            }),
+            Kind::Clicks => scan::scan::<4, _>(buf, lo, hi, |b, f| {
+                match parse_click(rows, b, f) {
+                    Ok(Some(rec)) => clicks.push_click(rec, rows.links, rows.p2_shift()),
+                    Ok(None) => {}
+                    Err(n) => rows.flag.set(n),
+                }
+            }),
+            Kind::Links => unreachable!(),
+        }
     }
 }
 
@@ -511,6 +555,7 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
     let p2_shift = 64 - plan.p2_bits;
     let parse_threads = plan.parse_threads;
     let links = links.filter(|l| l.has_links);
+    let rows = ParseRows { dt, ws, we, lookups, plan, flag: &flag, links };
 
     struct ParseState<E, C> {
         ev: E,
@@ -531,51 +576,8 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
             }
             let c = main_chunks[i];
             let fi = &files[c.file as usize];
-            match fi.kind {
-                Kind::Events => scan_chunk::<7, _>(files, c, &mut st.buf, |b, f| {
-                    if let Err(n) = parse_event::<ALL_CAT, K>(
-                        dt, b, f, ws, we, &lookups.prod, |eid, h, ingest, user, ts, cc| {
-                            st.ev.push(eid, h, ingest, user, ts, cc, plan, &flag);
-                        },
-                    ) {
-                        flag.set(n);
-                    }
-                }),
-                Kind::Clicks => {
-                    let ck_base = ws - WEEK_MS;
-                    let ck = &mut st.ck;
-                    scan_chunk::<4, _>(files, c, &mut st.buf, |b, f| {
-                        if flen(f[0]) == 0 || flen(f[1]) == 0 {
-                            return;
-                        }
-                        let campaign = unsafe { lookups.camp.get(fptr(b, f[2]), flen(f[2])) };
-                        if campaign == INVALID_CAMP {
-                            return;
-                        }
-                        let t = match fts(dt, b, f[3]) {
-                            Some(t) if t >= ck_base && t < we => t,
-                            _ => return,
-                        };
-                        let cid: K = match fkey(b, f[0]) {
-                            Some(v) => v,
-                            None => {
-                                flag.set(key_need(f[0]));
-                                return;
-                            }
-                        };
-                        let user: K = match fkey(b, f[1]) {
-                            Some(v) => v,
-                            None => {
-                                flag.set(key_need(f[1]));
-                                return;
-                            }
-                        };
-                        let ts = (t - ck_base) as u32;
-                        ck.push_click(RecC { person: user, cid, ts, campaign }, links, p2_shift);
-                    });
-                }
-                Kind::Links => unreachable!(),
-            }
+            let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, &mut st.buf);
+            st.ev.parse_rows::<ALL_CAT>(&mut st.ck, &rows, fi.kind, &st.buf, lo, hi);
         },
         |st| {
             st.ev.finish();
@@ -867,6 +869,33 @@ struct SinglePass {
     tid_bits: u32,
 }
 
+struct SinglePassEvents<'a> {
+    out: &'a mut SinglePass,
+    plan: &'a PartitionPlan,
+    flag: &'a Flag,
+}
+
+impl direct::EventOutput for SinglePassEvents<'_> {
+    #[inline(always)]
+    fn valid(&mut self, eid: u64, ingest: u32, user: u64, ts: u32, cc: u32) {
+        let p = (eid.h() >> (64 - self.plan.p1_bits)) as usize;
+        let q = (user.h() >> (64 - self.plan.p2_bits)) as usize;
+        let idx = self.out.b.push_idx(q, RecB { person: user, ts, cc });
+        if idx >= MAX_LOC_IDX {
+            self.flag.set(Need::TwoPass);
+            return;
+        }
+        let loc = self.out.tid_bits | ((q as u32) << 18) | idx as u32;
+        self.out.tok.push(p, Tok { eid, ingest, loc });
+    }
+
+    #[inline(always)]
+    fn invalid(&mut self, eid: u64, ingest: u32) {
+        let p = (eid.h() >> (64 - self.plan.p1_bits)) as usize;
+        self.out.tok.push(p, Tok { eid, ingest, loc: NO_REC });
+    }
+}
+
 impl EventSink<u64> for SinglePass {
     type Clicks = Sinks<RecC<u64>>;
 
@@ -879,29 +908,96 @@ impl EventSink<u64> for SinglePass {
         }
     }
 
-    #[inline(always)]
-    fn push(
-        &mut self, eid: u64, eid_h: u64, ingest: u32, user: u64, ts: u32, cc: u32,
-        plan: &PartitionPlan, flag: &Flag,
+    fn parse_rows<const ALL_CAT: bool>(
+        &mut self, clicks: &mut Self::Clicks, rows: &ParseRows<'_, u64>,
+        kind: Kind, buf: &[u8], lo: usize, hi: usize,
     ) {
-        let p = (eid_h >> (64 - plan.p1_bits)) as usize;
-        let loc = if cc == INVALID_CC {
-            NO_REC
-        } else {
-            let q = (user.h() >> (64 - plan.p2_bits)) as usize;
-            let idx = self.b.push_idx(q, RecB { person: user, ts, cc });
-            if idx >= MAX_LOC_IDX {
-                flag.set(Need::TwoPass);
-                return;
-            }
-            self.tid_bits | ((q as u32) << 18) | idx as u32
-        };
-        self.tok.push(p, Tok { eid, ingest, loc });
+        debug_assert!(!ALL_CAT && rows.links.is_none());
+        match kind {
+            Kind::Events => direct::events(rows, buf, lo, hi, &mut SinglePassEvents {
+                out: self, plan: rows.plan, flag: rows.flag,
+            }),
+            Kind::Clicks => direct::clicks(rows, buf, lo, hi, |rec| {
+                clicks.push_click(rec, None, rows.p2_shift());
+            }),
+            Kind::Links => unreachable!(),
+        }
     }
 
     fn finish(&mut self) {
         self.tok.finish();
         self.b.finish();
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(64))]
+struct LinkEntries {
+    keys: [u64; 4],
+    canon: [u64; 4],
+}
+
+#[derive(Default)]
+struct RelocationMap {
+    buckets: Vec<LinkEntries>,
+    mask: usize,
+}
+
+impl RelocationMap {
+    fn reset(&mut self, n: usize) {
+        let len = n.div_ceil(2).next_power_of_two();
+        if self.buckets.len() < len {
+            self.buckets.resize(len, LinkEntries::default());
+        }
+        self.buckets[..len].fill(LinkEntries::default());
+        self.mask = len - 1;
+    }
+
+    fn insert(&mut self, key: u64, person: u64) {
+        let mut slot = key.h() as usize & self.mask;
+        loop {
+            let bucket = &mut self.buckets[slot];
+            if let Some(lane) = bucket.keys.iter().position(|&k| k == 0) {
+                bucket.keys[lane] = key;
+                bucket.canon[lane] = person;
+                return;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_slot(&self, key: u64) -> usize {
+        let slot = key.h() as usize & self.mask;
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(
+                self.buckets.as_ptr().add(slot).cast(),
+            );
+        }
+        slot
+    }
+
+    #[inline(always)]
+    fn get(&self, key: u64) -> Option<u64> {
+        self.get_from_slot(key, key.h() as usize & self.mask)
+    }
+
+    #[inline(always)]
+    fn get_from_slot(&self, key: u64, mut slot: usize) -> Option<u64> {
+        use std::arch::x86_64::*;
+        let needle = unsafe { _mm256_set1_epi64x(key as i64) };
+        loop {
+            let bucket = unsafe { self.buckets.get_unchecked(slot) };
+            let keys = unsafe { _mm256_load_si256(bucket.keys.as_ptr().cast()) };
+            let hits = unsafe { _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle))) } as u32;
+            if hits != 0 {
+                return Some(unsafe { *bucket.canon.get_unchecked(hits.trailing_zeros() as usize) });
+            }
+            if unsafe { _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, _mm256_setzero_si256()))) } != 0 {
+                return None;
+            }
+            slot = (slot + 1) & self.mask;
+        }
     }
 }
 
@@ -1057,12 +1153,17 @@ fn ingest_single_pass(
     let p2 = plan.p2;
     let mut dead = DeadEvents::new(&b_sinks, p2, threads);
     dedup_tokens(&tok_sinks, &dead, plan.p1, threads);
-    par::drop_par(threads, tok_sinks);
-    tm.lap("dedup");
     let relocated = if links.entries.is_empty() {
+        par::drop_par(threads, tok_sinks);
+        tm.lap("dedup");
         None
     } else {
-        let relocated = relocate_linked(links, &b_sinks, &ck_sinks, &mut dead, plan, ne_raw, threads);
+        let arenas: Vec<_> = tok_sinks.into_iter()
+            .map(|sink| Mutex::new(Some(sink.into_arena())))
+            .collect();
+        tm.lap("dedup");
+        let relocated = relocate_linked(links, &b_sinks, &ck_sinks, &mut dead, plan, ne_raw, threads, &arenas);
+        par::drop_par(threads, arenas);
         tm.lap("relocate");
         Some(relocated)
     };
@@ -1080,6 +1181,7 @@ fn dedup_tokens(sinks: &[Sinks<Tok>], dead: &DeadEvents, p1: usize, threads: usi
 fn relocate_linked(
     links: BucketLinks, events: &[Sinks<RecB<u64>>], clicks: &[Sinks<RecC<u64>>],
     dead: &mut DeadEvents, plan: &PartitionPlan, ne_raw: usize, threads: usize,
+    arenas: &[Mutex<Option<par::SinkArena>>],
 ) -> Relocated<u64> {
     let mut dead_clicks = DeadClicks::new(clicks, plan.p2, threads);
     let event_offsets = &dead.offsets;
@@ -1094,7 +1196,11 @@ fn relocate_linked(
     let mut workers = par::run_fini(
         threads,
         plan.p2,
-        |_| (Map::with_capacity(0), Sinks::new(plan.p2, cap_b), Sinks::new(plan.p2, cap_c)),
+        |tid| {
+            let arena = arenas.get(tid).and_then(|slot| slot.lock().unwrap().take());
+            let (b, c) = Sinks::reuse_pair(plan.p2, cap_b, cap_c, plan.p1, arena);
+            (RelocationMap::default(), b, c)
+        },
         |(map, out_b, out_c), q| {
             let entries = links.bucket(q);
             if entries.is_empty() {
@@ -1112,21 +1218,11 @@ fn relocate_linked(
                 // to record groups of 64 and never shared by two tasks.
                 let eb = unsafe { event_bits.slice(e, event_offsets[part + 1] - e) };
                 let cb = unsafe { click_bits.slice(c, click_offsets[part + 1] - c) };
-                relocate_rows(events.part(q), eb, |r| {
-                    if let Some(person) = map.get(r.person) {
-                        out_b.push((person.h() >> shift) as usize, RecB { person, ..*r });
-                        true
-                    } else {
-                        false
-                    }
+                relocate_rows(events.part(q), eb, map, |r| r.person, |r, person| {
+                    out_b.push((person.h() >> shift) as usize, RecB { person, ..*r });
                 });
-                relocate_rows(clicks.part(q), cb, |r| {
-                    if let Some(person) = map.get(r.person) {
-                        out_c.push((person.h() >> shift) as usize, RecC { person, ..*r });
-                        true
-                    } else {
-                        false
-                    }
+                relocate_rows(clicks.part(q), cb, map, |r| r.person, |r, person| {
+                    out_c.push((person.h() >> shift) as usize, RecC { person, ..*r });
                 });
             }
         },
@@ -1146,29 +1242,60 @@ fn relocate_linked(
 
 #[inline(always)]
 fn relocate_rows<T, W: DeadWord>(
-    (arena, overflow): (&[T], &[T]), dead: &mut [W], mut move_row: impl FnMut(&T) -> bool,
+    (arena, overflow): (&[T], &[T]), dead: &mut [W], map: &RelocationMap,
+    key: impl Fn(&T) -> u64, mut move_row: impl FnMut(&T, u64),
 ) {
-    let mut start = 0;
-    for slice in [arena, overflow] {
-        let mut done = 0;
-        while done < slice.len() {
-            let idx = start + done;
-            let bit = idx & 63;
-            let n = (64 - bit).min(slice.len() - done);
-            let word = dead[idx >> 6].exclusive();
-            let mut mask = *word >> bit;
-            let mut moved = 0;
-            for (i, row) in slice[done..done + n].iter().enumerate() {
-                if mask & 1 == 0 && move_row(row) {
-                    moved |= 1u64 << i;
-                }
-                mask >>= 1;
-            }
-            *word |= moved << bit;
-            done += n;
-        }
-        start += slice.len();
+    let len = arena.len() + overflow.len();
+    for (i, word) in dead.iter_mut().enumerate() {
+        let start = i * 64;
+        let end = (start + 64).min(len);
+        let word = word.exclusive();
+        let mut mask = *word;
+        let moved = if end <= arena.len() {
+            relocate_block(&arena[start..end], &mut mask, map, &key, &mut move_row)
+        } else if start >= arena.len() {
+            relocate_block(&overflow[start - arena.len()..end - arena.len()], &mut mask, map, &key, &mut move_row)
+        } else {
+            let first = &arena[start..];
+            let a = relocate_block(first, &mut mask, map, &key, &mut move_row);
+            let b = relocate_block(&overflow[..end - arena.len()], &mut mask, map, &key, &mut move_row);
+            a | (b << first.len())
+        };
+        *word |= moved;
     }
+}
+
+#[inline(always)]
+fn relocate_block<T>(
+    rows: &[T], mask: &mut u64, map: &RelocationMap,
+    key: &impl Fn(&T) -> u64, move_row: &mut impl FnMut(&T, u64),
+) -> u64 {
+    let mut moved = 0;
+    let mut done = 0;
+    for block in rows.chunks_exact(8) {
+        // Probe the slots we prefetched so each row only hashes its key once.
+        let slots: [usize; 8] = std::array::from_fn(|i| map.prefetch_slot(key(&block[i])));
+        for (i, (row, slot)) in block.iter().zip(slots).enumerate() {
+            if *mask & 1 == 0 {
+                if let Some(person) = map.get_from_slot(key(row), slot) {
+                    move_row(row, person);
+                    moved |= 1u64 << (done + i);
+                }
+            }
+            *mask >>= 1;
+        }
+        done += 8;
+    }
+    for (i, row) in rows[done..].iter().enumerate() {
+        if *mask & 1 == 0 {
+            if let Some(person) = map.get(key(row)) {
+                move_row(row, person);
+                moved |= 1u64 << (done + i);
+            }
+        }
+        *mask >>= 1;
+    }
+    moved
 }
 
 #[inline(always)]
@@ -2243,6 +2370,27 @@ fn parse_event<const ALL_CAT: bool, K: Key>(
     Ok(())
 }
 
+#[inline(always)]
+fn parse_click<K: Key>(
+    rows: &ParseRows<'_, K>, b: &[u8], f: &[(u32, u32); 4],
+) -> Result<Option<RecC<K>>, Need> {
+    if flen(f[0]) == 0 || flen(f[1]) == 0 {
+        return Ok(None);
+    }
+    let campaign = unsafe { rows.lookups.camp.get(fptr(b, f[2]), flen(f[2])) };
+    if campaign == INVALID_CAMP {
+        return Ok(None);
+    }
+    let base = rows.clicks_base();
+    let t = match fts(rows.dt, b, f[3]) {
+        Some(t) if t >= base && t < rows.we => t,
+        _ => return Ok(None),
+    };
+    let cid = fkey(b, f[0]).ok_or_else(|| key_need(f[0]))?;
+    let person = fkey(b, f[1]).ok_or_else(|| key_need(f[1]))?;
+    Ok(Some(RecC { person, cid, ts: (t - base) as u32, campaign }))
+}
+
 /// Linked-id resolution: id key -> canonical id key (only ids whose canonical differs).
 /// Stored in ONE 2 MiB huge-page-backed flat partitioned table (zero `maps[p]` pointer
 /// indirection, ~100% 2M dTLB hit rate even at 128 MB / 60M events!). Direct ring-32
@@ -2640,6 +2788,32 @@ mod tests {
         events.extend_from_slice(&row.repeat(MAX_LOC_IDX + 1));
         std::fs::write(path, events).unwrap();
         assert_eq!(run(), (false, MAX_LOC_IDX + 1, vec![(user(b"c"), 0)]));
+    }
+
+    #[test]
+    fn relocation_preserves_dead_bits_across_sink_overflow() {
+        let mut map = RelocationMap::default();
+        map.reset(1);
+        map.insert(13, 7);
+        let keys: Vec<u64> = (0..147).map(|i| if i % 3 == 0 { 13 } else { 5 }).collect();
+        let initially_dead = [1 << 4, 1 << 2, 1 << 2];
+        let mut dead = initially_dead;
+        let mut moved = Vec::new();
+        relocate_rows(keys.split_at(69), &mut dead, &map, |key| *key, |key, person| {
+            assert_eq!((*key, person), (13, 7));
+            moved.push(person);
+        });
+        let mut expected = initially_dead;
+        let mut count = 0;
+        for (i, key) in keys.iter().enumerate() {
+            let bit = 1 << (i % 64);
+            if *key == 13 && (expected[i / 64] & bit) == 0 {
+                expected[i / 64] |= bit;
+                count += 1;
+            }
+        }
+        assert_eq!(moved.len(), count);
+        assert_eq!(dead, expected);
     }
 
     #[test]

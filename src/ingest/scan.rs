@@ -201,6 +201,41 @@ fn below_lt64(i: u32) -> u64 {
     (1u64 << (i & 63)) - 1
 }
 
+/// Validate the columns of one LF-delimited row for direct-parser fallback.
+pub(super) fn row_fields<const N: usize>(buf: &[u8], lo: usize, lf: usize) -> Option<[(u32, u32); N]> {
+    assert!(lo <= lf && lf < u32::MAX as usize && buf.len() >= lf + PAD);
+    let mut ends = [lf; N];
+    let mut seen = 0;
+    let mut quotes = 0;
+    for base in (lo..lf).step_by(64) {
+        let (seps, q, _) = masks(unsafe { buf.as_ptr().add(base) });
+        let valid = below((lf - base) as u32);
+        let mut seps = seps & valid;
+        quotes += (q & valid).count_ones();
+        while seps != 0 {
+            if seen + 1 == N {
+                return None;
+            }
+            ends[seen] = base + seps.trailing_zeros() as usize;
+            seen += 1;
+            seps &= seps - 1;
+        }
+    }
+    if seen + 1 != N {
+        return None;
+    }
+    let mut start = lo;
+    let mut wrapped = 0;
+    let fields = ends.map(|end| {
+        let q = usize::from(end - start >= 2 && buf[start] == b'"' && buf[end - 1] == b'"');
+        let field = ((start + q) as u32, (end - q) as u32);
+        start = end + 1;
+        wrapped += q as u32;
+        field
+    });
+    (quotes == 2 * wrapped).then_some(fields)
+}
+
 #[cfg(test)]
 #[inline(always)]
 pub fn scan_ref<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, mut f: F) {

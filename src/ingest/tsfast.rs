@@ -113,24 +113,70 @@ impl DateTable {
         let ddt = (std::ptr::read_unaligned(p.add(8) as *const u32)) & 0x00FF_FFFF; // DDT
         let e = self.entries.get_unchecked(Self::slot(a, ddt));
         if (e.a == a) & (e.ddt == ddt) {
-            let c = ld8(p.add(11)); // HH:MM:SS
-            const SC: u64 = 0x0000_FF00_00FF_0000;
-            const VC: u64 = ((b':' as u64) << 40) | ((b':' as u64) << 16);
-            let d = c.wrapping_sub(0x3030_3030_3030_3030);
-            // Simultaneously verifies H0<=2, H1<=9, M0<=5, M1<=9, S0<=5, S1<=9 (no carries on valid digits).
-            let ok_hms = (((d.wrapping_add(0x767A_0076_7A00_767Du64) | d) & 0x8080_0080_8000_8080u64) == 0)
-                & ((c & SC) == VC);
-            let dig = d & 0x0F0F_000F_0F00_0F0Fu64;
-            let pairs = dig.wrapping_mul(10).wrapping_add(dig >> 8);
-            let hour = pairs & 0xFF;
-            if ok_hms & (hour <= 23) {
-                let hm_sec = ((pairs & 0x0000_0000_FF00_00FFu64).wrapping_mul((3600u64 << 40) | (60u64 << 16))) >> 40;
-                let sec = (pairs >> 48) & 0xFF;
-                return Some(e.day_sec as i64 + (hm_sec + sec) as i64);
-            }
-            return None;
+            return Self::clock_sec(p).map(|sec| sec + e.day_sec as i64);
         }
         civil19_sec_cold(p)
+    }
+
+    #[inline(always)]
+    unsafe fn clock_sec(p: *const u8) -> Option<i64> {
+        let c = ld8(p.add(11)); // HH:MM:SS
+        const SC: u64 = 0x0000_FF00_00FF_0000;
+        const VC: u64 = ((b':' as u64) << 40) | ((b':' as u64) << 16);
+        let d = c.wrapping_sub(0x3030_3030_3030_3030);
+        // Simultaneously verifies H0<=2, H1<=9, M0<=5, M1<=9, S0<=5, S1<=9 (no carries on valid digits).
+        let ok_hms = (((d.wrapping_add(0x767A_0076_7A00_767Du64) | d) & 0x8080_0080_8000_8080u64) == 0)
+            & ((c & SC) == VC);
+        let dig = d & 0x0F0F_000F_0F00_0F0Fu64;
+        let pairs = dig.wrapping_mul(10).wrapping_add(dig >> 8);
+        let hour = pairs & 0xFF;
+        if ok_hms & (hour <= 23) {
+            let hm_sec = ((pairs & 0x0000_0000_FF00_00FFu64).wrapping_mul((3600u64 << 40) | (60u64 << 16))) >> 40;
+            let sec = (pairs >> 48) & 0xFF;
+            return Some((hm_sec + sec) as i64);
+        }
+        None
+    }
+
+    #[inline(always)]
+    unsafe fn clock_pair(a: *const u8, b: *const u8) -> Option<(i64, i64)> {
+        use std::arch::x86_64::*;
+        let raw = _mm_set_epi64x(ld8(b.add(11)) as i64, ld8(a.add(11)) as i64);
+        let min = _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00"));
+        let max = _mm_set1_epi64x(i64::from_le_bytes(*b"29:59:59"));
+        let bad = _mm_or_si128(_mm_subs_epu8(min, raw), _mm_subs_epu8(raw, max));
+        // Pack each time as three adjacent decimal pairs, dropping the colons.
+        let digits = _mm_shuffle_epi8(
+            _mm_sub_epi8(raw, min),
+            _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, 8, 9, 11, 12, 14, 15, -1, -1),
+        );
+        let times = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let hours_bad = _mm_cmpgt_epi16(times, _mm_setr_epi16(23, 59, 59, 0, 23, 59, 59, 0));
+        let invalid = _mm_or_si128(bad, hours_bad);
+        if _mm_testz_si128(invalid, invalid) == 0 {
+            return None;
+        }
+        let both = _mm_madd_epi16(times, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
+        let seconds = _mm_hadd_epi32(both, both);
+        Some((_mm_cvtsi128_si32(seconds) as i64, _mm_extract_epi32::<1>(seconds) as i64))
+    }
+
+    /// Both fields have an independently checked F1 terminator and delimiter.
+    #[inline(always)]
+    pub(super) unsafe fn parse_f1_pair(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
+        let prefix = ld8(a);
+        let ddt = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
+        let date = self.entries.get_unchecked(Self::slot(prefix, ddt));
+        if (date.a == prefix) & (date.ddt == ddt) {
+            if (ld8(b) == prefix) & (b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF == ddt) {
+                let (event, ingest) = Self::clock_pair(a, b)?;
+                let day = date.day_sec as i64;
+                return Some(((day + event) * 1000, day + ingest));
+            }
+            let event = date.day_sec as i64 + Self::clock_sec(a)?;
+            return Some((event * 1000, self.civil19_sec(b)?));
+        }
+        Some((civil19_sec_cold(a)? * 1000, self.civil19_sec(b)?))
     }
 
     /// Fast path for `ingest_ts` (guaranteed valid F1): returns `Some(epoch_seconds)` if whole
