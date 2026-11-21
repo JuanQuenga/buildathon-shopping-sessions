@@ -142,7 +142,7 @@ struct Ctx {
     prod: IdLookup,
     camp: IdLookup,
     files: Vec<FileInfo>,
-    handles: Vec<File>,
+    handles: Arc<Vec<File>>,
     mmaps: Vec<Option<MappedFile>>,
     pref_stop: Arc<AtomicBool>,
     link_chunks: Vec<Chunk>,
@@ -228,25 +228,26 @@ fn env_usize(name: &str) -> Option<usize> {
 
 fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
     let (ws, we) = small::read_manifest(data_dir);
-    let products = small::read_products(data_dir);
-    let (campaigns, campaign_map) = small::read_campaigns(data_dir);
+    let (categories, _, prod) = small::read_products_lookup(data_dir);
+    let (campaigns, camp) = small::read_campaigns_lookup(data_dir);
     // Representation limits of the compact records (else: generic path).
-    if we < ws || we - ws > u32::MAX as i64 - WEEK_MS || products.categories.len() > 256 {
+    if we < ws || we - ws > u32::MAX as i64 - WEEK_MS || categories.len() > 256 {
         return None;
     }
     let dt = DateTable::build(ws, we);
-    let prod = IdLookup::build(products.map.iter().map(|(k, &v)| (k.as_slice(), v)), products.unknown);
-    let camp = IdLookup::build(campaign_map.iter().map(|(k, &v)| (k.as_slice(), v)), INVALID_CAMP);
     let mut files: Vec<FileInfo> = Vec::new();
+    let mut handles = Vec::new();
     for (sub, kind) in [("events", Kind::Events), ("clicks", Kind::Clicks), ("links", Kind::Links)] {
         for p in small::list_csv(data_dir, sub) {
-            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let handle = File::open(&p).expect("open csv");
+            let len = handle.metadata().map(|m| m.len()).unwrap_or(0);
             files.push(FileInfo { path: p, len, kind });
+            handles.push(handle);
         }
     }
-    let handles: Vec<File> = files.iter().map(|f| File::open(&f.path).expect("open csv")).collect();
+    let handles = Arc::new(handles);
     let total_csv_bytes: u64 = files.iter().map(|f| f.len).sum();
-    let use_mmap = total_csv_bytes <= (10u64 << 30) && std::env::var("INGEST_PREAD").is_err();
+    let use_mmap = total_csv_bytes <= (8u64 << 30) && std::env::var("INGEST_PREAD").is_err();
     let mmaps: Vec<Option<MappedFile>> = if use_mmap {
         use std::os::fd::AsRawFd;
         handles
@@ -264,14 +265,16 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         env_usize("INGEST_PREFETCH").unwrap_or(4).min(8)
     };
     if pref_threads > 0 {
-        let mut segs: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+        let mut segs = Vec::new();
         let seg_sz: u64 = 16 << 20;
-        for f in files.iter().filter(|f| f.kind == Kind::Links).chain(files.iter().filter(|f| f.kind != Kind::Links)) {
-            let mut off = 0u64;
-            while off < f.len {
-                let len = seg_sz.min(f.len - off);
-                segs.push((f.path.clone(), off, len));
-                off += len;
+        for kind in [Kind::Links, Kind::Events, Kind::Clicks] {
+            for (file_idx, f) in files.iter().enumerate().filter(|(_, f)| f.kind == kind) {
+                let mut off = 0u64;
+                while off < f.len {
+                    let len = seg_sz.min(f.len - off);
+                    segs.push((file_idx, off, len));
+                    off += len;
+                }
             }
         }
         let n_pref = segs.len().min(pref_threads);
@@ -282,9 +285,9 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
                 let segs = Arc::clone(&segs);
                 let next = Arc::clone(&next);
                 let stop = Arc::clone(&pref_stop);
+                let handles = Arc::clone(&handles);
                 std::thread::spawn(move || {
                     use std::os::fd::AsRawFd;
-                    let mut cached: Option<(std::path::PathBuf, File)> = None;
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             break;
@@ -293,19 +296,8 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
                         if i >= segs.len() {
                             break;
                         }
-                        let (ref path, off, len) = segs[i];
-                        let fd = match cached.as_ref() {
-                            Some((p, h)) if p == path => h.as_raw_fd(),
-                            _ => match File::open(path) {
-                                Ok(h) => {
-                                    let fd = h.as_raw_fd();
-                                    cached = Some((path.clone(), h));
-                                    fd
-                                }
-                                Err(_) => continue,
-                            },
-                        };
-                        par::fadvise_range(fd, off, len);
+                        let (file_idx, off, len) = segs[i];
+                        par::fadvise_range(handles[file_idx].as_raw_fd(), off, len);
                     }
                 });
             }
@@ -324,7 +316,7 @@ fn build_ctx(data_dir: &Path, tm: &mut Timer) -> Option<Ctx> {
         ws,
         we,
         dt,
-        categories: products.categories,
+        categories,
         campaigns,
         prod,
         camp,
@@ -759,7 +751,15 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(ctx: &Ctx, threads: usize, tm: &
     .into_iter()
     .map(|s| s.out)
     .collect();
-    drop(ev_sinks);
+    if !ALL_CAT && ne_raw <= 30_000_000 {
+        // The fused pipeline exits the process after writing output. Keep these
+        // mappings until exit on smaller inputs to avoid early TLB shootdowns.
+        std::mem::forget(ev_sinks);
+        std::mem::forget(links);
+    } else {
+        drop(ev_sinks);
+        drop(links);
+    }
     tm.lap("dedup");
     Ok(Deduped { b_sinks, ck_sinks, p2, ne_raw })
 }
@@ -943,8 +943,67 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
 fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Timer) -> Result<(), Need> {
     // Non-purchase events (view/cart, ~97%) never use `category` in daily outputs; skip `prod.get` for them!
-    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = ingest_to_sinks::<false, K>(ctx, threads, tm)?;
+    let prof = std::env::var("INGEST_PROF").as_deref() == Ok("1");
+    let deduped = ingest_to_sinks::<false, K>(ctx, threads, tm)?;
+    if prof {
+        group_fused::<K, GroupTimings>(ctx, deduped, output_dir, threads, tm);
+    } else {
+        group_fused::<K, ()>(ctx, deduped, output_dir, threads, tm);
+    }
+    Ok(())
+}
 
+#[derive(Clone, Copy)]
+enum GroupPhase {
+    Csr,
+    Sort,
+    Aggregate,
+    Write,
+}
+
+// Specialize the default path with () so it stores no timing state and
+// compiles out all phase marks in the worker loops.
+trait GroupProfile: Default + Send {
+    const ENABLED: bool = false;
+    fn start(&mut self) {}
+    fn end(&mut self, _: GroupPhase) {}
+    fn totals(&self) -> [f64; 4] { [0.0; 4] }
+}
+
+impl GroupProfile for () {}
+
+#[derive(Default)]
+struct GroupTimings {
+    last: f64,
+    totals: [f64; 4],
+}
+
+impl GroupProfile for GroupTimings {
+    const ENABLED: bool = true;
+
+    fn start(&mut self) {
+        self.last = par::thread_cpu();
+    }
+
+    fn end(&mut self, phase: GroupPhase) {
+        let now = par::thread_cpu();
+        self.totals[phase as usize] += now - self.last;
+        self.last = now;
+    }
+
+    fn totals(&self) -> [f64; 4] {
+        self.totals
+    }
+}
+
+fn group_fused<K: Key, P: GroupProfile>(
+    ctx: &Ctx,
+    deduped: Deduped<K>,
+    output_dir: &Path,
+    threads: usize,
+    tm: &mut Timer,
+) {
+    let Deduped { b_sinks, ck_sinks, p2, ne_raw } = deduped;
     let ud = output_dir.join("user_daily");
     let cd = output_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("create user_daily");
@@ -974,7 +1033,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
     let ncat = ctx.categories.len();
     let categories = &ctx.categories;
 
-    struct FusedWorker<'a, K: Key> {
+    struct FusedWorker<'a, K: Key, P> {
         // Grouping scratch (reused across P2 partitions -> stays L2-hot!)
         map: Map<K, u32>,
         persons: Vec<K>,
@@ -1003,9 +1062,10 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
         np: usize,
         nc: usize,
         written: usize,
+        profile: P,
     }
 
-    impl<'a, K: Key> FusedWorker<'a, K> {
+    impl<K: Key, P> FusedWorker<'_, K, P> {
         #[inline(always)]
         fn flush_user_day(
             &mut self,
@@ -1130,7 +1190,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
     let ev_cnt_part = &ev_cnt_part;
     let ud_ref = &ud;
     let est_user_rows = ne / threads / 8 + 1024;
-    let workers: Vec<FusedWorker<'_, K>> = par::run_fini(
+    let workers: Vec<FusedWorker<'_, K, P>> = par::run_fini(
         threads,
         p2,
         |tid| FusedWorker {
@@ -1159,6 +1219,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             np: 0,
             nc: 0,
             written: 0,
+            profile: P::default(),
         },
         |w, idx| {
             let q = q_order[idx];
@@ -1166,6 +1227,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
             if n == 0 {
                 return;
             }
+            w.profile.start();
             w.map.reset(n / 20 + 16);
             w.persons.clear();
             w.counts.clear();
@@ -1267,6 +1329,8 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
                 }
             }
 
+            w.profile.end(GroupPhase::Csr);
+
             // Per-person sort + sessionize + credit + assists while hot in L1/L2 cache!
             let mut ev_st = 0usize;
             let mut id_buf = [0u8; 16];
@@ -1283,6 +1347,7 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
                 } else {
                     (0, 0)
                 };
+                w.profile.end(GroupPhase::Sort);
                 let id_len = w.persons[pi].unpack_buf(&mut id_buf);
                 let id_bytes = &id_buf[..id_len];
 
@@ -1380,10 +1445,13 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
                     w.assists(pcl);
                 }
                 ev_st = ev_en;
+                w.profile.end(GroupPhase::Aggregate);
             }
         },
         |w| {
+            w.profile.start();
             w.written = w.writer.finish();
+            w.profile.end(GroupPhase::Write);
         },
     );
     // Skip unmapping b_sinks/ck_sinks right before exit(0) (avoids 8-core munmap TLB shootdowns).
@@ -1395,6 +1463,16 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
     if user_rows_written == 0 {
         output::write_empty_user(&ud).expect("writing empty user_daily");
     }
+    if P::ENABLED {
+        let mut totals = [0.0; 4];
+        for w in &workers {
+            for (total, cpu) in totals.iter_mut().zip(w.profile.totals()) {
+                *total += cpu;
+            }
+        }
+        let [csr, sort, agg, write] = totals;
+        eprintln!("[ingest-prof] cpu csr {csr:.6}s sort {sort:.6}s sessionize+agg {agg:.6}s user-finish {write:.6}s");
+    }
     let camp_rows = aggregate::merge_camps(workers.into_iter().map(|w| w.camp));
     tm.lap("group+agg");
     let t_cw = Instant::now();
@@ -1405,7 +1483,6 @@ fn run_fused<K: Key>(ctx: &Ctx, output_dir: &Path, threads: usize, tm: &mut Time
         camp_rows.len()
     );
     eprintln!("[ingest] key={}B persons={np} events={ne} (raw {ne_raw}) clicks={nc}", std::mem::size_of::<K>());
-    Ok(())
 }
 
 fn run<K: Key>(ctx: &Ctx, threads: usize, tm: &mut Timer) -> Result<Loaded, Need> {
@@ -1978,8 +2055,7 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
 pub fn bench_rows(path: &Path, data_dir: &Path) {
     let (ws, we) = small::read_manifest(data_dir);
     let dt = DateTable::build(ws, we);
-    let products = small::read_products(data_dir);
-    let prod = IdLookup::build(products.map.iter().map(|(k, &v)| (k.as_slice(), v)), products.unknown);
+    let (_, _, prod) = small::read_products_lookup(data_dir);
     let data = std::fs::read(path).unwrap();
     let mut buf = data.clone();
     let hi = buf.len();

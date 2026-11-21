@@ -20,7 +20,6 @@
 //!                    `b_parts[q]` and `ck_parts[q]`, sorts events/clicks, sessionizes/attributes/
 //!                    computes interval-union assists in `i64` ms, streams directly to `UserWriter`
 //!                    and merges `CampStore`s into `campaign_daily`.
-use super::key::IdLookup;
 use super::par::{self, SlabBuf, SyncPtr};
 use super::scan::{self, Chunk, FileInfo, Kind};
 use super::tsfast::{self, DateTable};
@@ -658,11 +657,9 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
 
     // ---------------- Stage 0: small metadata + prefetch ----------------
     let (ws, we) = small::read_manifest(data_dir);
-    let products = small::read_products(data_dir);
-    let (campaigns, campaign_map) = small::read_campaigns(data_dir);
+    let (categories, _, prod) = small::read_products_lookup(data_dir);
+    let (campaigns, camp) = small::read_campaigns_lookup(data_dir);
     let dt = DateTable::build(ws, we);
-    let prod = IdLookup::build(products.map.iter().map(|(k, &v)| (k.as_slice(), v)), products.unknown);
-    let camp = IdLookup::build(campaign_map.iter().map(|(k, &v)| (k.as_slice(), v)), INVALID_CAMP);
     let mut files: Vec<FileInfo> = Vec::new();
     for (sub, kind) in [("events", Kind::Events), ("clicks", Kind::Clicks), ("links", Kind::Links)] {
         for p in small::list_csv(data_dir, sub) {
@@ -1135,20 +1132,29 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
                         let slot = cnt & (CK_RING - 1);
                         if cnt >= CK_RING {
                             let pc = unsafe { *ring.get_unchecked(slot) };
-                            let (person, ph) = links_ref.canonical_h(field(b, pc.uid_f), pc.uh);
+                            let (person, ph) = links_ref.canonical_h(field(buf, pc.uid_f), pc.uh);
                             let q = (ph >> (64 - p2_bits)) as usize;
                             push_ck_rec(
                                 unsafe { parts.get_unchecked_mut(q) },
                                 person,
                                 ph,
-                                field(b, pc.cid_f),
+                                field(buf, pc.cid_f),
                                 pc.ts_ms,
                                 pc.campaign,
                             );
                         }
+                        // Pending clicks can outlive the scanner tile. Store ranges relative
+                        // to the chunk so they can be read after the callback or the scan.
+                        let base = unsafe { b.as_ptr().offset_from(buf.as_ptr()) } as u32;
+                        let in_chunk = |(start, end)| (base + start, base + end);
                         unsafe {
-                            *ring.get_unchecked_mut(slot) =
-                                PendingCk { uid_f: f[1], cid_f: f[0], uh, ts_ms: t, campaign };
+                            *ring.get_unchecked_mut(slot) = PendingCk {
+                                uid_f: in_chunk(f[1]),
+                                cid_f: in_chunk(f[0]),
+                                uh,
+                                ts_ms: t,
+                                campaign,
+                            };
                         }
                         cnt += 1;
                     } else {
@@ -1205,8 +1211,8 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
     };
     let ncamp = campaigns.len();
     let organic = ncamp as u32;
-    let ncat = products.categories.len();
-    let categories = &products.categories;
+    let ncat = categories.len();
+    let categories = &categories;
 
     #[derive(Clone, Copy)]
     #[repr(C)]

@@ -244,7 +244,8 @@ mod lookup_tests {
             (b"x9".to_vec(), 5), (b"p99999999".to_vec(), 6), (b"P1".to_vec(), 7), (b"p".to_vec(), 8),
             (long_id.clone(), 9),
         ];
-        let l = IdLookup::build(ids.iter().map(|(a, b)| (a.as_slice(), *b)), 0);
+        let duplicates = [(&b"p1"[..], 256), (&b"x9"[..], 257), (long_id.as_slice(), 258)];
+        let l = IdLookup::build(ids.iter().map(|(a, b)| (a.as_slice(), *b)).chain(duplicates), 0);
         let q = |s: &[u8]| {
             let mut v = s.to_vec();
             v.resize(s.len() + 32, b'9');

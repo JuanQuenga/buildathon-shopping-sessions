@@ -6,7 +6,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 pub const PAD: usize = 64;
-const TILE: usize = 32 * 1024;
+const TILE: usize = 24 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -275,7 +275,7 @@ thread_local! {
 }
 
 /// Scan `buf[lo..hi]` (rows terminated by LF; PAD readable bytes after hi) in
-/// L1/L2-resident tiles so `buf`, `seps`, and `lfs` never spill out of cache.
+/// L1/L2-resident tiles. Field ranges are relative to the slice passed to the callback.
 #[inline(always)]
 pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, f: F) {
     SCRATCH.with(|s| scan_with::<N, F>(buf, lo, hi, &mut s.borrow_mut(), f))
@@ -505,8 +505,10 @@ fn scan_tile_stage2_u16<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
     sc: &Scratch,
     f: &mut F,
 ) {
+    // Keep the tail padding readable for the callback. Derive the pointer from
+    // the original buffer so the preceding byte can also be read when lo > 0.
+    let tile_buf = &buf[lo..];
     let tile_ptr = unsafe { buf.as_ptr().add(lo) };
-    let lo32 = lo as u32;
     let seps_sl = &sc.seps16[..];
     let lfs_sl = &sc.lfs16[..];
     let sep_len = seps_sl.len();
@@ -527,11 +529,11 @@ fn scan_tile_stage2_u16<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
                     let b1 = unsafe { *tile_ptr.offset(e as isize - 1) };
                     let w = ((e >= s + 2) & (b0 == b'"') & (b1 == b'"')) as u32;
                     wrapped += w;
-                    fields[j] = (lo32 + s + w, lo32 + e - w);
+                    fields[j] = (s + w, e - w);
                     s = e + 1;
                 }
                 if qc - q_prev == 2 * wrapped {
-                    f(buf, &fields);
+                    f(tile_buf, &fields);
                 }
                 k += N;
             } else {
@@ -561,7 +563,7 @@ fn scan_tile_stage2_u16<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
                     s = e + 1;
                 }
                 if qc - q_prev == 2 * wrapped {
-                    f(buf, &fields);
+                    f(tile_buf, &fields);
                 }
                 k += N;
             } else {
@@ -752,12 +754,20 @@ mod tests {
             let lo = (next() % 3) as usize;
             let lo = lo.min(hi);
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            scan_ref::<3, _>(&buf, lo, hi, |_, f| a.push(*f));
-            scan::<3, _>(&buf, lo, hi, |_, f| b.push(*f));
+            scan_ref::<3, _>(&buf, lo, hi, |buf, f| {
+                a.push(f.map(|(s, e)| buf[s as usize..e as usize].to_vec()));
+            });
+            scan::<3, _>(&buf, lo, hi, |buf, f| {
+                b.push(f.map(|(s, e)| buf[s as usize..e as usize].to_vec()));
+            });
             assert_eq!(a, b);
             let (mut a, mut b) = (Vec::new(), Vec::new());
-            scan_ref::<1, _>(&buf, lo, hi, |_, f| a.push(*f));
-            scan::<1, _>(&buf, lo, hi, |_, f| b.push(*f));
+            scan_ref::<1, _>(&buf, lo, hi, |buf, f| {
+                a.push(f.map(|(s, e)| buf[s as usize..e as usize].to_vec()));
+            });
+            scan::<1, _>(&buf, lo, hi, |buf, f| {
+                b.push(f.map(|(s, e)| buf[s as usize..e as usize].to_vec()));
+            });
             assert_eq!(a, b);
         }
     }

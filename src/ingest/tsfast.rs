@@ -144,16 +144,22 @@ impl DateTable {
     }
 
     /// Exact equivalent of `ts::parse_ts` using the L1 date cache + specialized 13-digit F3
-    /// + ISO-first branch order (cuts mispredicts on 55% F1 / 30% F3 / 15% F2 mix) + cold fallback.
+    /// fast path plus a cold fallback.
     #[inline(always)]
     pub unsafe fn parse(&self, p: *const u8, len: usize) -> Option<i64> {
         if len == 13 {
-            let raw_hi = ld8(p);
-            let raw_lo = ld8(p.add(5));
+            const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
+            const DIGIT_LIMIT: u64 = 0x7676_7676_7676_7676;
             const M5: u64 = 0x0000_00FF_FFFF_FFFF;
-            if digits_ok(raw_hi, M5) & digits_ok(raw_lo, u64::MAX) {
-                let hi = swar_dec8_unchecked(((raw_hi & M5) << 24) | 0x0000_0000_0030_3030u64);
-                let lo = swar_dec8_unchecked(raw_lo);
+            let d_hi = ld8(p).wrapping_sub(ASCII_ZERO);
+            let d_lo = ld8(p.add(5)).wrapping_sub(ASCII_ZERO);
+            // Valid lanes cannot carry or borrow into the next lane. The first
+            // invalid lane therefore sets its high bit in d or d + DIGIT_LIMIT.
+            let bad_hi = (d_hi.wrapping_add(DIGIT_LIMIT) | d_hi) & 0x0000_0080_8080_8080;
+            let bad_lo = (d_lo.wrapping_add(DIGIT_LIMIT) | d_lo) & 0x8080_8080_8080_8080;
+            if (bad_hi | bad_lo) == 0 {
+                let hi = swar_dec8_digits((d_hi & M5) << 24);
+                let lo = swar_dec8_digits(d_lo);
                 return Some((hi * 100_000_000 + lo) as i64);
             }
             return None;
@@ -225,9 +231,8 @@ unsafe fn parse_cold(p: *const u8, len: usize) -> Option<i64> {
 }
 
 #[inline(always)]
-fn swar_dec8_unchecked(x: u64) -> u64 {
-    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
-    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+fn swar_dec8_digits(v: u64) -> u64 {
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
     (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32)))
         .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32))))
         >> 32
@@ -281,12 +286,7 @@ pub unsafe fn digits8(p: *const u8, k: usize) -> Option<u64> {
         return None;
     }
     let x = ((raw & m) << sh) | (0x3030_3030_3030_3030u64 & !(u64::MAX << sh));
-    let mut v = x.wrapping_sub(0x3030_3030_3030_3030);
-    v = v.wrapping_mul(10).wrapping_add(v >> 8);
-    v = (((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000u64 << 32)))
-        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000u64 << 32))))
-        >> 32;
-    Some(v)
+    Some(swar_dec8_digits(x.wrapping_sub(0x3030_3030_3030_3030)))
 }
 
 /// F3: digits only. Same results as `ts::parse_f3`.
@@ -360,6 +360,15 @@ mod tests {
         for dt in [&dt_oct, &dt_dec, &dt_leap] {
             for s in &seeds {
                 check(dt, s);
+            }
+        }
+        // Exercise both overlapping SWAR loads with every byte at every digit position.
+        let epoch_ms = *b"1791071890000";
+        for i in 0..epoch_ms.len() {
+            for byte in 0..=u8::MAX {
+                let mut input = epoch_ms;
+                input[i] = byte;
+                check(&dt_oct, &input);
             }
         }
         for _ in 0..2_000_000 {
