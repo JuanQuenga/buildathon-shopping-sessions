@@ -398,6 +398,8 @@ fn sink_thp() -> bool {
     *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
+        // In always mode, let the kernel try THP without explicit advice
+        // that can trigger synchronous compaction on first writes.
         _ => !matches!(thp_enabled(), "always" | "never") && probe_sink_thp(),
     })
 }
@@ -563,8 +565,7 @@ pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
 }
 
-/// Software write-combining buffer size per partition. Two cache lines keep
-/// the combined buffer footprint down with two parse workers sharing L2.
+/// Two cache lines amortize each flush at the compact path's partition counts.
 const SWCB_BYTES: usize = 128;
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
@@ -575,8 +576,9 @@ struct SwcbLine([u8; SWCB_BYTES]);
 /// full cache lines of non-temporal stores.
 pub struct Sinks<T: Copy> {
     base: *mut T,
-    raw: (*mut u8, usize),
+    arena: SinkArena,
     cap: usize,
+    stride: usize,
     swcb: Vec<SwcbLine>,
     pub len: Vec<usize>,
     pub over: Vec<Vec<T>>,
@@ -584,9 +586,44 @@ pub struct Sinks<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Sinks<T> {}
 unsafe impl<T: Copy + Sync> Sync for Sinks<T> {}
 
-impl<T: Copy> Drop for Sinks<T> {
+struct SinkMapping {
+    raw: *mut u8,
+    len: usize,
+}
+
+// Mapping ownership is shared. Only the disjoint ranges in SinkArena
+// provide access to the bytes.
+unsafe impl Send for SinkMapping {}
+unsafe impl Sync for SinkMapping {}
+
+impl Drop for SinkMapping {
     fn drop(&mut self) {
-        huge_free(self.raw.0, self.raw.1);
+        huge_free(self.raw, self.len);
+    }
+}
+
+pub(super) struct SinkArena {
+    base: *mut u8,
+    bytes: usize,
+    mapping: Arc<SinkMapping>,
+}
+
+unsafe impl Send for SinkArena {}
+
+impl SinkArena {
+    fn new(bytes: usize) -> Self {
+        let (base, raw, len) = huge_alloc_ex(bytes, sink_thp());
+        Self { base, bytes, mapping: Arc::new(SinkMapping { raw, len }) }
+    }
+
+    fn split_at(self, offset: usize) -> (Self, Self) {
+        assert!(offset <= self.bytes && offset % 64 == 0);
+        let rest = Self {
+            base: unsafe { self.base.add(offset) },
+            bytes: self.bytes - offset,
+            mapping: Arc::clone(&self.mapping),
+        };
+        (Self { bytes: offset, ..self }, rest)
     }
 }
 
@@ -599,17 +636,53 @@ impl<T: Copy> Sinks<T> {
         SWCB_BYTES / sz
     }
 
-    pub fn new(parts: usize, cap: usize) -> Self {
-        let pl = Self::per_line();
-        let cap = cap.max(pl).div_ceil(pl) * pl;
-        let (a, p, l) = huge_alloc_ex(parts * cap * std::mem::size_of::<T>(), sink_thp());
+    fn aligned_cap(cap: usize) -> usize {
+        cap.max(Self::per_line()).next_multiple_of(Self::per_line())
+    }
+
+    fn from_arena(parts: usize, cap: usize, stride: usize, arena: SinkArena) -> Self {
         Sinks {
-            base: a as *mut T,
-            raw: (p, l),
+            base: arena.base.cast(),
+            arena,
             cap,
+            stride,
             swcb: vec![SwcbLine([0u8; SWCB_BYTES]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    pub fn new(parts: usize, cap: usize) -> Self {
+        let cap = Self::aligned_cap(cap);
+        Self::from_arena(parts, cap, cap, SinkArena::new(parts * cap * std::mem::size_of::<T>()))
+    }
+
+    pub(super) fn into_arena(self) -> SinkArena {
+        self.arena
+    }
+
+    pub(super) fn reuse_pair<U: Copy>(
+        parts: usize, cap: usize, other_cap: usize, source_parts: usize, arena: Option<SinkArena>,
+    ) -> (Self, Sinks<U>) {
+        let cap = Self::aligned_cap(cap);
+        let other_cap = Sinks::<U>::aligned_cap(other_cap);
+        let bytes = parts * cap * std::mem::size_of::<T>();
+        let other_bytes = parts * other_cap * std::mem::size_of::<U>();
+        if let Some(arena) = arena.filter(|a| bytes + other_bytes <= a.bytes) {
+            let stride = arena.bytes / source_parts;
+            // With two source partitions per destination, start each output
+            // subarena where token writes already populated the old partition.
+            if 2 * parts <= source_parts && bytes.max(other_bytes) <= stride * parts {
+                let (first, second) = arena.split_at(parts * stride);
+                return (
+                    Self::from_arena(parts, cap, stride / std::mem::size_of::<T>(), first),
+                    Sinks::from_arena(parts, other_cap, stride / std::mem::size_of::<U>(), second),
+                );
+            }
+            let (first, second) = arena.split_at(bytes);
+            (Self::from_arena(parts, cap, cap, first), Sinks::from_arena(parts, other_cap, other_cap, second))
+        } else {
+            (Self::new(parts, cap), Sinks::new(parts, other_cap))
         }
     }
 
@@ -636,15 +709,14 @@ impl<T: Copy> Sinks<T> {
         l
     }
 
-    #[cold]
-    #[inline(never)]
+    #[inline(always)]
     fn flush_full(&mut self, p: usize, nl: usize, line_ptr: *const T) {
         let pl = Self::per_line();
         let base_idx = nl - pl;
         if nl <= self.cap {
             unsafe {
                 use std::arch::x86_64::*;
-                let dst = self.base.add(p * self.cap + base_idx) as *mut __m256i;
+                let dst = self.base.add(p * self.stride + base_idx) as *mut __m256i;
                 let src = line_ptr as *const __m256i;
                 debug_assert_eq!(dst as usize & 63, 0);
                 debug_assert_eq!(src as usize & 63, 0);
@@ -653,9 +725,15 @@ impl<T: Copy> Sinks<T> {
                 }
             }
         } else {
-            let slice = unsafe { std::slice::from_raw_parts(line_ptr, pl) };
-            self.over[p].extend_from_slice(slice);
+            self.flush_overflow(p, line_ptr);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn flush_overflow(&mut self, p: usize, line_ptr: *const T) {
+        let slice = unsafe { std::slice::from_raw_parts(line_ptr, Self::per_line()) };
+        self.over[p].extend_from_slice(slice);
     }
 
     /// Flush all partially-filled SWCB lines into the arena/overflow and issue sfence.
@@ -670,7 +748,7 @@ impl<T: Copy> Sinks<T> {
                 let src = unsafe { std::slice::from_raw_parts(self.swcb.as_ptr().add(p) as *const T, rem) };
                 if l <= self.cap {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.cap + base_idx), rem);
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.stride + base_idx), rem);
                     }
                 } else {
                     self.over[p].extend_from_slice(src);
@@ -682,7 +760,7 @@ impl<T: Copy> Sinks<T> {
 
     #[inline]
     pub fn part(&self, p: usize) -> (&[T], &[T]) {
-        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p].min(self.cap)) };
+        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.stride), self.len[p].min(self.cap)) };
         (a, &self.over[p])
     }
 
