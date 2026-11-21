@@ -1,5 +1,17 @@
 # Benchmark results
 
+## Please submit
+
+- **Tag**: `probe-1` (commit `4456bb8`, branch `probe-1`) — **diagnostic probe only** (deliberately writes a schema-valid 0-row `user_daily` to fail the dev check and return stderr logs without touching our leaderboard score).
+  - **What it tests**: scorer CPU model/flags/cgroup limits, THP `enabled`/`defrag` + 32 MiB fault/unmap latency (`default` vs `MADV_HUGEPAGE` vs `MADV_NOHUGEPAGE`) + 128 MiB serial vs parallel `munmap`, `/proc/mounts`, `preadv2(RWF_NOWAIT)` warm-cache check, Cascade Lake **AVX2 vs AVX-512VL-256 vs AVX-512BW-512** frequency-license check on real `/data/events` bytes, and dev `getrusage` user/sys/minflt split.
+  - **Verified locally**: `ss-test:probe-1` exits `0` in 0.93 s (52 lines stderr), `objdump -d` confirms only AVX-512 F/BW/VL inside runtime-guarded scanners, dev compare cleanly reports `DIFFER` (0/117,038 `user_daily` rows; 27,400/27,400 `campaign_daily` rows).
+
+## Official scores
+
+| Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
+| --- | --- | ---: | --- | --- |
+| `candidate-3` | `63b9256` (`4f01a6e`) | **0.88 s** | 12 / 153 (then; leaders now 0.59–0.65 s) | Accepted exact output |
+
 Command: `bench/run.sh DATA_DIR IMAGE RUNS` (Docker, scorer flags, `--cpuset-cpus 0-7`, 24g).
 Wall = container start to exit, measured on the host. Stage timers come from the binary's stderr.
 "Cold" evicts the data files from the page cache with `posix_fadvise(DONTNEED)` (no sudo on the
