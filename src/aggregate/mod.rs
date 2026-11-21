@@ -123,6 +123,30 @@ impl CampStore {
             self.sparse.entry((camp, day)).or_default()
         }
     }
+
+    #[inline(always)]
+    pub fn dense_row(&mut self, camp: u32) -> Option<&mut [CampCell]> {
+        let width = self.ndays as usize;
+        if width == 0 {
+            return None;
+        }
+        let base = camp as usize * width;
+        Some(&mut self.dense[base..base + width])
+    }
+
+    /// # Safety
+    /// The campaign and relative day must be in the campaign table and window.
+    #[inline(always)]
+    pub unsafe fn cell_in_window(&mut self, camp: u32, rel_day: usize) -> &mut CampCell {
+        if self.ndays != 0 {
+            debug_assert!(rel_day < self.ndays as usize);
+            let index = camp as usize * self.ndays as usize + rel_day;
+            unsafe { self.dense.get_unchecked_mut(index) }
+        } else {
+            let day = self.day0.wrapping_add(rel_day as i32);
+            self.sparse.entry((camp, day)).or_default()
+        }
+    }
 }
 
 /// Merge per-worker `CampStore`s into non-empty `CampRow`s.
@@ -431,8 +455,7 @@ pub fn aggregate(loaded: &Loaded, threads: usize) -> Tables {
 }
 
 /// With `user_dir`, each worker builds its user_daily rows directly as Parquet column
-/// buffers and writes them there as one file (even when empty); `Tables::user_rows`
-/// then comes back empty.
+/// buffers and writes them in row groups. `Tables::user_rows` then comes back empty.
 pub fn aggregate_with(loaded: &Loaded, threads: usize, user_dir: Option<&Path>) -> Tables {
     let threads = threads.max(1);
     let (day0, ndays) = if loaded.window_end_ms > loaded.window_start_ms {

@@ -30,7 +30,7 @@ mod direct;
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
-const DAY_MS_U64: u64 = ts::DAY_MS as u64;
+const DAY_MS_U32: u32 = ts::DAY_MS as u32;
 const CHUNK: u64 = 256 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
@@ -1345,6 +1345,99 @@ fn for_each_live<T: Copy, W: DeadWord>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct GroupEntry<K> {
+    key: K,
+    id: u32,
+    count: u32,
+}
+
+impl<K: Key> Default for GroupEntry<K> {
+    fn default() -> Self {
+        Self { key: K::default(), id: 0, count: 0 }
+    }
+}
+
+// Compact event counts share the probed slot with the person key and ID.
+struct GroupMap<K> {
+    entries: Vec<GroupEntry<K>>,
+    person_slots: Vec<usize>,
+    mask: usize,
+}
+
+impl<K: Key> GroupMap<K> {
+    fn new() -> Self {
+        Self { entries: Vec::new(), person_slots: Vec::new(), mask: 0 }
+    }
+
+    fn reset(&mut self, keys: usize) {
+        let cap = (keys * 2).next_power_of_two().max(16);
+        self.entries.clear();
+        self.entries.resize(cap, GroupEntry::default());
+        self.person_slots.clear();
+        self.mask = cap - 1;
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let cap = self.entries.len() * 2;
+        let old = std::mem::replace(&mut self.entries, vec![GroupEntry::default(); cap]);
+        self.mask = cap - 1;
+        for pos in &mut self.person_slots {
+            let entry = old[*pos];
+            let mut i = entry.key.h() as usize & self.mask;
+            while !self.entries[i].key.is_zero() {
+                i = (i + 1) & self.mask;
+            }
+            self.entries[i] = entry;
+            *pos = i;
+        }
+    }
+
+    #[inline(always)]
+    fn count(&mut self, key: K) -> u32 {
+        debug_assert!(!key.is_zero());
+        let mut i = key.h() as usize & self.mask;
+        loop {
+            let entry = unsafe { self.entries.get_unchecked_mut(i) };
+            if entry.key == key {
+                entry.count += 1;
+                return entry.id;
+            }
+            if entry.key.is_zero() {
+                let id = self.person_slots.len() as u32;
+                *entry = GroupEntry { key, id, count: 1 };
+                self.person_slots.push(i);
+                if self.person_slots.len() * 2 > self.entries.len() {
+                    self.grow();
+                }
+                return id;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: K) -> Option<u32> {
+        let mut i = key.h() as usize & self.mask;
+        loop {
+            let entry = unsafe { self.entries.get_unchecked(i) };
+            if entry.key == key {
+                return Some(entry.id);
+            }
+            if entry.key.is_zero() {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn person(&self, id: usize) -> GroupEntry<K> {
+        self.entries[self.person_slots[id]]
+    }
+}
+
 /// 8-byte compact surviving event inside a P2 partition: `(ts << 32) | cc`.
 /// Single-instruction `u64` ordering sorts primarily by `ts` ascending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1387,88 +1480,48 @@ fn insertion_sort_ev(a: &mut [CompactEv]) {
     }
 }
 
-/// 3-pass (11+11+10 bit) LSB radix sort on `CompactEv::ts()` (skips trivial passes).
-fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
+#[inline(always)]
+fn sort_pair(a: &mut CompactEv, b: &mut CompactEv) {
+    let x = a.0;
+    let y = b.0;
+    a.0 = x.min(y);
+    b.0 = x.max(y);
+}
+
+// Use byte-wide histograms to keep the complete counting table in L1.
+fn radix_sort_ev_bytes(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
     let n = slice.len();
+    let mut counts = [[0u32; 256]; 4];
+    for ev in slice.iter() {
+        let bytes = ev.ts().to_le_bytes();
+        for i in 0..4 {
+            counts[i][bytes[i] as usize] += 1;
+        }
+    }
     if tmp.len() < n {
         tmp.resize(n, CompactEv(0));
     }
     let buf = &mut tmp[..n];
-    let mut c0 = [0u32; 2048];
-    let mut c1 = [0u32; 2048];
-    let mut c2 = [0u32; 1024];
-    for e in slice.iter() {
-        let t = e.ts();
-        c0[(t & 2047) as usize] += 1;
-        c1[((t >> 11) & 2047) as usize] += 1;
-        c2[(t >> 22) as usize] += 1;
-    }
-    let t0 = slice[0].ts();
-    let skip0 = c0[(t0 & 2047) as usize] == n as u32;
-    let skip1 = c1[((t0 >> 11) & 2047) as usize] == n as u32;
-    let skip2 = c2[(t0 >> 22) as usize] == n as u32;
     let mut in_tmp = false;
-
-    if !skip0 {
-        let mut acc = 0u32;
-        for c in c0.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
+    let origin = slice[0].ts().to_le_bytes();
+    for (i, (counts, byte)) in counts.iter_mut().zip(origin).enumerate() {
+        if counts[byte as usize] == n as u32 {
+            continue;
         }
-        for &e in slice.iter() {
-            let b = (e.ts() & 2047) as usize;
-            let dst = unsafe { c0.get_unchecked_mut(b) };
-            unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
-            *dst += 1;
+        let mut acc = 0;
+        for count in &mut *counts {
+            let current = *count;
+            *count = acc;
+            acc += current;
         }
-        in_tmp = true;
-    }
-    if !skip1 {
-        let mut acc = 0u32;
-        for c in c1.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
-        }
-        if in_tmp {
-            for &e in buf.iter() {
-                let b = ((e.ts() >> 11) & 2047) as usize;
-                let dst = unsafe { c1.get_unchecked_mut(b) };
-                unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
-                *dst += 1;
-            }
-        } else {
-            for &e in slice.iter() {
-                let b = ((e.ts() >> 11) & 2047) as usize;
-                let dst = unsafe { c1.get_unchecked_mut(b) };
-                unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
-                *dst += 1;
-            }
-        }
-        in_tmp = !in_tmp;
-    }
-    if !skip2 {
-        let mut acc = 0u32;
-        for c in c2.iter_mut() {
-            let v = *c;
-            *c = acc;
-            acc += v;
-        }
-        if in_tmp {
-            for &e in buf.iter() {
-                let b = (e.ts() >> 22) as usize;
-                let dst = unsafe { c2.get_unchecked_mut(b) };
-                unsafe { *slice.get_unchecked_mut(*dst as usize) = e };
-                *dst += 1;
-            }
-        } else {
-            for &e in slice.iter() {
-                let b = (e.ts() >> 22) as usize;
-                let dst = unsafe { c2.get_unchecked_mut(b) };
-                unsafe { *buf.get_unchecked_mut(*dst as usize) = e };
-                *dst += 1;
-            }
+        let (src, dst) = if in_tmp { (&*buf, &mut *slice) } else { (&*slice, &mut *buf) };
+        let shift = i * 8;
+        for &ev in src {
+            let bin = ((ev.ts() >> shift) & 255) as usize;
+            let pos = unsafe { counts.get_unchecked_mut(bin) };
+            // Prefix counts delimit disjoint output ranges that cover dst.
+            unsafe { *dst.get_unchecked_mut(*pos as usize) = ev };
+            *pos += 1;
         }
         in_tmp = !in_tmp;
     }
@@ -1479,16 +1532,31 @@ fn radix_sort_ev(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
 
 #[inline]
 fn sort_ev_slice(slice: &mut [CompactEv], tmp: &mut Vec<CompactEv>) {
-    let n = slice.len();
-    if n <= 1 {
-        return;
-    }
-    if n <= 16 {
-        insertion_sort_ev(slice);
-    } else if n <= 256 {
-        slice.sort_unstable();
-    } else {
-        radix_sort_ev(slice, tmp);
+    match slice {
+        [] | [_] => {}
+        [a, b] => sort_pair(a, b),
+        [a, b, c] => {
+            sort_pair(a, b);
+            sort_pair(b, c);
+            sort_pair(a, b);
+        }
+        [a, b, c, d] => {
+            sort_pair(a, b);
+            sort_pair(c, d);
+            sort_pair(a, c);
+            sort_pair(b, d);
+            sort_pair(b, c);
+        }
+        _ => {
+            let n = slice.len();
+            if n <= 16 {
+                insertion_sort_ev(slice);
+            } else if n <= 256 {
+                slice.sort_unstable();
+            } else {
+                radix_sort_ev_bytes(slice, tmp);
+            }
+        }
     }
 }
 
@@ -1498,27 +1566,35 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
     if n <= 1 {
         return n;
     }
-    if n <= 16 {
+    if n <= 24 {
         for i in 1..n {
-            let v = cl[i];
+            let v = unsafe { *cl.get_unchecked(i) };
             let mut j = i;
-            while j > 0 && (cl[j - 1].ts > v.ts || (cl[j - 1].ts == v.ts && cl[j - 1].cid > v.cid)) {
-                cl[j] = cl[j - 1];
+            while j > 0 {
+                let prev = unsafe { *cl.get_unchecked(j - 1) };
+                if (prev.ts, prev.cid) <= (v.ts, v.cid) {
+                    break;
+                }
+                unsafe { *cl.get_unchecked_mut(j) = prev };
                 j -= 1;
             }
-            cl[j] = v;
+            unsafe { *cl.get_unchecked_mut(j) = v };
         }
     } else {
         cl.sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid)));
     }
-    let mut w = 1usize;
-    for r in 1..n {
-        if cl[r].cid != cl[w - 1].cid {
-            cl[w] = cl[r];
-            w += 1;
+    // Most slices have no duplicates. Leave the sorted prefix alone.
+    let Some(first_duplicate) = cl.windows(2).position(|pair| pair[0].cid == pair[1].cid) else {
+        return n;
+    };
+    let mut out = first_duplicate + 1;
+    for read in out + 1..n {
+        if cl[read].cid != cl[out - 1].cid {
+            cl[out] = cl[read];
+            out += 1;
         }
     }
-    w
+    out
 }
 
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
@@ -1574,6 +1650,71 @@ impl GroupProfile for GroupTimings {
     }
 }
 
+struct FusedAssists {
+    s_start: Vec<u32>,
+    s_day: Vec<u16>,
+    stamp: u32,
+    campaigns: Vec<(u32, u32)>,
+}
+
+impl FusedAssists {
+    fn new(ncamp: usize) -> Self {
+        Self {
+            s_start: Vec::with_capacity(256),
+            s_day: Vec::with_capacity(256),
+            stamp: 0,
+            campaigns: vec![(0, 0); ncamp],
+        }
+    }
+
+    #[inline]
+    fn count<K: Key>(&mut self, camp: &mut CampStore, clicks: &[CompactClick<K>]) {
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.campaigns.fill((0, 0));
+            self.stamp = 1;
+        }
+        let stamp = self.stamp;
+        let starts = &self.s_start;
+        let (mut first, mut end) = (0, 0);
+        for click in clicks {
+            let lo = click.ts.saturating_sub(WEEK_MS_U32);
+            while first < starts.len() && starts[first] < lo {
+                first += 1;
+            }
+            if first == starts.len() {
+                break;
+            }
+            end = end.max(first);
+            while end < starts.len() && starts[end] <= click.ts {
+                end += 1;
+            }
+
+            // Both bounds advance monotonically. For this campaign, only
+            // the tail beyond the previous click's window is new.
+            let campaign = click.campaign as usize;
+            let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
+            let begin = if seen.0 == stamp { first.max(seen.1 as usize) } else { first };
+            if begin >= end {
+                continue;
+            }
+            *seen = (stamp, end as u32);
+            let days = &self.s_day[begin..end];
+            if let Some(row) = camp.dense_row(click.campaign) {
+                for &day in days {
+                    // Session starts are always inside the window.
+                    unsafe { row.get_unchecked_mut(day as usize) }.assisted += 1;
+                }
+            } else {
+                for &day in days {
+                    let day = camp.day0.wrapping_add(i32::from(day));
+                    camp.cell(click.campaign, day).assisted += 1;
+                }
+            }
+        }
+    }
+}
+
 fn group_fused<K: Key, P: GroupProfile>(
     ctx: &Ctx<'_>,
     deduped: Deduped<K>,
@@ -1610,7 +1751,7 @@ fn group_fused<K: Key, P: GroupProfile>(
     let ws = ctx.ws;
     let we = ctx.we;
     let day0 = aggregate::day_of(ws);
-    let ws_rem = ws.rem_euclid(ts::DAY_MS) as u64;
+    let ws_rem = ws.rem_euclid(ts::DAY_MS) as u32;
     let ndays = if we > ws {
         (aggregate::day_of(we - 1) as i64 - day0 as i64 + 1).min(u32::MAX as i64) as u32
     } else {
@@ -1624,11 +1765,10 @@ fn group_fused<K: Key, P: GroupProfile>(
 
     struct FusedWorker<'a, K: Key, P> {
         // Grouping scratch (reused across P2 partitions -> stays L2-hot!)
-        map: Map<K, u32>,
-        persons: Vec<K>,
-        counts: Vec<u32>,
+        map: GroupMap<K>,
         fill: Vec<u32>,
         pid: Vec<u32>,
+        ev_flat: Vec<CompactEv>,
         ev_buf: Vec<CompactEv>,
         ev_tmp: Vec<CompactEv>,
         cl_raw: Vec<(u32, CompactClick<K>)>,
@@ -1640,13 +1780,7 @@ fn group_fused<K: Key, P: GroupProfile>(
         writer: output::UserWriter<'a>,
         cat_sum: Vec<u64>,
         cat_touched: Vec<u32>,
-        s_start: Vec<u32>,
-        day_first: Vec<(i32, u32)>,
-        stamp: u32,
-        c_stamp: Vec<u32>,
-        c_lo: Vec<u32>,
-        c_hi: Vec<u32>,
-        active: Vec<u32>,
+        assists: FusedAssists,
         // Counters
         np: usize,
         nc: usize,
@@ -1654,7 +1788,7 @@ fn group_fused<K: Key, P: GroupProfile>(
         profile: P,
     }
 
-    impl<K: Key, P> FusedWorker<'_, K, P> {
+    impl<K: Key, P: GroupProfile> FusedWorker<'_, K, P> {
         #[inline(always)]
         fn flush_user_day(
             &mut self,
@@ -1665,131 +1799,31 @@ fn group_fused<K: Key, P: GroupProfile>(
             events: u32,
             revenue: i64,
         ) {
-            let mut top = NO_CATEGORY;
-            let mut best = 0u64;
-            for &c in &self.cat_touched {
-                let v = unsafe { *self.cat_sum.get_unchecked(c as usize) };
-                if v > best || (v == best && c < top) {
-                    best = v;
-                    top = c;
-                }
-                unsafe { *self.cat_sum.get_unchecked_mut(c as usize) = 0 };
-            }
-            self.cat_touched.clear();
-            let cat = if top == NO_CATEGORY {
+            let cat = if revenue == 0 {
                 None
             } else {
-                Some(unsafe { categories.get_unchecked(top as usize) }.as_slice())
+                self.take_top_category(categories)
             };
-            self.writer.push(id_bytes, day, sessions, events, revenue, cat);
-        }
-
-        #[inline(always)]
-        fn count_interval(&mut self, camp: u32, lo: u32, hi: u32) {
-            let st = &self.s_start;
-            let df = &self.day_first;
-            if st.len() == 1 {
-                let s0 = unsafe { *st.get_unchecked(0) };
-                if lo <= s0 && s0 <= hi {
-                    self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += 1;
-                }
-                return;
-            }
-            if st.len() <= 16 {
-                for (i, &(day, start)) in df.iter().enumerate() {
-                    let start = start as usize;
-                    if st[start] > hi {
-                        break;
-                    }
-                    let end = df.get(i + 1).map_or(st.len(), |&(_, next)| next as usize);
-                    let count = st[start..end]
-                        .iter()
-                        .take_while(|&&s| s <= hi)
-                        .filter(|&&s| s >= lo)
-                        .count();
-                    if count != 0 {
-                        self.camp.cell(camp, day).assisted += count as i64;
-                    }
-                }
-                return;
-            }
-            let a = st.partition_point(|&x| x < lo);
-            let b = st.partition_point(|&x| x <= hi);
-            if a >= b {
-                return;
-            }
-            if df.len() == 1 {
-                self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += (b - a) as i64;
-                return;
-            }
-            let mut di = df.partition_point(|d| (d.1 as usize) <= a) - 1;
-            let mut idx = a;
-            while idx < b {
-                let end = if di + 1 < df.len() {
-                    (df[di + 1].1 as usize).min(b)
-                } else {
-                    b
-                };
-                let day = df[di].0;
-                self.camp.cell(camp, day).assisted += (end - idx) as i64;
-                idx = end;
-                di += 1;
+            if self.writer.push_group_row(id_bytes, day, sessions, events, revenue, cat) {
+                self.profile.end(GroupPhase::Aggregate);
+                self.writer.flush_group();
+                self.profile.end(GroupPhase::Write);
             }
         }
 
-        #[inline]
-        fn assists(&mut self, pcl: &[CompactClick<K>]) {
-            let first = self.s_start[0];
-            let last = *unsafe { self.s_start.last().unwrap_unchecked() };
-            if pcl.len() == 1 {
-                let c = unsafe { *pcl.get_unchecked(0) };
-                let lo = c.ts.saturating_sub(WEEK_MS_U32);
-                if lo <= last && c.ts >= first {
-                    self.count_interval(c.campaign, lo, c.ts);
+        #[cold]
+        fn take_top_category<'a>(&mut self, categories: &'a [Vec<u8>]) -> Option<&'a [u8]> {
+            let mut top = NO_CATEGORY;
+            let mut best = 0u64;
+            for c in self.cat_touched.drain(..) {
+                let v = unsafe { self.cat_sum.get_unchecked_mut(c as usize) };
+                if *v > best || (*v == best && c < top) {
+                    best = *v;
+                    top = c;
                 }
-                return;
+                *v = 0;
             }
-            self.stamp = self.stamp.wrapping_add(1);
-            if self.stamp == 0 {
-                self.c_stamp.fill(0);
-                self.stamp = 1;
-            }
-            let stamp = self.stamp;
-            for c in pcl {
-                let t = c.ts;
-                let lo = t.saturating_sub(WEEK_MS_U32);
-                if lo > last {
-                    break;
-                }
-                if t < first {
-                    continue;
-                }
-                let ci = c.campaign as usize;
-                if unsafe { *self.c_stamp.get_unchecked(ci) } == stamp {
-                    let prev_hi = unsafe { *self.c_hi.get_unchecked(ci) };
-                    if lo <= prev_hi {
-                        unsafe { *self.c_hi.get_unchecked_mut(ci) = t };
-                        continue;
-                    }
-                    let lo0 = unsafe { *self.c_lo.get_unchecked(ci) };
-                    self.count_interval(c.campaign, lo0, prev_hi);
-                } else {
-                    unsafe { *self.c_stamp.get_unchecked_mut(ci) = stamp };
-                    self.active.push(c.campaign);
-                }
-                unsafe {
-                    *self.c_lo.get_unchecked_mut(ci) = lo;
-                    *self.c_hi.get_unchecked_mut(ci) = t;
-                }
-            }
-            let active = std::mem::take(&mut self.active);
-            for &c in &active {
-                let lo = unsafe { *self.c_lo.get_unchecked(c as usize) };
-                let hi = unsafe { *self.c_hi.get_unchecked(c as usize) };
-                self.count_interval(c, lo, hi);
-            }
-            self.active = active;
-            self.active.clear();
+            categories.get(top as usize).map(Vec::as_slice)
         }
     }
 
@@ -1801,11 +1835,10 @@ fn group_fused<K: Key, P: GroupProfile>(
         threads,
         p2,
         |tid| FusedWorker {
-            map: Map::<K, u32>::with_capacity(1024),
-            persons: Vec::with_capacity(2048),
-            counts: Vec::with_capacity(2048),
+            map: GroupMap::new(),
             fill: Vec::with_capacity(2048),
             pid: Vec::with_capacity(65536),
+            ev_flat: Vec::with_capacity(65536),
             ev_buf: Vec::with_capacity(65536),
             ev_tmp: Vec::new(),
             cl_raw: Vec::with_capacity(16384),
@@ -1816,13 +1849,7 @@ fn group_fused<K: Key, P: GroupProfile>(
             writer: output::UserWriter::new(ud_ref, tid, est_user_rows),
             cat_sum: vec![0u64; ncat],
             cat_touched: Vec::with_capacity(32),
-            s_start: Vec::with_capacity(256),
-            day_first: Vec::with_capacity(32),
-            stamp: 0,
-            c_stamp: vec![0u32; ncamp],
-            c_lo: vec![0u32; ncamp],
-            c_hi: vec![0u32; ncamp],
-            active: Vec::with_capacity(64),
+            assists: FusedAssists::new(ncamp),
             np: 0,
             nc: 0,
             written: 0,
@@ -1835,55 +1862,47 @@ fn group_fused<K: Key, P: GroupProfile>(
                 return;
             }
             w.profile.start();
-            w.map.reset(n / 20 + 16);
-            w.persons.clear();
-            w.counts.clear();
-            if w.pid.capacity() < n {
-                w.pid.reserve(n - w.pid.len());
-            }
-            unsafe { w.pid.set_len(n) };
-            let pid_ptr = w.pid.as_mut_ptr();
-            let mut j = 0usize;
+            w.map.reset(n / 25 + 16);
+            w.pid.clear();
+            w.pid.reserve(n);
+            w.ev_flat.clear();
+            w.ev_flat.reserve(n);
+            let pid = w.pid.as_mut_ptr();
+            let ev_flat = w.ev_flat.as_mut_ptr();
+            let mut live = 0;
             for_each_live(&b_sinks, dead.as_ref(), reloc_b, q, |r| {
-            let next = w.persons.len() as u32;
-            let (id, ins) = w.map.insert(r.person, next);
-            if ins {
-                w.persons.push(r.person);
-                w.counts.push(0);
-                if w.map.len() * 2 > map_cap(&w.map) {
-                    grow(&mut w.map, &w.persons);
+                let id = w.map.count(r.person);
+                // The count pass reserved one slot per live event.
+                unsafe {
+                    pid.add(live).write(id);
+                    ev_flat.add(live).write(CompactEv::new(r.ts, r.cc));
                 }
-            }
-            unsafe {
-                *w.counts.get_unchecked_mut(id as usize) += 1;
-                pid_ptr.add(j).write(id);
-            }
-            j += 1;
+                live += 1;
             });
-            let np = w.persons.len();
+            debug_assert_eq!(live, n);
+            unsafe {
+                w.pid.set_len(live);
+                w.ev_flat.set_len(live);
+            }
+            let np = w.map.person_slots.len();
             w.np += np;
             w.fill.clear();
             w.fill.reserve(np);
             let mut acc = 0u32;
             for i in 0..np {
                 w.fill.push(acc);
-                acc += w.counts[i];
+                acc += w.map.person(i).count;
             }
-            if w.ev_buf.capacity() < n {
-                w.ev_buf.reserve(n - w.ev_buf.len());
-            }
-            unsafe { w.ev_buf.set_len(n) };
+            w.ev_buf.clear();
+            w.ev_buf.reserve(n);
             let ev_ptr = w.ev_buf.as_mut_ptr();
-            let mut j = 0usize;
-            for_each_live(&b_sinks, dead.as_ref(), reloc_b, q, |r| {
-            let id = unsafe { *pid_ptr.add(j) } as usize;
-            let pos = unsafe { *w.fill.get_unchecked(id) } as usize;
-            unsafe {
-                ev_ptr.add(pos).write(CompactEv::new(r.ts, r.cc));
-                *w.fill.get_unchecked_mut(id) = (pos + 1) as u32;
+            for (&id, &ev) in w.pid.iter().zip(&w.ev_flat) {
+                let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
+                unsafe { ev_ptr.add(*pos as usize).write(ev) };
+                *pos += 1;
             }
-            j += 1;
-            });
+            // The prefix counts assigned each live event one distinct slot.
+            unsafe { w.ev_buf.set_len(n) };
 
             // Collect & count-scatter clicks for persons present in partition `q`.
             w.cl_raw.clear();
@@ -1907,10 +1926,8 @@ fn group_fused<K: Key, P: GroupProfile>(
                 w.ck_off.push(cacc);
                 w.fill.clear();
                 w.fill.extend_from_slice(&w.ck_off[..np]);
-                if w.cl_buf.capacity() < ncl_raw {
-                    w.cl_buf.reserve(ncl_raw - w.cl_buf.len());
-                }
-                unsafe { w.cl_buf.set_len(ncl_raw) };
+                w.cl_buf.clear();
+                w.cl_buf.reserve(ncl_raw);
                 let cl_ptr = w.cl_buf.as_mut_ptr();
                 for &(id, ck) in &w.cl_raw {
                     let pos = unsafe { *w.fill.get_unchecked(id as usize) } as usize;
@@ -1919,6 +1936,8 @@ fn group_fused<K: Key, P: GroupProfile>(
                         *w.fill.get_unchecked_mut(id as usize) = (pos + 1) as u32;
                     }
                 }
+                // Each of the ncl_raw clicks initialized one distinct offset.
+                unsafe { w.cl_buf.set_len(ncl_raw) };
             }
 
             w.profile.end(GroupPhase::Csr);
@@ -1927,8 +1946,8 @@ fn group_fused<K: Key, P: GroupProfile>(
             let mut ev_st = 0usize;
             let mut id_buf = [0u8; 16];
             for pi in 0..np {
-                let ec = w.counts[pi] as usize;
-                let ev_en = ev_st + ec;
+                let person = w.map.person(pi);
+                let ev_en = ev_st + person.count as usize;
                 sort_ev_slice(&mut w.ev_buf[ev_st..ev_en], &mut w.ev_tmp);
                 let (cl_st, cl_len) = if ncl_raw > 0 {
                     let cs = w.ck_off[pi] as usize;
@@ -1940,51 +1959,41 @@ fn group_fused<K: Key, P: GroupProfile>(
                     (0, 0)
                 };
                 w.profile.end(GroupPhase::Sort);
-                let id_len = w.persons[pi].unpack_buf(&mut id_buf);
+                let id_len = person.key.unpack_buf(&mut id_buf);
                 let id_bytes = &id_buf[..id_len];
 
-                w.s_start.clear();
-                w.day_first.clear();
+                w.assists.s_start.clear();
+                w.assists.s_day.clear();
                 let mut i = ev_st;
                 let mut cj = cl_st;
                 let cl_end = cl_st + cl_len;
-                let mut grp_first = cl_st;
-                let mut last_ts = 0u32;
-                let mut have_click = false;
-                let mut ud_day = i32::MIN;
-                let mut next_day_s = 0u64;
+                let mut grp_first = cl_end;
+                // The exclusive window end reserves u32::MAX as a sentinel.
+                let mut last_ts = u32::MAX;
+                let mut rel_day = 0u32;
+                let mut next_day_s = DAY_MS_U32 - ws_rem;
                 let (mut ud_sessions, mut ud_events, mut ud_revenue) = (0u32, 0u32, 0i64);
 
                 while i < ev_en {
-                    let s = unsafe { w.ev_buf.get_unchecked(i).ts() };
-                    let day = if (s as u64) < next_day_s {
-                        ud_day
-                    } else {
-                        let rel_day = (ws_rem + s as u64) / DAY_MS_U64;
-                        next_day_s = (rel_day + 1) * DAY_MS_U64 - ws_rem;
-                        day0 + rel_day as i32
-                    };
-                    if day != ud_day {
+                    let first = unsafe { *w.ev_buf.get_unchecked(i) };
+                    let s = first.ts();
+                    if s >= next_day_s {
                         if ud_sessions != 0 {
-                            w.flush_user_day(id_bytes, categories, ud_day, ud_sessions, ud_events, ud_revenue);
+                            w.flush_user_day(id_bytes, categories, day0.wrapping_add(rel_day as i32), ud_sessions, ud_events, ud_revenue);
+                            ud_sessions = 0;
+                            ud_events = 0;
+                            ud_revenue = 0;
                         }
-                        ud_day = day;
-                        ud_sessions = 0;
-                        ud_events = 0;
-                        ud_revenue = 0;
-                        w.day_first.push((day, w.s_start.len() as u32));
+                        // The compact window is at most u32::MAX - WEEK_MS long,
+                        // leaving room to add the window's time of day.
+                        rel_day = (ws_rem + s) / DAY_MS_U32;
+                        next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
                     }
                     let mut prev = s;
-                    let mut k = i;
+                    let mut k = i + 1;
+                    let mut cc = first.cc();
                     let mut rev = 0u64;
-                    while k < ev_en {
-                        let e = unsafe { *w.ev_buf.get_unchecked(k) };
-                        let ets = e.ts();
-                        if ets - prev > GAP_MS_U32 {
-                            break;
-                        }
-                        prev = ets;
-                        let cc = e.cc();
+                    loop {
                         let cents = cc & 0x00FF_FFFF;
                         if cents != 0 {
                             rev += cents as u64;
@@ -1995,6 +2004,16 @@ fn group_fused<K: Key, P: GroupProfile>(
                             }
                             *slot += cents as u64;
                         }
+                        if k == ev_en {
+                            break;
+                        }
+                        let e = unsafe { *w.ev_buf.get_unchecked(k) };
+                        let ets = e.ts();
+                        if ets - prev > GAP_MS_U32 {
+                            break;
+                        }
+                        prev = ets;
+                        cc = e.cc();
                         k += 1;
                     }
                     let nev = (k - i) as u32;
@@ -2006,35 +2025,37 @@ fn group_fused<K: Key, P: GroupProfile>(
                         if ct > s_ck {
                             break;
                         }
-                        if !have_click || ct != last_ts {
+                        if ct != last_ts {
                             last_ts = ct;
                             grp_first = cj;
-                            have_click = true;
                         }
                         cj += 1;
                     }
-                    let credit = if have_click && last_ts >= s {
+                    let credit = if grp_first != cl_end && last_ts >= s {
                         unsafe { w.cl_buf.get_unchecked(grp_first).campaign }
                     } else {
                         organic
                     };
-                    let cell = w.camp.cell(credit, day);
+                    // Credit is a known campaign (or organic) and the start is in the window.
+                    let cell = unsafe { w.camp.cell_in_window(credit, rel_day as usize) };
                     cell.sessions += 1;
-                    cell.purchasing += (rev != 0) as i64;
-                    cell.revenue += rev as i64;
+                    if rev != 0 {
+                        cell.purchasing += 1;
+                        cell.revenue += rev as i64;
+                    }
 
                     ud_sessions += 1;
                     ud_events += nev;
                     ud_revenue += rev as i64;
-                    w.s_start.push(s);
+                    if cl_len > 0 {
+                        w.assists.s_start.push(s);
+                        w.assists.s_day.push(rel_day as u16);
+                    }
                 }
-                w.flush_user_day(id_bytes, categories, ud_day, ud_sessions, ud_events, ud_revenue);
+                w.flush_user_day(id_bytes, categories, day0.wrapping_add(rel_day as i32), ud_sessions, ud_events, ud_revenue);
 
                 if cl_len > 0 {
-                    // SAFETY: `cl_buf` is not mutated by `assists`.
-                    let cl_ptr = w.cl_buf.as_ptr();
-                    let pcl = unsafe { std::slice::from_raw_parts(cl_ptr.add(cl_st), cl_len) };
-                    w.assists(pcl);
+                    w.assists.count(&mut w.camp, &w.cl_buf[cl_st..cl_end]);
                 }
                 ev_st = ev_en;
                 w.profile.end(GroupPhase::Aggregate);
@@ -2050,6 +2071,7 @@ fn group_fused<K: Key, P: GroupProfile>(
             drop(std::mem::take(&mut w.cl_buf));
             drop(std::mem::take(&mut w.cl_raw));
             drop(std::mem::take(&mut w.pid));
+            drop(std::mem::take(&mut w.ev_flat));
         },
     );
     let arenas = b_sinks.into_iter().map(Ok).chain(ck_sinks.into_iter().map(Err));
@@ -2826,7 +2848,7 @@ mod tests {
             rng
         };
         let mut tmp = Vec::new();
-        for &n in &[0usize, 1, 2, 15, 16, 17, 256, 257, 4096, 100_000] {
+        for &n in &[0usize, 1, 2, 3, 4, 15, 16, 17, 256, 257, 4096, 100_000] {
             let mut a: Vec<CompactEv> = (0..n)
                 .map(|i| CompactEv::new((next() as u32) % 1_209_600_000, i as u32))
                 .collect();
@@ -2835,6 +2857,9 @@ mod tests {
             b.sort_by_key(|e| e.ts());
             assert!(a.windows(2).all(|w| w[0].ts() <= w[1].ts()));
             assert_eq!(a.iter().map(|e| e.ts()).collect::<Vec<_>>(), b.iter().map(|e| e.ts()).collect::<Vec<_>>());
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b);
             // Also test identical timestamps (all passes skipped) and full u32 range
             if n > 0 {
                 let mut same = vec![CompactEv::new(42, 1); n];

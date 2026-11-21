@@ -1,6 +1,6 @@
 //! Parquet output for both tables. Owner: aggregate agent.
 //!
-//! user_daily: one file per worker chunk (split above MAX_ROWS), written in parallel.
+//! user_daily: row groups written in parallel into per-worker files.
 //! campaign_daily: one file. Both directories always get at least one file, even with
 //! zero rows.
 
@@ -8,11 +8,12 @@ pub mod parquet;
 
 use super::{CampRow, Tables, UserRow, NO_CATEGORY};
 use crate::types::Loaded;
-use parquet::FileBuilder;
+use parquet::{FileBuilder, RowGroupFile};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const USER_GROUP_ROWS: usize = 1 << 14;
 const MAX_ROWS: usize = 1 << 21;
 const MAX_COL_BYTES: usize = 1 << 29; // 512 MiB cap per page (well below Parquet i32::MAX limit)
 
@@ -31,8 +32,8 @@ pub struct UserCols {
     n: usize,
     ids: Vec<u8>,
     day: Vec<i32>,
-    sessions: Vec<i64>,
-    events: Vec<i64>,
+    sessions: Vec<u32>,
+    events: Vec<u32>,
     revenue: Vec<i64>,
     defs: Vec<u8>,
     top: Vec<u8>,
@@ -99,7 +100,7 @@ impl UserCols {
     }
     #[inline(always)]
     pub fn needs_flush(&self) -> bool {
-        self.n >= MAX_ROWS || self.ids.len() >= MAX_COL_BYTES || self.top.len() >= MAX_COL_BYTES
+        self.n >= USER_GROUP_ROWS || self.ids.len() >= MAX_COL_BYTES || self.top.len() >= MAX_COL_BYTES
     }
     #[inline(always)]
     pub fn push(
@@ -127,8 +128,8 @@ impl UserCols {
             self.ids.set_len(cur + 4 + ilen);
 
             self.day.as_mut_ptr().add(n).write(day);
-            self.sessions.as_mut_ptr().add(n).write(sessions as i64);
-            self.events.as_mut_ptr().add(n).write(events as i64);
+            self.sessions.as_mut_ptr().add(n).write(sessions);
+            self.events.as_mut_ptr().add(n).write(events);
             self.revenue.as_mut_ptr().add(n).write(revenue);
 
             let di = n >> 3;
@@ -153,15 +154,14 @@ impl UserCols {
     }
 }
 
-/// Streaming per-worker `user_daily` writer that splits parts before hitting `MAX_ROWS`
-/// or `MAX_COL_BYTES` so Parquet pages never overflow `i32::MAX`.
+/// Streams bounded row groups into one `user_daily` file per worker.
 pub struct UserWriter<'a> {
     dir: &'a Path,
     worker: usize,
-    seq: usize,
-    pub cols: UserCols,
+    cols: UserCols,
     file: FileBuilder,
-    pub total_written: usize,
+    stream: Option<RowGroupFile>,
+    total_written: usize,
 }
 
 impl<'a> UserWriter<'a> {
@@ -169,9 +169,9 @@ impl<'a> UserWriter<'a> {
         UserWriter {
             dir,
             worker,
-            seq: 0,
-            cols: UserCols::with_capacity(est_rows),
+            cols: UserCols::with_capacity(est_rows.min(USER_GROUP_ROWS)),
             file: FileBuilder::default(),
+            stream: None,
             total_written: 0,
         }
     }
@@ -185,24 +185,38 @@ impl<'a> UserWriter<'a> {
         revenue: i64,
         top: Option<&[u8]>,
     ) {
-        self.cols.push(id, day, sessions, events, revenue, top);
-        if self.cols.needs_flush() {
-            self.flush_part();
+        if self.push_group_row(id, day, sessions, events, revenue, top) {
+            self.flush_group();
         }
     }
+
+    #[inline(always)]
+    pub fn push_group_row(
+        &mut self,
+        id: &[u8],
+        day: i32,
+        sessions: u32,
+        events: u32,
+        revenue: i64,
+        top: Option<&[u8]>,
+    ) -> bool {
+        self.cols.push(id, day, sessions, events, revenue, top);
+        self.cols.needs_flush()
+    }
+
     #[cold]
-    fn flush_part(&mut self) {
-        if self.cols.len() == 0 {
-            return;
-        }
-        let path = self
-            .dir
-            .join(format!("part-{}-{}.parquet", self.worker, self.seq));
-        write_user_cols_to(&path, &mut self.cols, &mut self.file).expect("writing user_daily part");
+    pub fn flush_group(&mut self) {
+        debug_assert!(self.cols.len() > 0);
+        encode_user_cols(&mut self.cols, &mut self.file);
+        let stream = self.stream.get_or_insert_with(|| {
+            let name = format!("part-{}.parquet", self.worker);
+            RowGroupFile::create(&self.dir.join(name)).expect("creating user_daily part")
+        });
+        stream.append(&self.file).expect("writing user_daily row group");
         self.total_written += self.cols.len();
-        self.seq += 1;
         self.cols.clear();
     }
+
     /// Release completed column buffers on the thread that wrote the parts.
     pub fn release_buffers(&mut self) {
         debug_assert_eq!(self.cols.len(), 0);
@@ -211,16 +225,10 @@ impl<'a> UserWriter<'a> {
 
     pub fn finish(&mut self) -> usize {
         if self.cols.len() > 0 {
-            let path = if self.seq == 0 {
-                self.dir.join(format!("part-{}.parquet", self.worker))
-            } else {
-                self.dir
-                    .join(format!("part-{}-{}.parquet", self.worker, self.seq))
-            };
-            write_user_cols_to(&path, &mut self.cols, &mut self.file).expect("writing user_daily");
-            self.total_written += self.cols.len();
-            self.seq += 1;
-            self.cols.clear();
+            self.flush_group();
+        }
+        if let Some(stream) = self.stream.take() {
+            stream.finish().expect("writing user_daily footer");
         }
         self.file = FileBuilder::default();
         self.total_written
@@ -241,9 +249,9 @@ fn encode_user_cols(cols: &mut UserCols, file: &mut FileBuilder) {
     file.reset(cols.n);
     file.col_user_id(&cols.ids);
     file.col_date(&cols.day);
-    file.col_i64("sessions", &cols.sessions, true);
-    file.col_i64("events", &cols.events, true);
-    file.col_i64("revenue_cents", &cols.revenue, false);
+    file.col_u32("sessions", &cols.sessions);
+    file.col_u32("events", &cols.events);
+    file.col_user_revenue(&cols.revenue);
     file.col_category(&cols.defs, &cols.top);
 }
 
@@ -289,16 +297,16 @@ fn encode_campaign(rows: &[CampRow], campaigns: &[(Vec<u8>, Vec<u8>)], file: &mu
     file.col_date(&rows.iter().map(|row| row.day).collect::<Vec<_>>());
     let mut integers = Vec::with_capacity(rows.len());
     integers.extend(rows.iter().map(|row| row.cell.sessions));
-    file.col_i64("sessions", &integers, false);
+    file.col_i64("sessions", &integers);
     integers.clear();
     integers.extend(rows.iter().map(|row| row.cell.purchasing));
-    file.col_i64("purchasing_sessions", &integers, false);
+    file.col_i64("purchasing_sessions", &integers);
     integers.clear();
     integers.extend(rows.iter().map(|row| row.cell.revenue));
-    file.col_i64("revenue_cents", &integers, false);
+    file.col_i64("revenue_cents", &integers);
     integers.clear();
     integers.extend(rows.iter().map(|row| row.cell.assisted));
-    file.col_i64("assisted_sessions", &integers, false);
+    file.col_i64("assisted_sessions", &integers);
 }
 
 fn user_file(rows: &[UserRow], loaded: &Loaded) -> Vec<u8> {

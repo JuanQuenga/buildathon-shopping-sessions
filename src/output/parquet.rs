@@ -1,4 +1,4 @@
-//! Dependency-free Parquet v1 writer with one row group per file.
+//! Dependency-free Parquet v1 page and row group writer.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -54,6 +54,7 @@ impl Compression {
     }
 }
 
+#[derive(Clone)]
 struct ColMeta {
     name: &'static str,
     kind: Kind,
@@ -199,23 +200,8 @@ impl FileBuilder {
         }
     }
 
-    pub fn col_i64(&mut self, name: &'static str, vals: &[i64], use_dictionary: bool) {
+    pub fn col_i64(&mut self, name: &'static str, vals: &[i64]) {
         self.page.clear();
-        if use_dictionary {
-            if name == "sessions" {
-                if let Some((first, last)) = dense_indices(vals, &mut self.indices) {
-                    let dict: Vec<_> = (first..=last).collect();
-                    let kind = encode_integers(&dict, &mut self.page);
-                    self.write_dictionary(name, kind, dict.len(), None, Compression::None);
-                    return;
-                }
-            }
-            if let Some(dict) = integer_dictionary(vals, &mut self.indices, 0) {
-                let kind = encode_integers(&dict, &mut self.page);
-                self.write_dictionary(name, kind, dict.len(), None, Compression::None);
-                return;
-            }
-        }
         let kind = integer_kind(vals);
         if kind == Kind::Int32 && self.num_rows != 0 {
             write_i32_values(vals, &mut self.page);
@@ -228,6 +214,43 @@ impl FileBuilder {
         } else {
             self.write_plain(name, kind, super::bytes_of(vals));
         }
+    }
+
+    // Keep the physical schema fixed across groups, including counts above i32::MAX.
+    pub fn col_u32(&mut self, name: &'static str, vals: &[u32]) {
+        self.page.clear();
+        if vals.is_empty() {
+            self.write_plain(name, Kind::Int64, &[]);
+            return;
+        }
+        if name == "sessions" {
+            if let Some((first, last)) = dense_indices(vals, &mut self.indices) {
+                for value in first..=last {
+                    self.page.extend_from_slice(&value.to_le_bytes());
+                }
+                self.write_dictionary(
+                    name, Kind::Int64, (last - first + 1) as usize, None, Compression::None,
+                );
+                return;
+            }
+        }
+        if let Some(dict) = integer_dictionary(vals, &mut self.indices, 0) {
+            for &value in &dict {
+                self.page.extend_from_slice(&i64::from(value).to_le_bytes());
+            }
+            self.write_dictionary(name, Kind::Int64, dict.len(), None, Compression::None);
+        } else {
+            for &value in vals {
+                self.page.extend_from_slice(&i64::from(value).to_le_bytes());
+            }
+            self.write_buffered_plain(name, Kind::Int64);
+        }
+    }
+
+    pub fn col_user_revenue(&mut self, vals: &[i64]) {
+        self.add_data(
+            "revenue_cents", Kind::Int64, Compression::ZeroWords, None, Some(super::bytes_of(vals)),
+        );
     }
 
     pub fn col_user_id(&mut self, plain: &[u8]) {
@@ -401,7 +424,9 @@ impl FileBuilder {
     }
 
     pub fn finish(&mut self) -> &[u8] {
-        footer(&mut self.buf, self.num_rows, &self.cols);
+        let groups = std::iter::once((self.num_rows, self.cols.as_slice()))
+            .take(usize::from(self.num_rows != 0));
+        footer(&mut self.buf, self.num_rows, &self.cols, groups);
         &self.buf[self.start..]
     }
 
@@ -409,6 +434,56 @@ impl FileBuilder {
         self.finish();
         self.buf.drain(..self.start);
         self.buf
+    }
+}
+
+/// Writes independently encoded row groups while retaining only footer metadata.
+pub struct RowGroupFile {
+    file: std::fs::File,
+    end: usize,
+    rows: usize,
+    groups: Vec<(usize, Vec<ColMeta>)>,
+}
+
+impl RowGroupFile {
+    pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::fs::File::create(path)?,
+            end: 0,
+            rows: 0,
+            groups: Vec::new(),
+        })
+    }
+
+    pub fn append(&mut self, group: &FileBuilder) -> std::io::Result<()> {
+        use std::io::Write;
+        debug_assert!(self.groups.first().is_none_or(|(_, cols)| {
+            cols.len() == group.cols.len()
+                && cols.iter().zip(&group.cols).all(|(a, b)| a.kind == b.kind && a.name == b.name)
+        }));
+        let bytes = &group.buf[group.start..];
+        let skip = if self.groups.is_empty() { 0 } else { PAR1.len() };
+        self.file.write_all(&bytes[skip..])?;
+        let mut cols = group.cols.clone();
+        if skip != 0 {
+            let delta = self.end - skip;
+            for col in &mut cols {
+                col.data_offset += delta;
+                col.dictionary_offset = col.dictionary_offset.map(|offset| offset + delta);
+            }
+        }
+        self.end += bytes.len() - skip;
+        self.rows += group.num_rows;
+        self.groups.push((group.num_rows, cols));
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut tail = Vec::new();
+        let groups = self.groups.iter().map(|(rows, cols)| (*rows, cols.as_slice()));
+        footer(&mut tail, self.rows, &self.groups[0].1, groups);
+        self.file.write_all(&tail)
     }
 }
 
@@ -421,16 +496,6 @@ fn integer_kind(vals: &[i64]) -> Kind {
     } else {
         Kind::Int64
     }
-}
-
-fn encode_integers(vals: &[i64], out: &mut Vec<u8>) -> Kind {
-    let kind = integer_kind(vals);
-    if kind == Kind::Int32 {
-        write_i32_values(vals, out);
-    } else {
-        out.extend_from_slice(super::bytes_of(vals));
-    }
-    kind
 }
 
 fn write_i32_values(vals: &[i64], out: &mut Vec<u8>) {
@@ -778,7 +843,7 @@ fn snappy_user_ids(input: &[u8], out: &mut Vec<u8>) {
     snappy_literals(&input[literal..], out);
 }
 
-/// Scan pairs of PLAIN INT32 words. Each all-zero run can copy its first four bytes.
+/// Copy runs of zero words in PLAIN integer pages.
 fn snappy_zero_words(input: &[u8], out: &mut Vec<u8>) {
     out.reserve(input.len() * 3 / 4);
     uvarint(out, input.len() as u64);
@@ -861,7 +926,12 @@ fn snappy_copy(offset: usize, mut len: usize, out: &mut Vec<u8>) {
 }
 
 /// Appends FileMetaData, its length and the trailing magic.
-fn footer(out: &mut Vec<u8>, num_rows: usize, cols: &[ColMeta]) {
+fn footer<'a>(
+    out: &mut Vec<u8>,
+    num_rows: usize,
+    cols: &[ColMeta],
+    groups: impl ExactSizeIterator<Item = (usize, &'a [ColMeta])>,
+) {
     let footer_start = out.len();
     let num_rows = num_rows as i64;
     {
@@ -904,10 +974,9 @@ fn footer(out: &mut Vec<u8>, num_rows: usize, cols: &[ColMeta]) {
             tw.end();
         }
         tw.i64(3, num_rows);
-        if num_rows == 0 {
-            tw.list(4, CT_STRUCT, 0);
-        } else {
-            tw.list(4, CT_STRUCT, 1);
+        tw.list(4, CT_STRUCT, groups.len());
+        for (num_rows, cols) in groups {
+            let num_rows = num_rows as i64;
             tw.begin(None); // RowGroup
             tw.list(1, CT_STRUCT, cols.len());
             let mut uncompressed = 0i64;
@@ -1128,35 +1197,35 @@ mod tests {
     #[test]
     fn selects_i32_only_when_both_bounds_fit() {
         let mut file = FileBuilder::default();
-        for use_dictionary in [false, true] {
-            for (value, expected) in [
-                (i32::MIN as i64 - 1, Kind::Int64),
-                (i32::MIN as i64, Kind::Int32),
-                (i32::MAX as i64, Kind::Int32),
-                (i32::MAX as i64 + 1, Kind::Int64),
-            ] {
-                file.reset(2);
-                file.col_i64("sessions", &[0, value], use_dictionary);
-                assert_eq!(file.cols[0].kind, expected);
-                assert_eq!(file.cols[0].dictionary_offset.is_some(), use_dictionary);
-            }
+        for (value, expected) in [
+            (i32::MIN as i64 - 1, Kind::Int64),
+            (i32::MIN as i64, Kind::Int32),
+            (i32::MAX as i64, Kind::Int32),
+            (i32::MAX as i64 + 1, Kind::Int64),
+        ] {
+            file.reset(2);
+            file.col_i64("sessions", &[0, value]);
+            assert_eq!(file.cols[0].kind, expected);
+            assert_eq!(file.cols[0].dictionary_offset, None);
         }
     }
 
     #[test]
     fn dictionary_over_limit_falls_back_to_plain_snappy() {
-        let vals: Vec<_> = (0..=DICTIONARY_LIMIT as i64).collect();
+        let mut vals: Vec<_> = (0..DICTIONARY_LIMIT as u32).collect();
+        vals.push(u32::MAX);
         let mut file = FileBuilder::default();
         file.reset(DICTIONARY_LIMIT);
-        file.col_i64("events", &vals[..DICTIONARY_LIMIT], true);
+        file.col_u32("events", &vals[..DICTIONARY_LIMIT]);
         assert!(file.cols[0].dictionary_offset.is_some());
         file.reset(vals.len());
-        file.col_i64("events", &vals, true);
+        file.col_u32("events", &vals);
+        assert_eq!(file.cols[0].kind, Kind::Int64);
         assert_eq!(file.cols[0].dictionary_offset, None);
         assert_eq!(file.cols[0].codec, CODEC_SNAPPY);
         let expected: Vec<_> = vals
             .iter()
-            .flat_map(|&value| (value as i32).to_le_bytes())
+            .flat_map(|&value| i64::from(value).to_le_bytes())
             .collect();
         assert_eq!(decode_snappy(&file.compressed), expected);
     }
@@ -1184,7 +1253,7 @@ mod tests {
         let mut file = FileBuilder::default();
         file.reset(0);
         file.col_date(&[]);
-        file.col_i64("events", &[], true);
+        file.col_u32("events", &[]);
         file.col_category(&[], &[]);
         let bytes = file.finish();
         let footer_size = read_u32(&bytes[bytes.len() - 8..]) as usize;
