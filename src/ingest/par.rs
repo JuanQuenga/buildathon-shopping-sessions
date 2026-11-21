@@ -359,6 +359,13 @@ extern "C" {
     fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
 }
 
+/// End the process once all output files have been written and closed.
+pub fn exit_success() -> ! {
+    const SYS_EXIT_GROUP: std::ffi::c_long = 231; // Linux x86-64
+    unsafe { syscall(SYS_EXIT_GROUP, 0i32) };
+    std::process::abort();
+}
+
 /// Sample the first 256 KiB without waiting for disk I/O. Some filesystems
 /// don't implement RWF_NOWAIT, so an inconclusive probe leaves prefetch enabled.
 pub fn is_file_cached(fd: i32, len: u64) -> Option<bool> {
@@ -395,31 +402,7 @@ fn thp_enabled() -> &'static str {
 
 fn sink_thp() -> bool {
     static USE_THP: OnceLock<bool> = OnceLock::new();
-    *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => !matches!(thp_enabled(), "always" | "never") && probe_sink_thp(),
-    })
-}
-
-fn probe_sink_thp() -> bool {
-    let bytes = 8 * HUGE_PAGE_BYTES;
-    let Some((aligned, raw, len)) = map_aligned(bytes) else {
-        return false;
-    };
-    let fast = unsafe {
-        if madvise(aligned, bytes, 14) == 0 {
-            let start = Instant::now();
-            for offset in (0..bytes).step_by(HUGE_PAGE_BYTES) {
-                aligned.add(offset).write_volatile(1);
-            }
-            start.elapsed() < std::time::Duration::from_millis(8)
-        } else {
-            false
-        }
-    };
-    huge_free(raw, len);
-    fast
+    *USE_THP.get_or_init(|| std::env::var("INGEST_SINK_THP").as_deref() != Ok("0"))
 }
 
 pub fn diagnose(threads: usize, cache: Option<bool>, prefetch: usize) {
@@ -602,7 +585,13 @@ impl<T: Copy> Sinks<T> {
     pub fn new(parts: usize, cap: usize) -> Self {
         let pl = Self::per_line();
         let cap = cap.max(pl).div_ceil(pl) * pl;
-        let (a, p, l) = huge_alloc_ex(parts * cap * std::mem::size_of::<T>(), sink_thp());
+        let bytes = parts * cap * std::mem::size_of::<T>();
+        let (a, p, l) = huge_alloc_ex(bytes, sink_thp());
+        // Worker initialization touches each huge-page stride before parsing starts.
+        for offset in (0..bytes).step_by(HUGE_PAGE_BYTES) {
+            // The mapping belongs to this worker. This byte will be overwritten on use.
+            unsafe { a.add(offset).write_volatile(0) };
+        }
         Sinks {
             base: a as *mut T,
             raw: (p, l),

@@ -21,7 +21,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, Scope, ScopedJoinHandle};
-use std::time::Instant;
 
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
@@ -243,17 +242,11 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) -> bool
 
         let plan = PartitionPlan::new(&ctx, threads);
         match ingest_compact(&mut ctx, threads, &plan, &mut tm) {
-            Ok(deduped) => {
-                run_fused(&ctx, deduped, output_dir, threads, &mut tm);
-                true
-            }
+            Ok(deduped) => run_fused(&ctx, deduped, output_dir, threads, &mut tm),
             Err(Need::Wide) => {
                 eprintln!("[ingest] compact keys not applicable: retrying with wide keys");
                 match ingest_to_sinks::<false, u128>(&mut ctx, threads, &plan, &mut tm) {
-                    Ok(deduped) => {
-                        run_fused(&ctx, deduped, output_dir, threads, &mut tm);
-                        true
-                    }
+                    Ok(deduped) => run_fused(&ctx, deduped, output_dir, threads, &mut tm),
                     Err(_) => false,
                 }
             }
@@ -956,7 +949,12 @@ fn ingest_single_pass(
     let p2 = plan.p2;
     let dead = DeadEvents::new(&b_sinks, p2, threads);
     dedup_tokens(&tok_sinks, &dead, plan.p1, threads);
-    par::drop_par(threads, tok_sinks);
+    if ne_raw > 30_000_000 {
+        par::drop_par(threads, tok_sinks);
+    } else {
+        // The fused output path will release these mappings at process exit.
+        std::mem::forget(tok_sinks);
+    }
     tm.lap("dedup");
     Ok(Deduped { b_sinks, ck_sinks, p2, ne_raw, dead: Some(dead) })
 }
@@ -1190,12 +1188,12 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
 }
 
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
-fn run_fused<K: Key>(ctx: &Ctx<'_>, deduped: Deduped<K>, output_dir: &Path, threads: usize, tm: &mut Timer) {
+fn run_fused<K: Key>(ctx: &Ctx<'_>, deduped: Deduped<K>, output_dir: &Path, threads: usize, tm: &mut Timer) -> ! {
     let prof = std::env::var("INGEST_PROF").as_deref() == Ok("1");
     if prof {
-        group_fused::<K, GroupTimings>(ctx, deduped, output_dir, threads, tm);
+        group_fused::<K, GroupTimings>(ctx, deduped, output_dir, threads, tm)
     } else {
-        group_fused::<K, ()>(ctx, deduped, output_dir, threads, tm);
+        group_fused::<K, ()>(ctx, deduped, output_dir, threads, tm)
     }
 }
 
@@ -1248,7 +1246,7 @@ fn group_fused<K: Key, P: GroupProfile>(
     output_dir: &Path,
     threads: usize,
     tm: &mut Timer,
-) {
+) -> ! {
     let Deduped { b_sinks, ck_sinks, p2, ne_raw, dead } = deduped;
     let ud = output_dir.join("user_daily");
     let cd = output_dir.join("campaign_daily");
@@ -1460,7 +1458,7 @@ fn group_fused<K: Key, P: GroupProfile>(
     let ev_cnt_part = &ev_cnt_part;
     let ud_ref = &ud;
     let est_user_rows = ne / threads / 8 + 1024;
-    let workers: Vec<FusedWorker<'_, K, P>> = par::run_fini(
+    let mut workers: Vec<FusedWorker<'_, K, P>> = par::run_fini(
         threads,
         p2,
         |tid| FusedWorker {
@@ -1720,8 +1718,6 @@ fn group_fused<K: Key, P: GroupProfile>(
             drop(std::mem::take(&mut w.pid));
         },
     );
-    let arenas = b_sinks.into_iter().map(Ok).chain(ck_sinks.into_iter().map(Err));
-    par::drop_par(threads, arenas.collect());
     let np: usize = workers.iter().map(|w| w.np).sum();
     let nc: usize = workers.iter().map(|w| w.nc).sum();
     let user_rows_written: usize = workers.iter().map(|w| w.written).sum();
@@ -1738,17 +1734,14 @@ fn group_fused<K: Key, P: GroupProfile>(
         let [csr, sort, agg, write] = totals;
         eprintln!("[ingest-prof] cpu csr {csr:.6}s sort {sort:.6}s sessionize+agg {agg:.6}s user-finish {write:.6}s");
     }
-    let camp_rows = aggregate::merge_camps(workers.into_iter().map(|w| w.camp));
-    tm.lap("group+agg");
-    let t_cw = Instant::now();
-    output::write_campaign_raw(&cd, &camp_rows, &lookups.campaigns).expect("writing campaign_daily");
-    tm.lap("campaign-write");
-    eprintln!(
-        "[stage] campaign_write {:.3}s (user rows {user_rows_written}, campaign rows {})",
-        t_cw.elapsed().as_secs_f64(),
-        camp_rows.len()
+    // Move out the campaign stores while retaining worker allocations until exit.
+    let camp_rows = aggregate::merge_camps(
+        workers.iter_mut().map(|w| std::mem::replace(&mut w.camp, CampStore::new(0, 0, 0))),
     );
+    tm.lap("group+agg");
     eprintln!("[ingest] key={}B persons={np} events={ne} (raw {ne_raw}) clicks={nc}", std::mem::size_of::<K>());
+    output::write_campaign_raw(&cd, &camp_rows, &lookups.campaigns).expect("writing campaign_daily");
+    par::exit_success();
 }
 
 fn run<K: Key>(ctx: &mut Ctx<'_>, threads: usize, tm: &mut Timer) -> Result<Loaded, Need> {
