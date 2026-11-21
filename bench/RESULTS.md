@@ -1,6 +1,14 @@
 # Benchmark results
 
-## Please submit
+## Candidate 14a
+
+- Prediction before submission: 0.64 s official. The preserved cache-fast work in progress beat 12b2 by 53–72 ms in two interleaved native sessions. The Docker runtime and higher hardware branch-miss count add uncertainty.
+- Warm 20M native, eight pinned hardware threads. Seven-round medians were 0.706 s (12b2), 0.733 s (13c), and 0.653 s (14a). Five-round medians were 0.740 s, 0.753 s, and 0.668 s.
+- Cachegrind on dev reported 2,843,324 misses with a simulated 6 MiB last-level cache for 12b2 and 2,695,211 for 14a. With a separate 1 MiB last-level simulation, misses were 5,444,444 and 4,153,848. Cachegrind simulates L1 and one last-level cache per run.
+- The fast ingest pipeline uses 64 KiB reads at eight workers, direct link and common event parsing, shorter write-combining buffers, per-worker arena population, and dedup prefetch.
+- Native verification passed 61 release tests, 36 official fixtures, 32 adversarial cases, dev, six 1M datasets, 20M, all four 60M datasets, and forced generic dev. The largest dataset run peaked at 5,983 MiB RSS.
+
+## Candidate 13c
 
 - **Tag**: `candidate-13c` (HEAD on `main`, glibc bookworm) — **Prototype C VMA-uncontended pread + LocalAlloc slabs + L2-hot 4-wide AVX2 RelocMap + dynamic group+agg + fast `eid` & `links` direct parsers** (beats `candidate-12b2` on same-session interleaved local wall by **−71 ms** at **2.2× lower RSS** and **2.3× fewer faults**!).
   - **Root cause fixed vs `candidate-13b` (`38e9a39`, official `0.8135 s`)**:
@@ -21,6 +29,7 @@
 | `candidate-12b2` | `79d1dce` | **0.6811 s** | **CURRENT BEST** | Accepted exact output; 1-var `MADV_POPULATE_WRITE` on 12b (−8.5 ms vs 12b; local 4k wall 0.780 s) |
 | `candidate-12b` | `3889b4c` (`4ec2aa3`) | **0.6896 s** | 24 | Accepted exact output; 1-var unified arena reuse + `mallopt` (−30.9 ms vs 12a) |
 | `candidate-12a` | `bf812eb` (`c34c244`) | **0.7205 s** | 26 | Accepted exact output; −99.0 ms vs 11b from 1-var `group+agg` rework |
+| `candidate-13c` | `399f833` | **0.7492 s** | — | Accepted exact output |
 | `candidate-13b` | `38e9a39` | **0.8135 s** | — | Accepted exact output; Prototype C CPU/L2 overhaul (512 MiB RSS, local 4k wall 1.012 s; confirmed `official ≈ 0.19 + 0.63 × local_wall`) |
 | `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | — | Accepted exact output; direct specialized row parsers + co-partitioned L2 Links + `tok→reloc` reuse |
 | `candidate-11a` | `f6d8110` | **0.8678 s** | — | Accepted exact output; co-partitioned L2 Links + quote-bit SIMD scan + BMI2 PEXT keys |

@@ -36,11 +36,11 @@ pub enum PipelineArena {
 pub fn run_pipeline(data_dir: &Path, output_dir: &Path, threads: usize) -> Option<PipelineArena> {
     let slow_forced = std::env::var("INGEST_SLOW").map(|v| v == "1").unwrap_or(false);
     let generic_forced = std::env::var("INGEST_GENERIC").map(|v| v == "1").unwrap_or(false);
-    let no_proto_c = std::env::var("INGEST_NO_PROTO_C").map(|v| v == "1").unwrap_or(false);
+    let use_proto_c = std::env::var("INGEST_PROTO_C").map(|v| v == "1").unwrap_or(false);
     let dump_path = std::env::var("INGEST_DUMP").ok();
     if !slow_forced && dump_path.is_none() {
         if !generic_forced {
-            if !no_proto_c {
+            if use_proto_c {
                 match crate::proto_c::run_to_output(data_dir, output_dir, threads) {
                     Ok(arena) => return Some(PipelineArena::ProtoC(arena)),
                     Err(reason) if reason.starts_with("exact-order:") => {

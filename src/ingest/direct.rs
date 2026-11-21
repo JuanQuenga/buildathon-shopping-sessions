@@ -2,13 +2,40 @@
 //! bytes beyond the row, so each accepted field proves where its delimiter is.
 
 use super::{
-    parse_click, parse_event, scan, ts, tsfast, ParseRows, RecC, INVALID_CAMP, INVALID_CC,
+    fkey, flen, key_need, parse_click, parse_event, scan, ts, tsfast, Flag, ParseRows, RecC,
+    INVALID_CAMP, INVALID_CC,
 };
 use std::arch::x86_64::*;
 
 #[inline(always)]
 unsafe fn ld8(p: *const u8) -> u64 {
     p.cast::<u64>().read_unaligned()
+}
+
+/// Fast path for an unquoted 8- or 9-byte ASCII ID terminated by `DELIM` (`,` or `\n`).
+#[inline(always)]
+unsafe fn id_delim<const DELIM: u8>(p: *const u8) -> Option<(u64, *const u8)> {
+    let first = *p;
+    if first == b'"' {
+        return None;
+    }
+    let mut tail = ld8(p.add(1));
+    let len = if *p.add(9) == DELIM {
+        9
+    } else if *p.add(8) == DELIM {
+        tail &= 0x00FF_FFFF_FFFF_FFFF;
+        8
+    } else {
+        return None;
+    };
+    let filled = tail | if len == 8 { 0x3000_0000_0000_0000 } else { 0 };
+    if (first.wrapping_sub(0x30) >= 0x50)
+        | (((filled.wrapping_sub(0x3030_3030_3030_3030) | filled) & 0x8080_8080_8080_8080) != 0)
+    {
+        return None;
+    }
+    let key = (u64::from(first) << 56) | _pext_u64(tail.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
+    Some((key, p.add(len + 1)))
 }
 
 /// Locate the value and the expected closing delimiter of a comma-ended field.
@@ -23,21 +50,20 @@ unsafe fn ends(p: *const u8, len: usize, delim: u8, quoted: usize) -> bool {
     (*p.add(len) == delim) & ((quoted == 0) | (*p.add(len + 1) == b','))
 }
 
-#[inline(always)]
-unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
-    let (p, delim, quoted) = open(p);
+#[cold]
+#[inline(never)]
+unsafe fn id_quoted(p: *const u8) -> Option<(u64, *const u8)> {
+    let p = p.add(1);
     let first = *p;
     let mut tail = ld8(p.add(1));
-    let len = if ends(p, 9, delim, quoted) {
+    let len = if (*p.add(9) == b'"') & (*p.add(10) == b',') {
         9
-    } else if ends(p, 8, delim, quoted) {
+    } else if (*p.add(8) == b'"') & (*p.add(9) == b',') {
         tail &= 0x00FF_FFFF_FFFF_FFFF;
         8
     } else {
         return None;
     };
-    // Accept lanes in 0x30..=0x7f in one test. The first smaller lane
-    // sets its high bit on subtraction, even with cross-lane borrows.
     let filled = tail | if len == 8 { 0x3000_0000_0000_0000 } else { 0 };
     if (first.wrapping_sub(0x30) >= 0x50)
         | (((filled.wrapping_sub(0x3030_3030_3030_3030) | filled) & 0x8080_8080_8080_8080) != 0)
@@ -45,7 +71,16 @@ unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
         return None;
     }
     let key = (u64::from(first) << 56) | _pext_u64(tail.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
-    Some((key, p.add(len + 1 + quoted)))
+    Some((key, p.add(len + 2)))
+}
+
+#[inline(always)]
+unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
+    if *p != b'"' {
+        id_delim::<b','>(p)
+    } else {
+        id_quoted(p)
+    }
 }
 
 struct Tail {
@@ -101,16 +136,8 @@ pub(super) trait EventOutput {
     fn invalid(&mut self, eid: u64, ingest: u32);
 }
 
-/// On success, every field and the terminating LF have been checked before
-/// emitting. At the start of each field at least PAD bytes remain readable.
 #[inline(always)]
-unsafe fn event(
-    rows: &ParseRows<'_, u64>,
-    p: *const u8,
-    emit: &mut impl EventOutput,
-) -> Option<*const u8> {
-    let (eid, p) = id(p)?;
-    let (user, p) = id(p)?;
+unsafe fn event_ts_general(rows: &ParseRows<'_, u64>, p: *const u8) -> Option<(u32, u32, *const u8)> {
     let (p, delim, q) = open(p);
     let len = if *p.add(19) == b'Z' && ends(p, 20, delim, q) {
         20
@@ -126,7 +153,8 @@ unsafe fn event(
         return None;
     }
     let (t, ingest) = if len == 20 {
-        rows.dt.parse_f1_pair(p, ingest_p)?
+        let (es, is) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        (es * 1000, is)
     } else {
         (rows.dt.parse(p, len)?, rows.dt.parse_f1_sec(ingest_p, 20)?)
     };
@@ -136,7 +164,69 @@ unsafe fn event(
     if (ingest as u64 >= u32::MAX as u64 - 1) || ingest * 1000 - t > ts::DAY_MS {
         return None;
     }
-    let (p, delim, q) = open(ingest_p.add(21 + q));
+    Some(((t - rows.ws) as u32, (ingest + 1) as u32, ingest_p.add(21 + q)))
+}
+
+/// On success, every field and the terminating LF have been checked before
+/// emitting. At the start of each field at least PAD bytes remain readable.
+#[inline(always)]
+unsafe fn event(
+    rows: &ParseRows<'_, u64>,
+    p: *const u8,
+    emit: &mut impl EventOutput,
+) -> Option<*const u8> {
+    let (eid, p) = id(p)?;
+    let (user, p) = id(p)?;
+    // Ultra-fast common path: unquoted F1 ts + unquoted F1 ingest_ts (whole seconds).
+    let (ts_off, ingest, p) = if (*p != b'"') & (*p.add(19) == b'Z') & (*p.add(20) == b',') {
+        let ingest_p = p.add(21);
+        if (*ingest_p == b'"') | (*ingest_p.add(19) != b'Z') | (*ingest_p.add(20) != b',') {
+            return None;
+        }
+        let (ev_sec, ingest_sec) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        if (ingest_sec as u64 >= u32::MAX as u64 - 1) | (ingest_sec - ev_sec > 86_400) {
+            return None;
+        }
+        let ts_off = if rows.whole_sec_window {
+            if (ev_sec < rows.ws_sec) | (ev_sec >= rows.we_sec) {
+                return None;
+            }
+            ((ev_sec - rows.ws_sec) as u32).wrapping_mul(1000)
+        } else {
+            let t = ev_sec * 1000;
+            if (t < rows.ws) | (t >= rows.we) {
+                return None;
+            }
+            (t - rows.ws) as u32
+        };
+        (ts_off, (ingest_sec + 1) as u32, ingest_p.add(21))
+    } else {
+        event_ts_general(rows, p)?
+    };
+
+    // Fast unquoted view/cart (~95% of all rows): bypass wrapping() and purchase branch!
+    let word = p.cast::<u32>().read_unaligned();
+    if ((word == u32::from_le_bytes(*b"view")) | (word == u32::from_le_bytes(*b"cart")))
+        & (*p.add(4) == b',')
+    {
+        let p = p.add(5);
+        let tail = tail(p)?;
+        if tail.quotes == 0 {
+            if tail.comma == 0 {
+                return None;
+            }
+            emit.valid(eid, ingest, user, ts_off, 0);
+            return Some(p.add(tail.lf + 1));
+        }
+        let (qp, _) = tail.wrapping()?;
+        if tail.comma == 2 * qp {
+            return None;
+        }
+        emit.valid(eid, ingest, user, ts_off, 0);
+        return Some(p.add(tail.lf + 1));
+    }
+
+    let (p, delim, q) = open(p);
     let word = p.cast::<u32>().read_unaligned();
     let (purchase, p) = if ((word == u32::from_le_bytes(*b"view"))
         | (word == u32::from_le_bytes(*b"cart")))
@@ -167,7 +257,7 @@ unsafe fn event(
     } else {
         0
     };
-    emit.valid(eid, (ingest + 1) as u32, user, (t - rows.ws) as u32, cc);
+    emit.valid(eid, ingest, user, ts_off, cc);
     Some(p.add(tail.lf + 1))
 }
 
@@ -180,7 +270,11 @@ unsafe fn click(
     let (cid, p) = id(p)?;
     let (person, p) = id(p)?;
     let tail = tail(p)?;
-    let (qc, qt) = tail.wrapping()?;
+    let (qc, qt) = if tail.quotes == 0 {
+        (0, 0)
+    } else {
+        tail.wrapping()?
+    };
     let end = p.add(tail.lf + 1);
     let campaign = rows.lookups.camp.get(p.add(qc), tail.comma - 2 * qc);
     if campaign == INVALID_CAMP {
@@ -199,6 +293,60 @@ unsafe fn click(
         }
     }
     Some(end)
+}
+
+#[inline(always)]
+unsafe fn link(p: *const u8, emit: &mut impl FnMut(u64, u64)) -> Option<*const u8> {
+    let (a, p) = id_delim::<b','>(p)?;
+    let (b, p) = id_delim::<b'\n'>(p)?;
+    emit(a, b);
+    Some(p)
+}
+
+#[cold]
+#[inline(never)]
+fn link_slow(
+    flag: &Flag,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    emit: &mut impl FnMut(u64, u64),
+) -> usize {
+    row_fields::<2>(buf, lo, hi, |f| {
+        if flen(f[0]) == 0 || flen(f[1]) == 0 {
+            return;
+        }
+        match (fkey::<u64>(buf, f[0]), fkey::<u64>(buf, f[1])) {
+            (Some(a), Some(b)) => emit(a, b),
+            (None, _) => flag.set(key_need(f[0])),
+            (_, None) => flag.set(key_need(f[1])),
+        }
+    })
+}
+
+#[inline]
+pub(super) fn links(
+    flag: &Flag,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    mut emit: impl FnMut(u64, u64),
+) {
+    if lo >= hi {
+        return;
+    }
+    assert!(hi < u32::MAX as usize && buf.len() >= hi + scan::PAD && buf[hi - 1] == b'\n');
+    let base = buf.as_ptr();
+    let mut p = unsafe { base.add(lo) };
+    let end = unsafe { base.add(hi) };
+    while p < end {
+        p = unsafe {
+            match link(p, &mut emit) {
+                Some(next) => next,
+                None => base.add(link_slow(flag, buf, p.offset_from(base) as usize, hi, &mut emit)),
+            }
+        };
+    }
 }
 
 fn row_fields<const N: usize>(
@@ -359,6 +507,9 @@ mod tests {
             dt: &dt,
             ws,
             we,
+            ws_sec: ws / 1000,
+            we_sec: we / 1000,
+            whole_sec_window: ws % 1000 == 0 && we % 1000 == 0,
             lookups: &lookups,
             plan: &plan,
             flag: &flag,

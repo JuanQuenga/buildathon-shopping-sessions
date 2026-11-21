@@ -614,6 +614,26 @@ impl SinkArena {
         };
         (Self { bytes: offset, ..self }, rest)
     }
+
+    /// Batch-populate writable anonymous pages in 4 MiB chunks (Linux >= 5.14).
+    /// Falls back silently to demand paging on older kernels (EINVAL).
+    pub(super) fn populate_write(&self) {
+        if std::env::var("INGEST_NO_POPULATE").as_deref() == Ok("1") {
+            return;
+        }
+        const MADV_POPULATE_WRITE: i32 = 23;
+        const CHUNK: usize = 4 << 20;
+        let lo = (self.base as usize).next_multiple_of(4096);
+        let hi = (self.base as usize + self.bytes) & !4095;
+        let mut off = lo;
+        while off < hi {
+            let len = (hi - off).min(CHUNK);
+            if unsafe { madvise(off as *mut u8, len, MADV_POPULATE_WRITE) } != 0 {
+                break;
+            }
+            off += len;
+        }
+    }
 }
 
 /// The unallocated tail of an exclusively borrowed arena. Typed allocations
@@ -793,9 +813,11 @@ impl<T: Copy> Sinks<T> {
     #[inline(always)]
     const fn per_line() -> usize {
         match std::mem::size_of::<T>() {
-            16 | 24 | 40 => 8,
-            32 | 48 => 4,
-            64 => 2,
+            16 => 4,       // 64 B = 1 cache line (halves SWCB L1/L2 footprint!)
+            24 | 40 => 8,  // 192 B / 320 B (smallest multiple of 64 B)
+            32 => 2,       // 64 B = 1 cache line
+            48 => 4,       // 192 B
+            64 => 1,       // 64 B = 1 cache line
             _ => panic!("unsupported sink record size"),
         }
     }

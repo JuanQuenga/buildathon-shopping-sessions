@@ -31,7 +31,7 @@ const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
 const DAY_MS_U32: u32 = ts::DAY_MS as u32;
-const CHUNK: u64 = 256 << 10;
+const CHUNK: u64 = 64 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
@@ -168,20 +168,6 @@ struct Ctx<'scope> {
     p1_bits_override: Option<u32>,
 }
 
-#[inline(always)]
-fn scan_chunk<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
-    files: &[FileInfo],
-    c: Chunk,
-    buf: &mut Vec<u8>,
-    f: F,
-) {
-    let fi = &files[c.file as usize];
-    let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
-    if lo < hi {
-        scan::scan::<N, F>(buf, lo, hi, f);
-    }
-}
-
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
 }
@@ -205,9 +191,10 @@ fn build_ctx<'scope, 'env>(
         Lookups { categories, campaigns, prod, camp }
     })));
     let prefetch = par::Prefetch::start(&files, threads);
+    let default_chunk = if threads <= 4 { 128 << 10 } else { CHUNK };
     let chunk_bytes = env_usize("INGEST_CHUNK_KB")
         .map(|kb| (kb.clamp(32, 4096) as u64) << 10)
-        .unwrap_or(CHUNK);
+        .unwrap_or(default_chunk);
     let chunks = scan::plan(&files, chunk_bytes);
     let link_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Links).collect();
     let main_chunks = chunks.iter().copied().filter(|c| files[c.file as usize].kind != Kind::Links).collect();
@@ -311,6 +298,7 @@ type CanonicalPart<'a, K> = (usize, ArenaVec<'a, (K, K)>);
 fn read_links<'a, K: Key>(
     ctx: &Ctx<'_>, threads: usize, tm: &mut Timer, scratch: &mut Scratch<'_>,
     canonical_space: &mut Scratch<'a>, partition_bits: u32,
+    scan_buf: impl Fn(&Flag, &[u8], usize, usize, &mut ArenaVec<'_, (K, K)>) + Sync,
 ) -> Result<Vec<CanonicalPart<'a, K>>, Need> {
     let flag = Flag(AtomicU8::new(0));
     let files = &ctx.files;
@@ -338,16 +326,12 @@ fn read_links<'a, K: Key>(
                     return;
                 }
                 let mut pairs = std::mem::take(&mut *pairs[i].lock().unwrap());
-                scan_chunk::<2, _>(files, chunks[i], buf, |b, f| {
-                    if flen(f[0]) == 0 || flen(f[1]) == 0 {
-                        return;
-                    }
-                    match (fkey::<K>(b, f[0]), fkey::<K>(b, f[1])) {
-                        (Some(a), Some(c)) => pairs.push((a, c)),
-                        (None, _) => flag.set(key_need(f[0])),
-                        (_, None) => flag.set(key_need(f[1])),
-                    }
-                });
+                let c = chunks[i];
+                let fi = &files[c.file as usize];
+                let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
+                if lo < hi {
+                    scan_buf(&flag, buf, lo, hi, &mut pairs);
+                }
                 if !pairs.is_empty() {
                     parsed.push((i, pairs));
                 }
@@ -455,7 +439,7 @@ impl PartitionPlan {
         let est_ev = (ctx.event_bytes / 80) as usize + 1024;
         let est_ck = (ctx.click_bytes / 48) as usize + 1024;
         let parse_threads = if ctx.parse_threads > 0 { ctx.parse_threads.clamp(1, MAX_THREADS) } else { threads };
-        // Keep the write buffers small enough for sibling threads sharing L2.
+        // Keep SWCBs L1/L2-resident and DedupTable at <=35% load inside 512 KiB L2 on Cascade Lake.
         let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 11 });
         let p2_bits = env_usize("INGEST_P2_BITS").map(|b| b.clamp(8, 10) as u32)
             .unwrap_or(if est_ev <= 30_000_000 { 8 } else { 10 });
@@ -463,8 +447,8 @@ impl PartitionPlan {
         let p2 = 1 << p2_bits;
         Self {
             parse_threads, p1_bits, p2_bits, p1, p2,
-            cap_ev: est_ev * 112 / 100 / parse_threads / p1 + 24,
-            cap_ck: est_ck * 112 / 100 / parse_threads / p2 + 24,
+            cap_ev: est_ev * 107 / 100 / parse_threads / p1 + 24,
+            cap_ck: est_ck * 108 / 100 / parse_threads / p2 + 24,
         }
     }
 }
@@ -473,6 +457,9 @@ struct ParseRows<'a, K: Key> {
     dt: &'a DateTable,
     ws: i64,
     we: i64,
+    ws_sec: i64,
+    we_sec: i64,
+    whole_sec_window: bool,
     lookups: &'a Lookups,
     plan: &'a PartitionPlan,
     flag: &'a Flag,
@@ -634,7 +621,18 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
     let p2_shift = 64 - plan.p2_bits;
     let parse_threads = plan.parse_threads;
     let links = links.filter(|l| l.has_links);
-    let rows = ParseRows { dt, ws, we, lookups, plan, flag: &flag, links };
+    let rows = ParseRows {
+        dt,
+        ws,
+        we,
+        ws_sec: ws / 1000,
+        we_sec: we / 1000,
+        whole_sec_window: ws % 1000 == 0 && we % 1000 == 0,
+        lookups,
+        plan,
+        flag: &flag,
+        links,
+    };
 
     struct ParseState<E, C> {
         ev: E,
@@ -679,7 +677,18 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(
     plan: &PartitionPlan,
     tm: &mut Timer,
 ) -> Result<Deduped<K>, Need> {
-    let pairs = read_links(ctx, threads, tm, &mut Scratch::default(), &mut Scratch::default(), LP_BITS)?;
+    let pairs = read_links(ctx, threads, tm, &mut Scratch::default(), &mut Scratch::default(), LP_BITS, |flag, buf, lo, hi, pairs| {
+        scan::scan::<2, _>(buf, lo, hi, |b, f| {
+            if flen(f[0]) == 0 || flen(f[1]) == 0 {
+                return;
+            }
+            match (fkey::<K>(b, f[0]), fkey::<K>(b, f[1])) {
+                (Some(a), Some(c)) => pairs.push((a, c)),
+                (None, _) => flag.set(key_need(f[0])),
+                (_, None) => flag.set(key_need(f[1])),
+            }
+        });
+    })?;
     let links = Links::<K>::from_pairs(&pairs, threads);
     drop(pairs);
     tm.lap("links-uf");
@@ -842,7 +851,7 @@ impl DedupTable {
             let (sl, base) = active[i];
             unsafe { sl.get_unchecked((idx - base) as usize) }
         };
-        let cap = (total * 2).next_power_of_two();
+        let cap = (total * 2).next_power_of_two().max(16);
         let mask = cap - 1;
 
         if total < (1 << 18) - 1 {
@@ -851,10 +860,34 @@ impl DedupTable {
             }
             let table = &mut self.t32[..cap];
             table.fill(0);
+            let tptr = table.as_ptr();
             let mut flat = 0u32;
+            const PF: usize = 8;
+            let mut hring = [0u32; PF];
             for &(sl, _) in active {
-                for r in sl {
-                    let h = r.hash32();
+                let n = sl.len();
+                let pre = n.min(PF);
+                for i in 0..pre {
+                    let h = unsafe { sl.get_unchecked(i) }.hash32();
+                    hring[i] = h;
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                            tptr.add((h as usize) & mask).cast(),
+                        );
+                    }
+                }
+                for i in 0..n {
+                    let h = hring[i & (PF - 1)];
+                    if i + PF < n {
+                        let nh = unsafe { sl.get_unchecked(i + PF) }.hash32();
+                        hring[i & (PF - 1)] = nh;
+                        unsafe {
+                            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                                tptr.add((nh as usize) & mask).cast(),
+                            );
+                        }
+                    }
+                    let r = unsafe { sl.get_unchecked(i) };
                     let fp = h >> 18; // 14-bit fingerprint
                     let mut slot = (h as usize) & mask;
                     loop {
@@ -1049,7 +1082,7 @@ impl<'a> RelocationMap<'a> {
     fn prefetch_slot(&self, key: u64) -> usize {
         let slot = key.h() as usize & self.mask;
         unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
                 self.buckets.as_ptr().add(slot).cast(),
             );
         }
@@ -1176,11 +1209,12 @@ struct Relocated<K: Key> {
 fn ingest_single_pass(
     ctx: &mut Ctx<'_>, threads: usize, plan: &PartitionPlan, tm: &mut Timer,
 ) -> Result<Deduped<u64>, Need> {
-    let cap_b = (plan.cap_ev - 24) * plan.p1 / plan.p2 + 32;
+    let est_ev = (ctx.event_bytes / 80) as usize + 1024;
+    let workers = plan.parse_threads;
+    let cap_b = est_ev * 103 / 100 / workers / plan.p2 + 32;
     let tok_bytes = Sinks::<Tok>::arena_bytes(plan.p1, plan.cap_ev);
     let event_bytes = Sinks::<RecB<u64>>::arena_bytes(plan.p2, cap_b);
     let click_bytes = Sinks::<RecC<u64>>::arena_bytes(plan.p2, plan.cap_ck);
-    let workers = plan.parse_threads;
     let parse_bytes = (tok_bytes + event_bytes + click_bytes) * workers;
     // A typical compact link occupies about as many CSV bytes as its
     // canonical pair. Unusually dense files can fall back to the heap.
@@ -1191,7 +1225,9 @@ fn ingest_single_pass(
     let (mut bucket_space, arena) = arena.split_at(link_bytes);
     let (mut tokens, mut arena) = arena.split_at(tok_bytes * workers);
     let pairs = read_links(ctx, threads, tm, &mut tokens.scratch(),
-        &mut bucket_space.scratch(), plan.p2_bits)?;
+        &mut bucket_space.scratch(), plan.p2_bits, |flag, buf, lo, hi, pairs| {
+            direct::links(flag, buf, lo, hi, |a, b| pairs.push((a, b)));
+        })?;
     let has_links = !pairs.is_empty();
     let links = BucketLinks::new(pairs, plan.p2);
     tm.lap("links-uf");
@@ -1206,6 +1242,9 @@ fn ingest_single_pass(
     }
     let result = parse_sinks::<false, u64, SinglePass>(ctx, plan, None, |tid| {
         let (tok, events, clicks) = slices[tid].lock().unwrap().take().unwrap();
+        tok.populate_write();
+        events.populate_write();
+        clicks.populate_write();
         let events = SinglePass {
             tok: Sinks::in_arena(plan.p1, plan.cap_ev, tok),
             b: Sinks::in_arena(plan.p2, cap_b, events),
@@ -1680,7 +1719,7 @@ fn sort_ev_slice(slice: &mut [CompactEv], tmp: &mut ArenaVec<'_, CompactEv>) {
     if n <= 1 {
         return;
     }
-    if n <= 16 {
+    if n <= 24 {
         insertion_sort_ev(slice);
     } else if n <= 256 {
         slice.sort_unstable();
