@@ -9,6 +9,7 @@
 pub mod csv;
 pub mod fast;
 pub mod generic;
+mod io;
 pub mod key;
 pub mod keys;
 pub mod par;
