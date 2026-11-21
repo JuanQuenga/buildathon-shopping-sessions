@@ -14,8 +14,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
-        .min(4);
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
     if let Ok(p) = std::env::var("INGEST_BENCH") {
         ingest::bench(std::path::Path::new(&p));
         return;
