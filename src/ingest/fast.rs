@@ -3,7 +3,7 @@
 //! caller then uses the generic slow path) if neither can carry the input exactly.
 //! Pipeline (docs/ingest.md):
 //!   links  : parse -> flat parallel scatter/intern -> parallel union-find -> canonical maps + L3 Bloom
-//!   parse  : chunked input + SIMD scan; event tokens -> P1 by event id; valid
+//!   parse  : chunked pread + SIMD scan; event tokens -> P1 by event id; valid
 //!            events and clicks -> P2 by canonical person (prefetched through Links)
 //!   dedup  : per P1 partition, exact open addressing marks loser locations in P2
 //!   group  : per P2 partition, skip losers, build CSR and sort by timestamp
@@ -27,7 +27,7 @@ const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
 const DAY_MS_U64: u64 = ts::DAY_MS as u64;
-const CHUNK: u64 = 1 << 20;
+const CHUNK: u64 = 256 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
@@ -336,7 +336,7 @@ fn read_links<K: Key>(ctx: &Ctx<'_>, threads: usize, tm: &mut Timer) -> Result<L
     }
     tm.lap("links-parse");
     let links = Links::build(&link_pairs, threads);
-    par::drop_par(threads, link_pairs);
+    drop(link_pairs);
     tm.lap("links-uf");
 
     // ---------------- Events + clicks parse ----------------
@@ -366,8 +366,8 @@ impl PartitionPlan {
         let p2 = 1 << p2_bits;
         Self {
             parse_threads, p1_bits, p2_bits, p1, p2,
-            cap_ev: est_ev * 104 / 100 / parse_threads / p1 + 24,
-            cap_ck: est_ck * 104 / 100 / parse_threads / p2 + 24,
+            cap_ev: est_ev * 112 / 100 / parse_threads / p1 + 24,
+            cap_ck: est_ck * 112 / 100 / parse_threads / p2 + 24,
         }
     }
 }
@@ -411,7 +411,6 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
     }
     tm.lap("small-wait");
     let main_chunks = &ctx.main_chunks;
-    let mappings = scan::InputMappings::new(files, main_chunks);
     let chunk_bytes = ctx.chunk_bytes;
     let PartitionPlan { parse_threads, p1_bits, p2_bits, p2, cap_ck, .. } = *plan;
 
@@ -442,16 +441,14 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
             buf: Vec::with_capacity(chunk_bytes as usize + 8192),
         },
         |st, i| {
-            let c = main_chunks[i];
-            // The inputs are read-only and the pool takes each planned index once.
-            let mapping = unsafe { mappings.lease(c) };
             if flag.get().is_some() {
                 return;
             }
+            let c = main_chunks[i];
             let fi = &files[c.file as usize];
             let mut buf = std::mem::take(&mut st.buf);
             match fi.kind {
-                Kind::Events => mapping.scan::<7, _>(&mut buf, |b, f| {
+                Kind::Events => scan_chunk::<7, _>(files, c, &mut buf, |b, f| {
                     if let Err(n) = parse_event::<ALL_CAT, K>(
                         dt, b, f, ws, we, &lookups.prod, p1_bits, |p, rec| st.ev.push(p, rec, links, plan, &flag),
                     ) {
@@ -461,7 +458,7 @@ fn parse_sinks<const ALL_CAT: bool, K: Key, E: EventSink<K>>(
                 Kind::Clicks => {
                     let ck_base = ws - WEEK_MS;
                     let has_links = links.has_links;
-                    mapping.scan::<4, _>(&mut buf, |b, f| {
+                    scan_chunk::<4, _>(files, c, &mut buf, |b, f| {
                         if flen(f[0]) == 0 || flen(f[1]) == 0 {
                             return;
                         }
@@ -550,7 +547,7 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(
 
     // ---------------- Event dedup ----------------
     let ne_raw: usize = (0..p1).map(|p| ev_sinks.iter().map(|s| s.count(p)).sum::<usize>()).sum();
-    let cap_b = ne_raw * 104 / 100 / threads / p2 + 32;
+    let cap_b = ne_raw * 112 / 100 / threads / p2 + 32;
     struct DedupState<K: Key> {
         table: DedupTable,
         dead: Vec<u64>,
@@ -849,7 +846,7 @@ impl SinglePass {
 
 impl EventSink<u64> for SinglePass {
     fn new(tid: usize, plan: &PartitionPlan) -> Self {
-        let cap_b = (plan.cap_ev - 24) * plan.p1 * 95 / 100 / plan.p2 + 32;
+        let cap_b = (plan.cap_ev - 24) * plan.p1 / plan.p2 + 32;
         Self {
             tok: Sinks::new(plan.p1, plan.cap_ev),
             b: Sinks::new(plan.p2, cap_b),
@@ -1316,6 +1313,7 @@ fn group_fused<K: Key, P: GroupProfile>(
         // Counters
         np: usize,
         nc: usize,
+        written: usize,
         profile: P,
     }
 
@@ -1462,14 +1460,7 @@ fn group_fused<K: Key, P: GroupProfile>(
     let ev_cnt_part = &ev_cnt_part;
     let ud_ref = &ud;
     let est_user_rows = ne / threads / 8 + 1024;
-    struct FinishedWorker<P> {
-        camp: CampStore,
-        np: usize,
-        nc: usize,
-        written: usize,
-        profile: P,
-    }
-    let workers = par::run_finish(
+    let workers: Vec<FusedWorker<'_, K, P>> = par::run_fini(
         threads,
         p2,
         |tid| FusedWorker {
@@ -1497,6 +1488,7 @@ fn group_fused<K: Key, P: GroupProfile>(
             active: Vec::with_capacity(64),
             np: 0,
             nc: 0,
+            written: 0,
             profile: P::default(),
         },
         |w, idx| {
@@ -1716,12 +1708,16 @@ fn group_fused<K: Key, P: GroupProfile>(
                 w.profile.end(GroupPhase::Aggregate);
             }
         },
-        |mut w| {
+        |w| {
             w.profile.start();
-            let written = w.writer.finish();
+            w.written = w.writer.finish();
             w.profile.end(GroupPhase::Write);
-            let FusedWorker { camp, np, nc, profile, .. } = w;
-            FinishedWorker { camp, np, nc, written, profile }
+            w.writer.release_buffers();
+            drop(std::mem::take(&mut w.ev_buf));
+            drop(std::mem::take(&mut w.ev_tmp));
+            drop(std::mem::take(&mut w.cl_buf));
+            drop(std::mem::take(&mut w.cl_raw));
+            drop(std::mem::take(&mut w.pid));
         },
     );
     let arenas = b_sinks.into_iter().map(Ok).chain(ck_sinks.into_iter().map(Err));
@@ -2154,7 +2150,7 @@ impl<K: Key> Links<K> {
         .into_iter()
         .flat_map(|x| x.0)
         .collect();
-        par::drop_par(threads, scattered);
+        drop(scattered);
         keys_parts.sort_unstable_by_key(|x| x.0);
         let mut base = vec![0u32; LP + 1];
         for p in 0..LP {
@@ -2186,7 +2182,7 @@ impl<K: Key> Links<K> {
                 }
             });
         }
-        par::drop_par(threads, keys_parts);
+        drop(keys_parts);
 
         // 4. Parallel lock-free union-find + smallest key per root.
         let node = |code: u64| base[(code >> 32) as usize] + code as u32;
@@ -2200,6 +2196,7 @@ impl<K: Key> Links<K> {
                 }
             }
         });
+        drop(ep);
         par::run(threads, nn.div_ceil(step), |_| (), |_, t| {
             for i in t * step..((t + 1) * step).min(nn) {
                 let r = uf_find(parent_ref, i as u32) as usize;
@@ -2232,18 +2229,9 @@ impl<K: Key> Links<K> {
         .into_iter()
         .flatten()
         .collect();
-        // Each union-find allocation can be released independently.
-        let node_arrays = vec![
-            (Some(ep), None, None),
-            (None, Some(keys), None),
-            (None, None, Some(parent)),
-            (None, None, Some(best)),
-        ];
-        par::drop_par(threads, node_arrays);
         let total_mapped: usize = canon_parts.iter().map(|x| x.1.len()).sum();
         eprintln!("[ingest] links={nl} linked_ids={nn} mapped={total_mapped}");
         if total_mapped == 0 {
-            par::drop_par(threads, canon_parts);
             return Links::empty();
         }
         let max_cnt = canon_parts.iter().map(|x| x.1.len()).max().unwrap_or(0);
@@ -2270,7 +2258,6 @@ impl<K: Key> Links<K> {
                 }
             }
         });
-        par::drop_par(threads, canon_parts);
         Links { has_links: true, base: a as *mut (K, K), raw: (raw_p, raw_l), part_bits, part_mask }
     }
 

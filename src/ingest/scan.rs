@@ -1,11 +1,9 @@
-//! LF-aligned input chunks and an L1/L2-tiled SIMD structural scanner that
-//! yields well-formed rows' unquoted field ranges.
+//! LF-aligned chunked reading (pread into a thread-local padded buffer without
+//! redundant zeroing) and an L1/L2-tiled SIMD structural scanner that yields
+//! well-formed rows' unquoted field ranges.
 use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 pub const PAD: usize = 64;
 const TILE: usize = 24 * 1024;
@@ -715,130 +713,6 @@ fn scan_tile_stage2<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
     }
 }
 
-extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-}
-
-/// Lazily map input files and release each one on its last scanning worker.
-pub(super) struct InputMappings<'a> {
-    files: &'a [FileInfo],
-    mappings: Vec<FileMapping>,
-}
-
-impl<'a> InputMappings<'a> {
-    pub(super) fn new(files: &'a [FileInfo], chunks: &[Chunk]) -> Self {
-        let mut counts = vec![0usize; files.len()];
-        for c in chunks {
-            counts[c.file as usize] += 1;
-        }
-        let mappings = files.iter().zip(counts).map(|(file, count)| {
-            FileMapping {
-                base: OnceLock::new(),
-                remaining: AtomicUsize::new(count),
-                len: file.len,
-            }
-        }).collect();
-        Self { files, mappings }
-    }
-
-    /// # Safety
-    /// The chunk must come from this plan and may be leased at most once.
-    /// The file must remain unchanged until all its leases finish.
-    pub(super) unsafe fn lease(&self, chunk: Chunk) -> ChunkMapping<'_> {
-        let index = chunk.file as usize;
-        ChunkMapping {
-            file: &self.files[index],
-            mapping: &self.mappings[index],
-            chunk,
-        }
-    }
-}
-
-struct FileMapping {
-    base: OnceLock<AtomicPtr<u8>>,
-    remaining: AtomicUsize,
-    len: u64,
-}
-
-impl FileMapping {
-    fn unmap(&self) {
-        if let Some(base) = self.base.get() {
-            let ptr = base.swap(std::ptr::null_mut(), Ordering::Relaxed);
-            if !ptr.is_null() {
-                // This mapping is dedicated to this file and has no remaining readers.
-                unsafe { munmap(ptr, self.len as usize) };
-            }
-        }
-    }
-}
-
-impl Drop for FileMapping {
-    fn drop(&mut self) {
-        self.unmap();
-    }
-}
-
-pub(super) struct ChunkMapping<'a> {
-    file: &'a FileInfo,
-    mapping: &'a FileMapping,
-    chunk: Chunk,
-}
-
-impl Drop for ChunkMapping<'_> {
-    fn drop(&mut self) {
-        // Each task holds a lease until its callback finishes. The last task
-        // acquires the preceding lease releases before unmapping the file.
-        if self.mapping.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.mapping.unmap();
-        }
-    }
-}
-
-impl ChunkMapping<'_> {
-    #[inline(always)]
-    pub(super) fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(
-        &self,
-        buf: &mut Vec<u8>,
-        f: F,
-    ) {
-        // The buffered reader provides padding and handles an unterminated
-        // final row. Mapped chunks use only readable bytes within the file.
-        let file = self.file;
-        let c = self.chunk;
-        let start = c.start.saturating_sub(1) as usize;
-        if file.len <= isize::MAX as u64 && c.end + (PAD as u64) < file.len {
-            let base = self.mapping.base.get_or_init(|| {
-                const PROT_READ: i32 = 1;
-                const MAP_PRIVATE: i32 = 2;
-                let ptr = unsafe {
-                    mmap(std::ptr::null_mut(), file.len as usize, PROT_READ, MAP_PRIVATE, file.handle.as_raw_fd(), 0)
-                };
-                AtomicPtr::new(if ptr as isize == -1 { std::ptr::null_mut() } else { ptr })
-            }).load(Ordering::Relaxed);
-            if !base.is_null() {
-                // Input is immutable for the run. The chunk lease prevents concurrent unmapping.
-                let data = unsafe { std::slice::from_raw_parts(base.add(start), file.len as usize - start) };
-                let own_end = c.end as usize - start;
-                let Some(lo) = memchr(b'\n', data).map(|i| i + 1) else {
-                    return;
-                };
-                if lo >= own_end {
-                    return;
-                }
-                if let Some(end) = memchr(b'\n', &data[own_end - 1..]).map(|i| i + own_end) {
-                    if end < u32::MAX as usize && end + PAD <= data.len() {
-                        scan::<N, F>(&data[..end + PAD], lo, end, f);
-                        return;
-                    }
-                }
-            }
-        }
-        let (lo, hi) = read_chunk(&file.handle, file.len, c, buf);
-        scan::<N, F>(buf, lo, hi, f);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,55 +724,6 @@ mod tests {
         scan::<N, _>(&buf, 0, hi, |b, f| out.push(f.iter().map(|&(s, e)| b[s as usize..e as usize].to_vec()).collect()));
         out
     }
-    #[test]
-    fn mapped_chunks_match_pread_and_release_the_file() {
-        struct TestFile(std::path::PathBuf);
-        impl Drop for TestFile {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-
-        let path = TestFile(std::env::temp_dir().join(format!(
-            "shopping-sessions-mapped-{}.csv",
-            std::process::id()
-        )));
-        let mut input = b"a,b,c,d,e,f,g\n".to_vec();
-        for i in 0..80 {
-            if i > 0 {
-                input.push(b'\n');
-            }
-            let width = if i % 17 == 0 { 170 } else { i };
-            input.resize(input.len() + width, b'x');
-            input.extend_from_slice(b",\"y\",z,,a,b,c");
-        }
-        std::fs::write(&path.0, &input).unwrap();
-        let files = [FileInfo {
-            handle: File::open(&path.0).unwrap(),
-            len: input.len() as u64,
-            kind: Kind::Events,
-        }];
-        let chunks = plan(&files, 64);
-        let mappings = InputMappings::new(&files, &chunks);
-        let mut want = Vec::new();
-        let mut got = Vec::new();
-        let mut buf = Vec::new();
-        for chunk in chunks {
-            let (lo, hi) = read_chunk(&files[0].handle, files[0].len, chunk, &mut buf);
-            scan::<7, _>(&buf, lo, hi, |buf, fields| {
-                want.push(fields.map(|(lo, hi)| buf[lo as usize..hi as usize].to_vec()));
-            });
-            // The loop visits each planned chunk once.
-            let mapping = unsafe { mappings.lease(chunk) };
-            mapping.scan::<7, _>(&mut buf, |buf, fields| {
-                got.push(fields.map(|(lo, hi)| buf[lo as usize..hi as usize].to_vec()));
-            });
-        }
-        assert_eq!(got.len(), 80);
-        assert_eq!(got, want);
-        assert!(mappings.mappings[0].base.get().unwrap().load(Ordering::Relaxed).is_null());
-    }
-
     #[test]
     fn two_stage_matches_reference_random() {
         let mut rng = 0x2545F4914F6CDD1Du64;

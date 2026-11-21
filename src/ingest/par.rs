@@ -122,26 +122,14 @@ where
     T: Fn(&mut S, usize) + Sync,
     F: Fn(&mut S) + Sync,
 {
-    run_finish(threads, ntasks, init, task, |mut state| {
-        fini(&mut state);
-        state
-    })
-}
-
-/// Finish each worker on its own thread and return only its result.
-pub fn run_finish<S, R: Send, I, T, F>(threads: usize, ntasks: usize, init: I, task: T, fini: F) -> Vec<R>
-where
-    I: Fn(usize) -> S + Sync,
-    T: Fn(&mut S, usize) + Sync,
-    F: Fn(S) -> R + Sync,
-{
     let threads = threads.max(1);
     if threads == 1 {
         let mut s = init(0);
         for i in 0..ntasks {
             task(&mut s, i);
         }
-        return vec![fini(s)];
+        fini(&mut s);
+        return vec![s];
     }
 
     // Acquire persistent global pool; fall back to thread::scope only if another test thread holds it.
@@ -149,30 +137,30 @@ where
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        return run_finish_scoped(threads, ntasks, init, task, fini);
+        return run_fini_scoped(threads, ntasks, init, task, fini);
     }
 
     let pool = get_pool();
     let total_bg = ensure_workers(pool, threads - 1);
 
-    let mut out: Vec<MaybeUninit<R>> = (0..threads).map(|_| MaybeUninit::uninit()).collect();
+    let mut out: Vec<MaybeUninit<S>> = (0..threads).map(|_| MaybeUninit::uninit()).collect();
     let next = AtomicUsize::new(0);
 
-    struct Ctx<'a, R, I, T, F> {
+    struct Ctx<'a, S, I, T, F> {
         next: &'a AtomicUsize,
         ntasks: usize,
         init: &'a I,
         task: &'a T,
         fini: &'a F,
-        out_ptr: *mut MaybeUninit<R>,
+        out_ptr: *mut MaybeUninit<S>,
     }
-    fn tramp<S, R, I, T, F>(raw: *const u8, tid: usize)
+    fn tramp<S, I, T, F>(raw: *const u8, tid: usize)
     where
         I: Fn(usize) -> S + Sync,
         T: Fn(&mut S, usize) + Sync,
-        F: Fn(S) -> R + Sync,
+        F: Fn(&mut S) + Sync,
     {
-        let ctx = unsafe { &*(raw as *const Ctx<'_, R, I, T, F>) };
+        let ctx = unsafe { &*(raw as *const Ctx<'_, S, I, T, F>) };
         let mut s = (ctx.init)(tid);
         loop {
             let i = ctx.next.fetch_add(1, Ordering::Relaxed);
@@ -181,8 +169,8 @@ where
             }
             (ctx.task)(&mut s, i);
         }
-        let result = (ctx.fini)(s);
-        unsafe { (*ctx.out_ptr.add(tid)).write(result) };
+        (ctx.fini)(&mut s);
+        unsafe { (*ctx.out_ptr.add(tid)).write(s) };
     }
 
     let ctx = Ctx {
@@ -194,8 +182,8 @@ where
         out_ptr: out.as_mut_ptr(),
     };
     let job = Job {
-        func: tramp::<S, R, I, T, F>,
-        data: (&ctx as *const Ctx<'_, R, I, T, F>) as *const u8,
+        func: tramp::<S, I, T, F>,
+        data: (&ctx as *const Ctx<'_, S, I, T, F>) as *const u8,
         active_workers: threads,
         done: AtomicUsize::new(0),
     };
@@ -209,7 +197,7 @@ where
     }
 
     // Calling thread runs worker 0 directly.
-    tramp::<S, R, I, T, F>(job.data, 0);
+    tramp::<S, I, T, F>(job.data, 0);
 
     // Wait for ALL spawned background workers before releasing stack `job`/`ctx`.
     let mut w_spins = 0u32;
@@ -227,11 +215,11 @@ where
     out.into_iter().map(|m| unsafe { m.assume_init() }).collect()
 }
 
-fn run_finish_scoped<S, R: Send, I, T, F>(threads: usize, ntasks: usize, init: I, task: T, fini: F) -> Vec<R>
+fn run_fini_scoped<S: Send, I, T, F>(threads: usize, ntasks: usize, init: I, task: T, fini: F) -> Vec<S>
 where
     I: Fn(usize) -> S + Sync,
     T: Fn(&mut S, usize) + Sync,
-    F: Fn(S) -> R + Sync,
+    F: Fn(&mut S) + Sync,
 {
     let next = AtomicUsize::new(0);
     std::thread::scope(|sc| {
@@ -247,7 +235,8 @@ where
                         }
                         task(&mut s, i);
                     }
-                    fini(s)
+                    fini(&mut s);
+                    s
                 })
             })
             .collect();

@@ -203,6 +203,12 @@ impl<'a> UserWriter<'a> {
         self.seq += 1;
         self.cols.clear();
     }
+    /// Release completed column buffers on the thread that wrote the parts.
+    pub fn release_buffers(&mut self) {
+        debug_assert_eq!(self.cols.len(), 0);
+        self.cols = UserCols::default();
+    }
+
     pub fn finish(&mut self) -> usize {
         if self.cols.len() > 0 {
             let path = if self.seq == 0 {
