@@ -182,7 +182,7 @@ pub fn validate_event(
         b"purchase" => parse_price(f[6])?,
         _ => return None,
     };
-    if ingest - t > ts::DAY_MS {
+    if ingest.saturating_sub(t) > ts::DAY_MS {
         return None;
     }
     let category = products.map.get(f[5]).copied().unwrap_or(products.unknown);

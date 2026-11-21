@@ -163,17 +163,22 @@ fn below(i: u32) -> u64 {
 /// Scan `buf[lo..hi]` (rows terminated by LF; PAD readable bytes after hi).
 /// Calls `f(buf, fields)` for each well-formed row with exactly N fields; each
 /// field is `(start, end)` after removing one outer quote pair.
+///
+/// Quote rule check per row: a field is "wrapped" if it has length >= 2 and
+/// starts and ends with `"`. The row is well-formed iff the number of quote
+/// bytes in the row equals 2 x (number of wrapped fields): then every quote is
+/// one of the wrapping pairs and no other quote exists anywhere.
 #[inline(always)]
 pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: usize, hi: usize, mut f: F) {
     if lo >= hi {
         return;
     }
-    assert!(buf.len() >= hi + PAD);
-    let mut fields = [(0u32, 0u32); N];
+    assert!(buf.len() >= hi + PAD && N <= 15 && hi < u32::MAX as usize);
+    let mut seps = [0u32; 16];
     let mut k = 0usize;
-    let mut bad = false;
-    let mut qc: u32 = 0;
-    let mut fs = lo;
+    let mut row_start = lo as u32;
+    let mut q_block = 0u32; // quotes before current block
+    let mut q_row = 0u32; // quotes before row start
     let mut base = lo;
     let ptr = buf.as_ptr();
     while base < hi {
@@ -181,37 +186,35 @@ pub fn scan<const N: usize, F: FnMut(&[u8], &[(u32, u32); N])>(buf: &[u8], lo: u
         let valid = below((hi - base) as u32);
         sep &= valid;
         let q = q & valid;
-        let mut prev = 0u32;
         while sep != 0 {
             let i = sep.trailing_zeros();
-            let pos = base + i as usize;
-            qc += (q & below(i) & !below(prev)).count_ones();
-            if !bad {
+            let pos = (base + i as usize) as u32;
+            seps[k & 15] = pos;
+            k += 1;
+            if (nlm >> i) & 1 != 0 {
+                let q_end = q_block + (q & below(i)).count_ones();
                 if k == N {
-                    bad = true;
-                } else if qc == 0 {
-                    fields[k] = (fs as u32, pos as u32);
-                    k += 1;
-                } else if qc == 2 && pos - fs >= 2 && buf[fs] == b'"' && buf[pos - 1] == b'"' {
-                    fields[k] = (fs as u32 + 1, pos as u32 - 1);
-                    k += 1;
-                } else {
-                    bad = true;
-                }
-            }
-            qc = 0;
-            prev = i + 1;
-            fs = pos + 1;
-            if nlm & (1u64 << i) != 0 {
-                if !bad && k == N {
-                    f(buf, &fields);
+                    let mut fields = [(0u32, 0u32); N];
+                    let mut wrapped = 0u32;
+                    let mut s = row_start;
+                    for j in 0..N {
+                        let e = seps[j];
+                        let w = e >= s + 2 && unsafe { *ptr.add(s as usize) == b'"' && *ptr.add(e as usize - 1) == b'"' };
+                        wrapped += w as u32;
+                        fields[j] = (s + w as u32, e - w as u32);
+                        s = e + 1;
+                    }
+                    if q_end - q_row == 2 * wrapped {
+                        f(buf, &fields);
+                    }
                 }
                 k = 0;
-                bad = false;
+                q_row = q_end;
+                row_start = pos + 1;
             }
             sep &= sep - 1;
         }
-        qc += (q & !below(prev)).count_ones();
+        q_block += q.count_ones();
         base += 64;
     }
 }
