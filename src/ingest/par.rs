@@ -47,3 +47,18 @@ impl<T> SyncPtr<T> {
         std::slice::from_raw_parts_mut(self.0.add(start), len)
     }
 }
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+extern "C" {
+    fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
+}
+/// CPU time of the calling thread, seconds.
+pub fn thread_cpu() -> f64 {
+    let mut t = Timespec { sec: 0, nsec: 0 };
+    unsafe { clock_gettime(3, &mut t) }; // CLOCK_THREAD_CPUTIME_ID
+    t.sec as f64 + t.nsec as f64 * 1e-9
+}

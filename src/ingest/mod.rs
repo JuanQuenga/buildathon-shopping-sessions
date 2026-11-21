@@ -12,6 +12,7 @@ pub mod scan;
 pub mod slow;
 pub mod small;
 pub mod ts;
+pub mod tsfast;
 
 use crate::types::*;
 use std::io::Write;
@@ -62,5 +63,39 @@ pub fn dump(l: &Loaded, path: &Path) {
         for c in ck {
             writeln!(w, "C {} {}", c.ts_ms, c.campaign).unwrap();
         }
+    }
+}
+
+/// Microbenchmark hook: `INGEST_BENCH=<csv file>` (events file) prints single-thread
+/// throughput of scanner and parsing pieces on an in-memory copy.
+pub fn bench(path: &Path) {
+    let data = std::fs::read(path).unwrap();
+    let mut buf = data.clone();
+    let hi = buf.len();
+    buf.resize(hi + scan::PAD + 1, 0);
+    let lo = data.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let mb = (hi - lo) as f64 / 1e6;
+    for round in 0..3 {
+        let t = par::thread_cpu();
+        let mut n = 0u64;
+        scan::scan::<7, _>(&buf, lo, hi, |_, f| n += f[1].0 as u64);
+        let d = par::thread_cpu() - t;
+        let t2 = par::thread_cpu();
+        let mut x = 0i64;
+        scan::scan::<7, _>(&buf, lo, hi, |b, f| {
+            x += ts::parse_ts(&b[f[2].0 as usize..f[2].1 as usize]).unwrap_or(0);
+            x += ts::parse_ts(&b[f[3].0 as usize..f[3].1 as usize]).unwrap_or(0);
+        });
+        let d2 = par::thread_cpu() - t2;
+        let t3 = par::thread_cpu();
+        let mut lines = 0u64;
+        for l in csv::data_lines(&data) {
+            let mut f = [&b""[..]; 7];
+            if csv::split(l, &mut f) {
+                lines += f[1].len() as u64;
+            }
+        }
+        let d3 = par::thread_cpu() - t3;
+        eprintln!("round {round}: scan {:.0} MB/s ({n}) | scan+2ts {:.0} MB/s ({x}) | scalar split {:.0} MB/s ({lines})", mb / d, mb / d2, mb / d3);
     }
 }

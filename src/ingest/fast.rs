@@ -1,10 +1,10 @@
 //! Parallel exact ingest. Ids are carried as exact inline u128 keys (<= 15
 //! bytes); any id that does not fit makes `load` return `None` and the caller
 //! falls back to the generic path. See docs/ingest.md.
-use super::key::{self, Map};
+use super::key::{self, IdLookup, Map};
 use super::par::{self, SyncPtr};
 use super::scan::{self, Chunk, FileInfo, Kind};
-use super::{slow, small, ts};
+use super::{slow, small, ts, tsfast};
 use crate::types::*;
 use std::fs::File;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
-const CHUNK: u64 = 4 << 20;
+const CHUNK: u64 = 1 << 20;
 /// Event dedup partitions (by event_id hash) and person partitions.
 const P1_BITS: u32 = 10;
 const P1: usize = 1 << P1_BITS;
@@ -22,7 +22,7 @@ const INVALID: u32 = u32::MAX;
 
 /// Event candidate before dedup.
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(64))]
 struct RecA {
     eid: u128,
     user: u128,
@@ -35,7 +35,7 @@ struct RecA {
 
 /// Surviving event keyed by person.
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(32))]
 struct RecB {
     person: u128,
     ts: i64,
@@ -45,12 +45,39 @@ struct RecB {
 
 /// Valid click keyed by person.
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(64))]
 struct RecC {
     person: u128,
     cid: u128,
     ts: i64,
     campaign: u32,
+}
+
+static PROF: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| std::env::var("INGEST_PROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+/// Append with non-temporal stores (records are whole 32/64-byte aligned units:
+/// no read-for-ownership of the destination line). Callers `sfence` before
+/// other threads read the data (see `fence`).
+#[inline(always)]
+fn push_nt<T: Copy>(v: &mut Vec<T>, x: T) {
+    const { assert!(std::mem::size_of::<T>() % 32 == 0 && std::mem::align_of::<T>() >= 32) };
+    if v.len() == v.capacity() {
+        fence();
+        v.reserve(v.capacity().max(256));
+    }
+    unsafe {
+        use std::arch::x86_64::*;
+        let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
+        let src = &x as *const T as *const __m256i;
+        for i in 0..std::mem::size_of::<T>() / 32 {
+            _mm256_stream_si256(dst.add(i), _mm256_loadu_si256(src.add(i)));
+        }
+        v.set_len(v.len() + 1);
+    }
+}
+
+#[inline(always)]
+fn fence() {
+    unsafe { std::arch::x86_64::_mm_sfence() }
 }
 
 struct Timer(Instant);
@@ -75,6 +102,11 @@ fn fkey(b: &[u8], f: (u32, u32)) -> u128 {
 }
 
 #[inline(always)]
+fn fts(b: &[u8], f: (u32, u32)) -> Option<i64> {
+    unsafe { tsfast::parse(b.as_ptr().add(f.0 as usize), flen(f)) }
+}
+
+#[inline(always)]
 fn flen(f: (u32, u32)) -> usize {
     (f.1 - f.0) as usize
 }
@@ -84,15 +116,9 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
     let (ws, we) = small::read_manifest(data_dir);
     let products = small::read_products(data_dir);
     let (campaigns, campaign_map) = small::read_campaigns(data_dir);
-    let mut prod = Map::with_capacity(products.map.len());
-    for (k, &v) in &products.map {
-        prod.insert(key::pack(k)?, v);
-    }
-    let mut camp = Map::with_capacity(campaign_map.len());
-    for (k, &v) in &campaign_map {
-        camp.insert(key::pack(k)?, v);
-    }
     let unknown = products.unknown;
+    let prod = IdLookup::build(products.map.iter().map(|(k, &v)| (k.as_slice(), v)), unknown)?;
+    let camp = IdLookup::build(campaign_map.iter().map(|(k, &v)| (k.as_slice(), v)), INVALID)?;
 
     let mut files: Vec<FileInfo> = Vec::new();
     for (sub, kind) in [("events", Kind::Events), ("clicks", Kind::Clicks), ("links", Kind::Links)] {
@@ -151,6 +177,8 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
         ev: Vec<Vec<RecA>>,
         ck: Vec<Vec<RecC>>,
         buf: Vec<u8>,
+        t_read: f64,
+        t_scan: f64,
     }
     let states = par::run(
         threads,
@@ -159,6 +187,8 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
             ev: (0..P1).map(|_| Vec::with_capacity(per_sink)).collect(),
             ck: (0..P2).map(|_| Vec::new()).collect(),
             buf: Vec::with_capacity(CHUNK as usize + 8192),
+            t_read: 0.0,
+            t_scan: 0.0,
         },
         |st, i| {
             if fallback.load(Ordering::Relaxed) {
@@ -166,11 +196,22 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
             }
             let c = main_chunks[i];
             let fi = &files[c.file as usize];
+            let t0 = par::thread_cpu();
             let (lo, hi) = scan::read_chunk(&handles[c.file as usize], fi.len, c, &mut st.buf);
+            st.t_read += par::thread_cpu() - t0;
+            let t1 = par::thread_cpu();
             let buf = std::mem::take(&mut st.buf);
+            let mode = *PROF;
             match fi.kind {
+                Kind::Events if mode == 1 => scan::scan::<7, _>(&buf, lo, hi, |_, f| {
+                    st.t_read += f[0].0 as f64 * 1e-30;
+                }),
+                Kind::Events if mode == 2 => scan::scan::<7, _>(&buf, lo, hi, |b, f| {
+                    let x = ts::parse_ts(field(b, f[2])).unwrap_or(0) + ts::parse_ts(field(b, f[3])).unwrap_or(0);
+                    st.t_read += x as f64 * 1e-30;
+                }),
                 Kind::Events => scan::scan::<7, _>(&buf, lo, hi, |b, f| {
-                    if !parse_event(b, f, ws, we, &prod, unknown, &mut st.ev) {
+                    if !parse_event(b, f, ws, we, &prod, &mut st.ev) {
                         fallback.store(true, Ordering::Relaxed);
                     }
                 }),
@@ -181,12 +222,17 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
                 }),
                 Kind::Links => unreachable!(),
             }
+            fence();
+            st.t_scan += par::thread_cpu() - t1;
             st.buf = buf;
         },
     );
     if fallback.load(Ordering::Relaxed) {
         return None;
     }
+    let tr: f64 = states.iter().map(|s| s.t_read).sum();
+    let tsn: f64 = states.iter().map(|s| s.t_scan).sum();
+    eprintln!("[ingest] parse cpu: read {tr:.3}s scan+parse {tsn:.3}s");
     let mut ev_sinks: Vec<Vec<Vec<RecA>>> = Vec::with_capacity(threads);
     let mut ck_sinks: Vec<Vec<Vec<RecC>>> = Vec::with_capacity(threads);
     for s in states {
@@ -263,8 +309,9 @@ pub fn load(data_dir: &Path, threads: usize) -> Option<Loaded> {
                 }
                 let person = links_ref.canonical(r.user);
                 let q = (key::hash(person) >> (64 - P2_BITS)) as usize;
-                out[q].push(RecB { person, ts: r.ts, cat: r.cat, cents: r.cents });
+                push_nt(&mut out[q], RecB { person, ts: r.ts, cat: r.cat, cents: r.cents });
             }
+            fence();
         },
     )
     .into_iter()
@@ -432,8 +479,7 @@ fn parse_event(
     f: &[(u32, u32); 7],
     ws: i64,
     we: i64,
-    prod: &Map,
-    unknown: u32,
+    prod: &IdLookup,
     sinks: &mut [Vec<RecA>],
 ) -> bool {
     let le = flen(f[0]);
@@ -444,7 +490,7 @@ fn parse_event(
         return false;
     }
     let eid = fkey(b, f[0]);
-    let ingest = ts::parse_ts(field(b, f[3])).unwrap_or(i64::MIN);
+    let ingest = fts(b, f[3]).unwrap_or(i64::MIN);
     let mut rec = RecA { eid, user: 0, ingest, ts: 0, cat: 0, cents: INVALID };
     let lu = flen(f[1]);
     if lu > key::MAX_INLINE {
@@ -454,26 +500,50 @@ fn parse_event(
         if lu == 0 || flen(f[5]) == 0 {
             break 'v;
         }
-        let Some(t) = ts::ts_in(field(b, f[2]), ws, we) else { break 'v };
-        let cents = match field(b, f[4]) {
-            b"view" | b"cart" => 0u32,
-            b"purchase" => match slow::parse_price(field(b, f[6])) {
-                Some(c) => c,
-                None => break 'v,
-            },
+        let t = match fts(b, f[2]) {
+            Some(t) if t >= ws && t < we => t,
             _ => break 'v,
+        };
+        let ty = f[4];
+        let cents = if flen(ty) == 4 {
+            let w = unsafe { std::ptr::read_unaligned(b.as_ptr().add(ty.0 as usize) as *const u32) };
+            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+                0
+            } else {
+                break 'v;
+            }
+        } else if flen(ty) == 8
+            && unsafe { std::ptr::read_unaligned(b.as_ptr().add(ty.0 as usize) as *const u64) } == u64::from_le_bytes(*b"purchase")
+        {
+            let pr = f[6];
+            let lp = flen(pr);
+            let v = if (1..=8).contains(&lp) {
+                unsafe { tsfast::digits8(b.as_ptr().add(pr.0 as usize), lp) }.map(|v| v as u32)
+            } else {
+                slow::parse_price(field(b, pr))
+            };
+            match v {
+                Some(c) if (1..=10_000_000).contains(&c) => c,
+                _ => break 'v,
+            }
+        } else {
+            break 'v;
         };
         if ingest - t > ts::DAY_MS {
             break 'v;
         }
-        let cat = if flen(f[5]) <= key::MAX_INLINE { prod.get(fkey(b, f[5])).unwrap_or(unknown) } else { unknown };
+        let cat = unsafe { prod.get(b.as_ptr().add(f[5].0 as usize), flen(f[5])) };
         rec.user = fkey(b, f[1]);
         rec.ts = t;
         rec.cat = cat;
         rec.cents = cents;
     }
     let p = (key::hash(eid) >> (64 - P1_BITS)) as usize;
-    unsafe { sinks.get_unchecked_mut(p) }.push(rec);
+    if *PROF == 3 {
+        if rec.cents == 7 && rec.ts == 5 { sinks[p].push(rec); }
+        return true;
+    }
+    push_nt(unsafe { sinks.get_unchecked_mut(p) }, rec);
     true
 }
 
@@ -483,7 +553,7 @@ fn parse_click(
     f: &[(u32, u32); 4],
     ws: i64,
     we: i64,
-    camp: &Map,
+    camp: &IdLookup,
     links: &Links,
     sinks: &mut [Vec<RecC>],
 ) -> bool {
@@ -495,18 +565,20 @@ fn parse_click(
     if lu == 0 {
         return true;
     }
-    let lcamp = flen(f[2]);
-    if lcamp > key::MAX_INLINE || lcamp == 0 {
-        return true; // cannot be a known campaign (all campaign ids fit, checked at load)
+    let campaign = unsafe { camp.get(b.as_ptr().add(f[2].0 as usize), flen(f[2])) };
+    if campaign == INVALID {
+        return true;
     }
-    let Some(campaign) = camp.get(fkey(b, f[2])) else { return true };
-    let Some(t) = ts::ts_in(field(b, f[3]), ws - WEEK_MS, we) else { return true };
+    let t = match fts(b, f[3]) {
+        Some(t) if t >= ws - WEEK_MS && t < we => t,
+        _ => return true,
+    };
     if lc > key::MAX_INLINE || lu > key::MAX_INLINE {
         return false;
     }
     let person = links.canonical(fkey(b, f[1]));
     let q = (key::hash(person) >> (64 - P2_BITS)) as usize;
-    unsafe { sinks.get_unchecked_mut(q) }.push(RecC { person, cid: fkey(b, f[0]), ts: t, campaign });
+    push_nt(unsafe { sinks.get_unchecked_mut(q) }, RecC { person, cid: fkey(b, f[0]), ts: t, campaign });
     true
 }
 
@@ -615,5 +687,50 @@ fn uf_union(p: &[AtomicU32], a: u32, b: u32) {
         if p[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             return;
         }
+    }
+}
+
+/// Single-thread per-row cost breakdown on one events file (INGEST_BENCH2=<file>, DATA_DIR for products).
+pub fn bench_rows(path: &Path, data_dir: &Path) {
+    let (ws, we) = small::read_manifest(data_dir);
+    let products = small::read_products(data_dir);
+    let prod = IdLookup::build(products.map.iter().map(|(k, &v)| (k.as_slice(), v)), products.unknown).unwrap();
+    let data = std::fs::read(path).unwrap();
+    let mut buf = data.clone();
+    let hi = buf.len();
+    buf.resize(hi + scan::PAD + 1, 0);
+    let lo = data.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let mb = (hi - lo) as f64 / 1e6;
+    let mut sinks: Vec<Vec<RecA>> = (0..P1).map(|_| Vec::new()).collect();
+    for round in 0..2 {
+        let mut line = String::new();
+        let mut rows = 0usize;
+        for stage in 0..6 {
+            let t = par::thread_cpu();
+            let mut acc = 0i64;
+            scan::scan::<7, _>(&buf, lo, hi, |b, f| {
+                rows += (stage == 0) as usize;
+                match stage {
+                    0 => acc += f[1].0 as i64,
+                    1 => acc += fts(b, f[2]).unwrap_or(0) ^ fts(b, f[3]).unwrap_or(0),
+                    2 => acc += fkey(b, f[0]) as i64 ^ fkey(b, f[1]) as i64,
+                    3 => acc += unsafe { prod.get(b.as_ptr().add(f[5].0 as usize), flen(f[5])) } as i64,
+                    4 => {
+                        parse_event(b, f, ws, we, &prod, &mut sinks);
+                    }
+                    _ => {
+                        parse_event(b, f, ws, we, &prod, &mut sinks);
+                    }
+                }
+            });
+            if stage == 4 {
+                for s in sinks.iter_mut() {
+                    s.clear();
+                }
+            }
+            let d = par::thread_cpu() - t;
+            line += &format!(" s{stage} {:.1}ns/row ({:.0}MB/s){}", d * 1e9 / rows.max(1) as f64, mb / d, if acc == 1 { "!" } else { "" });
+        }
+        eprintln!("round {round} rows {rows}:{line}");
     }
 }
