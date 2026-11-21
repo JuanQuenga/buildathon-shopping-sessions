@@ -1,17 +1,12 @@
-//! Bytes on disk -> `Loaded`. Owner: ingest agent.
+//! Bytes on disk -> `Loaded`. Owner: ingest agent. See docs/ingest.md.
+pub mod csv;
+pub mod slow;
+pub mod small;
+pub mod ts;
+
 use crate::types::*;
 use std::path::Path;
 
-pub fn load(_data_dir: &Path, _threads: usize) -> Loaded {
-    Loaded {
-        window_start_ms: 0,
-        window_end_ms: 0,
-        person_ids: StringTable::new(),
-        categories: vec![b"unknown".to_vec()],
-        campaigns: Vec::new(),
-        events: Vec::new(),
-        event_offsets: vec![0],
-        clicks: Vec::new(),
-        click_offsets: vec![0],
-    }
+pub fn load(data_dir: &Path, _threads: usize) -> Loaded {
+    slow::load(data_dir)
 }
