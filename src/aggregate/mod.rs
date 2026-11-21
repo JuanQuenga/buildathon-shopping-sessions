@@ -526,4 +526,31 @@ mod tests {
         let rows: Vec<UserRow> = aggregate(&l, 1).user_rows.into_iter().flatten().collect();
         assert_eq!(rows[0].top, 0);
     }
+
+    #[test]
+    fn sparse_matches_dense() {
+        let d = DAY_MS;
+        let mut l = mk(
+            vec![
+                ("a", vec![(10 * d, 0, 3), (12 * d + 7, 1, 0), (20 * d, 0, 9)], vec![(9 * d, 0), (11 * d, 1), (19 * d, 2)]),
+                ("b", vec![(10 * d + 5, 2, 0)], vec![(10 * d + 5, 2), (10 * d + 5, 1)]),
+            ],
+            3,
+        );
+        let norm = |t: Tables| {
+            let mut c = t.camp_rows;
+            c.sort_by_key(|r| (r.campaign, r.day));
+            let mut u: Vec<UserRow> = t.user_rows.into_iter().flatten().collect();
+            u.sort_by_key(|r| (r.person, r.day));
+            (u, c)
+        };
+        let dense = norm(aggregate(&l, 2));
+        // A window this long forces the sparse accumulator.
+        l.window_start_ms = -200_000 * d;
+        l.window_end_ms = 200_000 * d;
+        assert_eq!(CampStore::new(4, 0, 400_000).ndays, 0);
+        let sparse = norm(aggregate(&l, 2));
+        assert_eq!(dense, sparse);
+        assert!(dense.1.iter().any(|r| r.cell.assisted > 0 && r.cell.sessions == 0));
+    }
 }
