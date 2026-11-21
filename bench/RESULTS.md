@@ -2,20 +2,22 @@
 
 ## Please submit
 
-- **Tag**: `candidate-4` (HEAD on `main`) — **ready for official submission now** (passes full gate + all 4× 60M stress datasets in Docker under scorer flags).
+- **Tag**: `candidate-5` (HEAD on `main`) — **ready for official submission now** (passes full gate + all 4× 60M datasets exact `MATCH` in Docker).
   - **What it tests**:
-    1. **Safety (60M tail risk eliminated)**: parallel, memory-bounded generic path (`src/ingest/generic.rs` + `SlabBuf` + 512-entry `DateTable`) handles arbitrary ID lengths (`>15B`), arbitrary category counts (`>256`), and arbitrary window spans (`>42d`) in parallel — verified exact `MATCH` vs `oracle2` in Docker on `seed60-60m`, `seed60-longids` (< 5.5 GiB RSS), `seed60-5kcat`, and `seed60-90d`.
-    2. **SPEED_REVIEW Items 1–4 & 7 + Wave 1/2 speedups**: parallel `munmap` of arenas and per-worker `UserCols`/scratch teardown before exit (outside-`main` teardown reduced from **153 ms → < 8 ms**), `pread` restored, zero-alloc `products`/`campaigns` overlapped concurrently with `links`, `preadv2(RWF_NOWAIT)` warm-cache check skipping prefetch threads when cached (0 warm / 4 cold), persistent worker pool, no-THP streaming `Sinks`, guarded pure-YMM **AVX-512VL-256** `u16` scanner (verified via `objdump`: zero ZMM / VBMI / VPOPCNTDQ), carry-free 13-digit F3 + SWAR `HH:MM:SS`, `128 KiB` chunks + `128 B` SWCB tuned on 4C×2T SMT (`--cpuset-cpus 0-3,8-11`), linear short-interval assists, Debian glibc runtime (beat musl 0.914 s vs 0.992 s on 8 vCPUs), and `getrusage` user/sys/minflt stage timers + 1-line `[diag]` stderr line.
-  - **Local A/B vs `candidate-3` (`ss-test:4f01a6ec67`) on `--cpuset-cpus 0-3,8-11` (`seed20-20m` warm, exact scorer Docker flags)**:
-    - `candidate-3`: **1.050 s** median Docker container wall.
-    - `candidate-4`: **0.774 s** median Docker container wall (**−26.3%** container wall; outside-`main` < 8 ms).
-  - **Verification**: 15/15 release unit tests (0 warnings), `objdump` AVX-512 check, native `check_all.sh` (36 official, 32 adversarial, dev, 8× 1M seeds, 20M vs `oracle2`), forced `INGEST_GENERIC=1` full `check_all.sh`, `INGEST_SLOW=1` + `INGEST_NO_AVX512=1`, Polars/PyArrow/DuckDB cross-reader on dev + `all_empty_output`, Docker 36/36 + dev, and all 4× 60M datasets (`seed60-60m`, `seed60-longids`, `seed60-5kcat`, `seed60-90d`) exact `MATCH` in Docker.
+    1. **Single-materialization parse + dead-bitset dedup (`SPEED_REVIEW` Item 5)**: writes 16 B `RecB` directly to person partitions at parse time (ring-32 `Links` prefetch) + 16 B `Tok { eid, ingest, loc }` to `eid` partitions; `dedup` runs Pass 1 only, setting `AtomicU64` dead bits (2.6 MB bitset) on the ~5% losers — eliminating `dedup` Pass 2 completely, halving event DRAM traffic (128 B → 64 B/event), cutting 20M peak RSS **1,178 → 880 MiB (−25%)**, minor faults **332k → 248k (−25%)**, and 4T `dedup` wall **274 ms → 71 ms (0 minor faults)**. Exact two-pass fallback handles wide keys, dump mode, `>16` threads, and location overflow.
+    2. **Fixes three primary suspects for `candidate-4`'s scorer regression (0.985 s vs 0.882 s)**:
+       - **Runtime adaptive THP**: probes 16 MiB `MADV_HUGEPAGE` touch latency (`< 8 ms`) whenever `transparent_hugepage/enabled` is `[madvise]` or unreadable (restoring 2 MiB huge pages on clean cloud VMs while avoiding compaction stalls on `[always]` hosts).
+       - **Pure `AVX2` default scanner** (rules out Cascade Lake AVX-512 frequency-license penalty; `INGEST_SCANNER=avx512vl|avx512` still available).
+       - **`256 KiB` `pread` chunks restored** (halves read syscalls back to `candidate-3`'s level).
+    3. **Retains mandatory 60M safety**: parallel memory-bounded generic path (`src/ingest/generic.rs`) verified exact `MATCH` in Docker on `seed60-60m` (12.81 s, 3.51 GiB), `seed60-longids` (15.47 s, 5.67 GiB), `seed60-5kcat` (9.62 s, 2.86 GiB), and `seed60-90d` (11.19 s, 2.74 GiB).
+  - **Verification**: 17/17 release unit tests (0 warnings), `objdump` ISA check, full native + forced `INGEST_GENERIC=1` + `INGEST_SLOW=1` + `INGEST_NO_AVX512=1` + Polars/PyArrow/DuckDB checks, Docker 36/36 + dev, 20M `oracle2` exact `MATCH`, and all 4× 60M Docker exact `MATCH`.
 
 ## Official scores
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
-| `candidate-3` | `63b9256` (`4f01a6e`) | **0.88 s** | 12→28 (leaders now 0.48–0.64 s) | Accepted exact output |
+| `candidate-3` | `63b9256` (`4f01a6e`) | **0.882 s** | 29 (leaders now 0.42 s) | Accepted exact output (best official so far) |
+| `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (disabled `MADV_HUGEPAGE` on `Sinks`, halved chunks to 128 KiB, switched to AVX-512VL-256) |
 | `probe-1` | `4456bb8` | rejected (dev) | — | Deliberate 0-row dev mismatch; confirmed scorer returns row diff (not stderr) on mismatch |
 
 ## 2026-11-20 commit `4f01a6e` (`candidate-3`: 2M huge-page flat Links, RecA eid_hash, ring-32 prefetch, skip view/cart prod.get, 256 KiB L2-hot chunks + 4 prefetch threads, pshufb enc, CompactEv(u64))
