@@ -41,6 +41,19 @@ before returning. Stage timings go to stderr as `[stage] name 1.234s`.
 The aggregate agent may append dependencies under the `[dependencies]` marker line
 (keep the rest as is; ping in this doc).
 
+## Aggregate/output side (owner: aggregate agent)
+
+* `aggregate::run` creates `user_daily/` and `campaign_daily/`, aggregates in parallel over
+  person chunks (balanced by event count, largest first), and each worker writes its own
+  `user_daily/part-{worker}.parquet` (zero rows allowed) as soon as it runs out of work; the
+  merged campaign table goes to `campaign_daily/part-0.parquet`.
+* `src/output/` is included as `aggregate::output` via `#[path]`, so `main.rs` needs no change.
+* Parquet: hand-written, one row group, PLAIN, uncompressed, INT64 counters, INT32 `DATE`,
+  `STRING` (UTF8) byte arrays, `top_category` OPTIONAL with real nulls. Verified with
+  Polars, PyArrow, DuckDB and the official `run_fixtures.py` / `compare.py`.
+* Relies on: per-person events sorted by ts, clicks by (ts, click_id), categories and campaigns
+  sorted byte-wise, every listed person has >= 1 event.
+
 ## Changelog
 
 * 2026-11-20 v1: initial contract.
