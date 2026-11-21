@@ -17,7 +17,7 @@ set +e
 rc=$?
 set -e
 end=$(date +%s.%N)
-printf 'candidate exit %d, wall %.2fs on %s\n' "$rc" "$(echo "$end - $start" | bc)" "$data"
+printf 'candidate exit %d, wall %.2fs on %s\n' "$rc" "$(awk -v a="$start" -v b="$end" 'BEGIN{print b-a}')" "$data"
 if [ "$rc" -ne 0 ]; then tail -20 "$out.stderr"; rm -f "$out.stderr"; echo DIFFER; exit 1; fi
 grep '^\[stage\]' "$out.stderr" | tr '\n' ' ' || true; echo
 rm -f "$out.stderr"

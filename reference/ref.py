@@ -21,6 +21,9 @@ SESSION_GAP_MS = 1_800_000
 CLICK_LOOKBACK_MS = 7 * DAY_MS
 LATE_MS = DAY_MS
 MAX_PRICE = 10_000_000
+# REF_LITERAL_CHECK=1 re-derives every session's credit and assist set by brute force
+# over the 7-day click slice and asserts it equals the sliding-window result.
+LITERAL_CHECK = bool(os.environ.get("REF_LITERAL_CHECK"))
 
 EVENT_FIELDS = 7
 CLICK_FIELDS = 4
@@ -330,8 +333,12 @@ def run(data_dir, out_dir):
                 s[3] += 1
                 s[4][cat] = s[4].get(cat, 0) + price
             prev = ts
-        clicks = person_clicks.get(person, [])
+        clicks = person_clicks.get(person, [])  # sorted by (ts, click_id bytes)
         click_ts = [c[0] for c in clicks]
+        # Sliding window over clicks for assists: sessions are visited in increasing start
+        # order, clicks enter when ts <= start and leave when ts < start - 7d.
+        active = {}  # campaign -> number of clicks in window
+        enter = leave = 0
         for start, n_events, revenue, n_purchases, cats in sessions:
             day = start // DAY_MS
             u = user_daily.get((person, day))
@@ -343,17 +350,36 @@ def run(data_dir, out_dir):
             for cat, cents in cats.items():
                 u[3][cat] = u[3].get(cat, 0) + cents
 
-            lo = bisect_left(click_ts, start - CLICK_LOOKBACK_MS)
-            hi = bisect_right(click_ts, start)
-            eligible = clicks[lo:hi]
-            if eligible:
-                latest = max(c[0] for c in eligible)
-                credited = min(c[1] for c in eligible if c[0] == latest)
-                credited_camp = next(c[2] for c in eligible if c[0] == latest and c[1] == credited)
-                for camp in {c[2] for c in eligible}:
+            while enter < len(clicks) and clicks[enter][0] <= start:
+                camp = clicks[enter][2]
+                active[camp] = active.get(camp, 0) + 1
+                enter += 1
+            while leave < enter and clicks[leave][0] < start - CLICK_LOOKBACK_MS:
+                camp = clicks[leave][2]
+                active[camp] -= 1
+                if active[camp] == 0:
+                    del active[camp]
+                leave += 1
+            if enter > leave:
+                # Latest eligible ts is clicks[enter-1]; among clicks tied on it the first in
+                # (ts, click_id) order has the byte-wise smallest click_id.
+                first_tied = bisect_left(click_ts, click_ts[enter - 1], leave, enter)
+                credited_camp = clicks[first_tied][2]
+                for camp in active:
                     camp_row((camp, day))[3] += 1
             else:
                 credited_camp = None  # organic
+            if LITERAL_CHECK:
+                lo = bisect_left(click_ts, start - CLICK_LOOKBACK_MS)
+                hi = bisect_right(click_ts, start)
+                eligible = clicks[lo:hi]
+                assert set(active) == {c[2] for c in eligible}
+                if eligible:
+                    latest = max(c[0] for c in eligible)
+                    credited = min(c[1] for c in eligible if c[0] == latest)
+                    assert credited_camp == next(c[2] for c in eligible if c[1] == credited)
+                else:
+                    assert credited_camp is None
             r = camp_row((credited_camp, day))
             r[0] += 1
             r[1] += 1 if n_purchases > 0 else 0
