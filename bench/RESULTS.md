@@ -16,7 +16,8 @@
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
-| `candidate-3` | `63b9256` (`4f01a6e`) | **0.882 s** | 29 (leaders now 0.42 s) | Accepted exact output (best official so far) |
+| `candidate-3` | `63b9256` (`4f01a6e`) | **0.8824 s** | 29 (leaders now 0.42 s) | Accepted exact output (best official so far) |
+| `candidate-5` | `2bd1a01` (`6c2778c`) | **0.8826 s** | — | Accepted exact output; identical to candidate-3 despite halving event DRAM traffic & removing dedup Pass 2 → wall is dominated by I/O or non-compute fixed cost |
 | `candidate-4` | `e0b0a9d` (`f52fa03`) | **0.985 s** | — | Accepted exact output; +103 ms slower on scorer despite −26.3% locally (disabled `MADV_HUGEPAGE` on `Sinks`, halved chunks to 128 KiB, switched to AVX-512VL-256) |
 | `probe-1` | `4456bb8` | rejected (dev) | — | Deliberate 0-row dev mismatch; confirmed scorer returns row diff (not stderr) on mismatch |
 
