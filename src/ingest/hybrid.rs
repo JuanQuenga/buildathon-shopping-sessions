@@ -22,7 +22,7 @@ use super::{
     fts, partition_slices, sort_ev_slice, CompactClick, CompactEv, Ctx, DeadEvents, DedupBucket32,
     DedupTable, DenseBin, DenseSessions, Flag, FusedAssists, GroupPhase, GroupProfile,
     GroupTimings, Need, PartitionPlan, RecC, Tok, DAY_MS_U32, GAP_MS_U32, INVALID_CAMP,
-    LOC_IDX_BITS, LP, LP_BITS, MAX_LOC_IDX, MAX_THREADS, NO_REC, WEEK_MS,
+    LOC_IDX_BITS, MAX_LOC_IDX, MAX_THREADS, NO_REC, WEEK_MS,
 };
 use crate::aggregate::{self, output, CampStore};
 use crate::ingest::keys::Key;
@@ -38,6 +38,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
+
+const HLP_BITS: u32 = 9;
+const HLP: usize = 1 << HLP_BITS;
+const MAX_HLP_LOCAL_ID: usize = (1 << 23) - 1;
 
 const LONG_BIT: u64 = 1u64 << 63;
 const LINK_LONG_BIT: u64 = 1u64 << 62;
@@ -507,6 +511,7 @@ impl LongUserCache {
         Self { slots: vec![(0, 0); Self::CAP] }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn intern_vec(&mut self, arena: &mut Vec<u8>, s: &[u8], uh: u64) -> Option<u32> {
         let fp = ((uh >> 32) as u32) | 1;
@@ -887,13 +892,13 @@ fn any_zero_u16(a: u16, b: u16) -> bool {
 }
 
 #[inline(always)]
-fn any_zero_u32(a: u32, b: u32) -> bool {
+fn any_zero_u64(a: u64, b: u64) -> bool {
     let mut r = b;
-    let z = 0u32;
+    let z = 0u64;
     unsafe {
         std::arch::asm!(
-            "test {a:e}, {a:e}",
-            "cmove {r:e}, {z:e}",
+            "test {a}, {a}",
+            "cmove {r}, {z}",
             a = in(reg) a,
             z = in(reg) z,
             r = inout(reg) r,
@@ -907,7 +912,7 @@ fn any_zero_u32(a: u32, b: u32) -> bool {
 unsafe fn parse_link_ep_delim<const DELIM: u8>(
     p: *const u8,
     tid: usize,
-    long_bytes: &mut Vec<u8>,
+    long_bytes: &mut ArenaBytes,
     cache: &mut LongUserCache,
     flag: &Flag,
 ) -> Option<(u64, *const u8)> {
@@ -917,16 +922,29 @@ unsafe fn parse_link_ep_delim<const DELIM: u8>(
     let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
     if any_zero_u16(d8, d9) {
         let (key, len) = try_encode_89(p, end4, d8 == 0)?;
-        return Some((key, p.add(len + 1 + quoted)));
+        return Some((mix63(key), p.add(len + 1 + quoted)));
     }
-    if ends_delim(p, 33, mask, expect) && is_valid_opaque_33(p) {
-        let s = std::slice::from_raw_parts(p, 33);
-        let h = hash_long(s);
-        let Some(off) = cache.intern_vec(long_bytes, s, h) else {
-            flag.set(Need::Slow);
-            return None;
-        };
-        return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
+    if ends_delim(p, 33, mask, expect) {
+        let b0 = *p;
+        if b0.wrapping_sub(0x30) < 0x50 {
+            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+                let h = hash_packed_33(tag, hi, lo);
+                let Some(off) = cache.intern_arena_packed33(long_bytes, tag, hi, lo, h) else {
+                    flag.set(Need::Slow);
+                    return None;
+                };
+                return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
+            }
+        }
+        if is_valid_opaque_33(p) {
+            let s = std::slice::from_raw_parts(p, 33);
+            let h = hash_long(s);
+            let Some(off) = cache.intern_arena(long_bytes, s, h) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
+        }
     }
     None
 }
@@ -1125,7 +1143,7 @@ unsafe fn tail(p: *const u8) -> Option<Tail> {
     let mask = lf_bit - 1;
     let commas =
         _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8))) as u32 & mask;
-    if !commas.is_power_of_two() {
+    if commas.count_ones() != 1 {
         return None;
     }
     let quotes =
@@ -1135,25 +1153,21 @@ unsafe fn tail(p: *const u8) -> Option<Tail> {
 
 impl Tail {
     /// Branchlessly validate optional CSV wrapping quotes on `(product_id, price)` for
-    /// `view`/`cart` without `tzcnt(commas)` or variable shifts; returns `Some(product_nonempty)`.
+    /// `view`/`cart` in 11 bit-ops (zero `tzcnt(commas)` / variable shifts); returns `Some(product_nonempty)`.
     #[inline(always)]
     fn wrapping_view_cart(&self) -> Option<bool> {
         let q = self.quotes;
-        let c_prev = self.commas >> 1;
-        let c_next = self.commas << 1;
+        let c = self.commas;
+        let c_next = c << 1;
         let lf_prev = self.lf_bit >> 1;
-        let first = q & 1;
-        let last = u32::from((q & c_next) != 0);
-        let expected = ((1 | c_prev) & first.wrapping_neg())
-            | ((c_next | lf_prev) & last.wrapping_neg());
-        if (q != expected)
-            | ((first != 0) & ((self.commas & 3) != 0))
-            | ((last != 0) & (c_next >= lf_prev))
-        {
+        let first_mask = (q & 1).wrapping_neg();
+        let last_mask = u32::from((q & c_next) != 0).wrapping_neg();
+        let exp = ((1 | (c >> 1)) & first_mask) | ((c_next | lf_prev) & last_mask);
+        let bad = (q ^ exp) | (first_mask & c & 3) | (last_mask & (c_next & lf_prev));
+        if bad != 0 {
             return None;
         }
-        // Unquoted (first=0): nonempty iff commas > 1; quoted (first=1): nonempty iff commas > 4.
-        Some(self.commas > (1u32 << (first + first)))
+        Some((c & (1 | (first_mask & 4))) == 0)
     }
 
     /// Branchlessly validate optional CSV wrapping quotes on `(product_id, price)` for
@@ -1161,20 +1175,19 @@ impl Tail {
     #[inline(always)]
     fn wrapping_purchase(&self) -> Option<(usize, usize, usize)> {
         let q = self.quotes;
-        let c_prev = self.commas >> 1;
-        let c_next = self.commas << 1;
+        let c = self.commas;
+        let c_next = c << 1;
         let lf_prev = self.lf_bit >> 1;
         let first = q & 1;
         let last = u32::from((q & c_next) != 0);
-        let expected = ((1 | c_prev) & first.wrapping_neg())
-            | ((c_next | lf_prev) & last.wrapping_neg());
-        if (q != expected)
-            | ((first != 0) & ((self.commas & 3) != 0))
-            | ((last != 0) & (c_next >= lf_prev))
-        {
+        let first_mask = first.wrapping_neg();
+        let last_mask = last.wrapping_neg();
+        let exp = ((1 | (c >> 1)) & first_mask) | ((c_next | lf_prev) & last_mask);
+        let bad = (q ^ exp) | (first_mask & c & 3) | (last_mask & (c_next & lf_prev));
+        if bad != 0 {
             return None;
         }
-        Some((self.commas.trailing_zeros() as usize, first as usize, last as usize))
+        Some((c.trailing_zeros() as usize, first as usize, last as usize))
     }
 }
 
@@ -1183,12 +1196,13 @@ unsafe fn open_ingest_f1(raw: *const u8) -> Option<(*const u8, *const u8)> {
     let iq = usize::from(*raw == b'"');
     let p = raw.add(iq);
     let w = p.add(19).cast::<u32>().read_unaligned();
-    let lut: [u64; 2] = [
-        ((u32::from_le_bytes(*b"Z,\0\0") as u64) << 32) | 0x0000_FFFF,
-        ((u32::from_le_bytes(*b"Z\",\0") as u64) << 32) | 0x00FF_FFFF,
-    ];
-    let me = *lut.get_unchecked(iq);
-    if (w & (me as u32)) != ((me >> 32) as u32) {
+    let mask = std::hint::select_unpredictable(iq != 0, 0x00FF_FFFFu32, 0x0000_FFFFu32);
+    let expect = std::hint::select_unpredictable(
+        iq != 0,
+        u32::from_le_bytes(*b"Z\",\0"),
+        u32::from_le_bytes(*b"Z,\0\0"),
+    );
+    if (w & mask) != expect {
         return None;
     }
     Some((p, p.add(21 + iq)))
@@ -1457,7 +1471,7 @@ fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
 #[inline(always)]
 fn cmp_node_key(ka: u64, kb: u64, link_store: &LinkLongStore) -> CmpOrd {
     if ((ka | kb) as i64) >= 0 {
-        return ka.cmp(&kb);
+        return unmix63(ka).cmp(&unmix63(kb));
     }
     cmp_node_key_slow(ka, kb, link_store)
 }
@@ -1467,13 +1481,13 @@ fn cmp_node_key_slow(ka: u64, kb: u64, link_store: &LinkLongStore) -> CmpOrd {
     let mut ba = [0u8; 16];
     let mut bb = [0u8; 16];
     let sa: &[u8] = if is_short(ka) {
-        let n = ka.unpack_buf(&mut ba);
+        let n = unmix63(ka).unpack_buf(&mut ba);
         &ba[..n]
     } else {
         unsafe { link_store.get(ka as u32) }
     };
     let sb: &[u8] = if is_short(kb) {
-        let n = kb.unpack_buf(&mut bb);
+        let n = unmix63(kb).unpack_buf(&mut bb);
         &bb[..n]
     } else {
         unsafe { link_store.get(kb as u32) }
@@ -1504,7 +1518,7 @@ fn uf_union_min_hybrid(p: &[AtomicU32], keys: &[u64], link_store: &LinkLongStore
 struct LinkParseWorker {
     tid: usize,
     pairs: Vec<(u64, u64)>,
-    long_bytes: Vec<u8>,
+    long_bytes: ArenaBytes,
     cache: LongUserCache,
     buf: Vec<u8>,
 }
@@ -1512,15 +1526,15 @@ struct LinkParseWorker {
 fn encode_link_slice(
     s: &[u8],
     tid: usize,
-    long_bytes: &mut Vec<u8>,
+    long_bytes: &mut ArenaBytes,
     cache: &mut LongUserCache,
     flag: &Flag,
 ) -> Option<u64> {
     if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
-        Some(k)
+        Some(mix63(k))
     } else {
         let h = hash_long(s);
-        let Some(off) = cache.intern_vec(long_bytes, s, h) else {
+        let Some(off) = cache.intern_arena(long_bytes, s, h) else {
             flag.set(Need::Slow);
             return None;
         };
@@ -1534,7 +1548,7 @@ fn links_direct_hybrid(
     hi: usize,
     tid: usize,
     pairs: &mut Vec<(u64, u64)>,
-    long_bytes: &mut Vec<u8>,
+    long_bytes: &mut ArenaBytes,
     cache: &mut LongUserCache,
     flag: &Flag,
 ) {
@@ -1577,40 +1591,108 @@ fn links_direct_hybrid(
     }
 }
 
-struct Map63 {
-    e: Vec<(u64, u32)>,
+/// 4-way AVX2 L1/L2-resident interning map for pre-mixed short link keys (48 KiB at 1024 buckets
+/// vs 256 KiB scalar `Map63`, zero `mix63` recomputation!).
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct LinkKey4([u64; 4]);
+
+struct LinkShortMap4 {
+    keys: Vec<LinkKey4>,
+    vals: Vec<[u32; 4]>,
     mask: usize,
+    len: usize,
+    grow_at: usize,
 }
 
-impl Map63 {
+impl LinkShortMap4 {
     fn with_capacity(n: usize) -> Self {
-        let cap = (n * 2).next_power_of_two().max(16);
-        Self { e: vec![(0, 0); cap], mask: cap - 1 }
+        let nb = ((n / 4) + 4).next_power_of_two().max(4);
+        Self {
+            keys: vec![LinkKey4::default(); nb],
+            vals: vec![[0u32; 4]; nb],
+            mask: nb - 1,
+            len: 0,
+            grow_at: nb * 11 / 4, // 68.75% load
+        }
     }
 
     fn reset(&mut self, n: usize) {
-        let cap = (n * 2).next_power_of_two().max(16);
-        if cap > self.e.len() {
-            *self = Self::with_capacity(n);
-        } else {
-            self.mask = cap - 1;
-            self.e[..cap].fill((0, 0));
+        let nb = ((n / 4) + 4).next_power_of_two().max(4);
+        if nb > self.keys.len() {
+            self.keys.resize(nb, LinkKey4::default());
+            self.vals.resize(nb, [0u32; 4]);
+        }
+        self.keys[..nb].fill(LinkKey4::default());
+        self.mask = nb - 1;
+        self.len = 0;
+        self.grow_at = nb * 11 / 4;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let old_nb = self.mask + 1;
+        let new_nb = old_nb * 2;
+        let old_keys = std::mem::replace(&mut self.keys, vec![LinkKey4::default(); new_nb]);
+        let old_vals = std::mem::replace(&mut self.vals, vec![[0u32; 4]; new_nb]);
+        self.mask = new_nb - 1;
+        self.grow_at = new_nb * 11 / 4;
+        for bi in 0..old_nb {
+            let kb = old_keys[bi].0;
+            let vb = old_vals[bi];
+            for lane in 0..4 {
+                let k = kb[lane];
+                if k == 0 {
+                    break;
+                }
+                let mut slot = (k as usize) & self.mask;
+                'ins: loop {
+                    let dst_k = &mut self.keys[slot].0;
+                    for dl in 0..4 {
+                        if dst_k[dl] == 0 {
+                            dst_k[dl] = k;
+                            self.vals[slot][dl] = vb[lane];
+                            break 'ins;
+                        }
+                    }
+                    slot = (slot + 1) & self.mask;
+                }
+            }
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, k: u64, v: u32) -> (u32, bool) {
-        let mut s = (mix63(k) as usize) & self.mask;
+        let mut bi = (k as usize) & self.mask;
+        let needle = unsafe { _mm256_set1_epi64x(k as i64) };
+        let zero = unsafe { _mm256_setzero_si256() };
         loop {
-            let slot = unsafe { self.e.get_unchecked_mut(s) };
-            if slot.0 == k {
-                return (slot.1, false);
+            let kb = unsafe { self.keys.get_unchecked_mut(bi) };
+            let kv = unsafe { _mm256_load_si256(kb.0.as_ptr().cast()) };
+            let hits = unsafe {
+                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, needle)))
+            } as u32;
+            if hits != 0 {
+                let lane = hits.trailing_zeros() as usize;
+                return (unsafe { *self.vals.get_unchecked(bi).get_unchecked(lane) }, false);
             }
-            if slot.0 == 0 {
-                *slot = (k, v);
+            let empties = unsafe {
+                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, zero)))
+            } as u32;
+            if empties != 0 {
+                let lane = empties.trailing_zeros() as usize;
+                unsafe {
+                    *kb.0.get_unchecked_mut(lane) = k;
+                    *self.vals.get_unchecked_mut(bi).get_unchecked_mut(lane) = v;
+                }
+                self.len += 1;
+                if self.len >= self.grow_at {
+                    self.grow();
+                }
                 return (v, true);
             }
-            s = (s + 1) & self.mask;
+            bi = (bi + 1) & self.mask;
         }
     }
 }
@@ -1646,7 +1728,7 @@ fn read_links_hybrid(
         |tid| LinkParseWorker {
             tid,
             pairs: Vec::with_capacity(est_per_thr),
-            long_bytes: Vec::with_capacity(est_long_bytes),
+            long_bytes: ArenaBytes::new_heap(est_long_bytes),
             cache: LongUserCache::new(),
             buf: std::mem::take(&mut *ctx.readers[tid].lock().unwrap()),
         },
@@ -1685,14 +1767,15 @@ fn read_links_hybrid(
         pairs_by_w.push(w.pairs);
         raw_long_by_w.push(w.long_bytes);
     }
+    let raw_long_slices: Vec<&[u8]> = raw_long_by_w.iter().map(ArenaBytes::as_slice).collect();
     let links = build_bucket_links_hybrid(
         &pairs_by_w,
-        &raw_long_by_w,
+        &raw_long_slices,
         p2_short_bits,
         p2_long_bits,
         threads,
         scratch_buf,
-    );
+    )?;
     let to_drop: Vec<_> = pairs_by_w.into_iter().zip(raw_long_by_w).collect();
     par::drop_par(threads, to_drop);
     tm.lap("links-uf");
@@ -1701,12 +1784,12 @@ fn read_links_hybrid(
 
 fn build_bucket_links_hybrid(
     pairs_by_w: &[Vec<(u64, u64)>],
-    raw_long_by_w: &[Vec<u8>],
+    raw_long_by_w: &[&[u8]],
     p2_short_bits: u32,
     p2_long_bits: u32,
     threads: usize,
     scratch_buf: &mut [MaybeUninit<u8>],
-) -> HybridBucketLinks {
+) -> Result<HybridBucketLinks, Need> {
     let mut off = vec![0usize; pairs_by_w.len() + 1];
     for (i, v) in pairs_by_w.iter().enumerate() {
         off[i + 1] = off[i] + v.len();
@@ -1714,25 +1797,25 @@ fn build_bucket_links_hybrid(
     let nl = off[pairs_by_w.len()];
     if nl == 0 {
         eprintln!("[ingest] links=0 linked_ids=0");
-        return HybridBucketLinks::empty();
+        return Ok(HybridBucketLinks::empty());
     }
     let off_ref = &off;
 
-    // Split scratch into reusable regions so later stages (`keys`+`parent`, `short_tmp`+`long_tmp`)
-    // reuse ALREADY-FAULTED pages from dropped `scattered`, `parts`, and `ep` (-50% minor faults!).
+    // Split scratch into reusable regions so later stages reuse ALREADY-FAULTED pages.
     let slot_a_need = ((2 * nl) * 16 + pairs_by_w.len() * 64 + 4096).min(scratch_buf.len());
     let (slot_a, slot_bc) = scratch_buf.split_at_mut(slot_a_need);
-    let slot_b_need = ((2 * nl) * 8 + 4096).min(slot_bc.len());
+    let slot_b_need = ((2 * nl) * 4 + 4096).min(slot_bc.len());
 
     #[inline(always)]
     fn ep_part(x: u64) -> usize {
         if is_short(x) {
-            (mix63(x) >> (63 - LP_BITS)) as usize
+            (x >> (63 - HLP_BITS)) as usize
         } else {
-            ((x >> 49) & 0xFF) as usize
+            ((x >> 48) & ((HLP - 1) as u64)) as usize
         }
     }
 
+    let overflow_flag = AtomicU8::new(0);
     let (
         link_store,
         link_hashes,
@@ -1747,7 +1830,7 @@ fn build_bucket_links_hybrid(
 
         struct Scattered<'a> {
             flat: ArenaVec<'a, (u64, u32)>,
-            pos: [usize; LP + 1],
+            pos: [usize; HLP + 1],
         }
         let mut sc_a = Scratch::from_slice(slot_a);
         let scatter_space: Vec<_> = pairs_by_w
@@ -1756,17 +1839,17 @@ fn build_bucket_links_hybrid(
             .collect();
         let scattered: Vec<Scattered<'_>> =
             par::run(threads, pairs_by_w.len(), |_| Vec::new(), |res, t| {
-                let mut cnt = [0usize; LP];
+                let mut cnt = [0usize; HLP];
                 for &(a, b) in &pairs_by_w[t] {
                     cnt[ep_part(a)] += 1;
                     cnt[ep_part(b)] += 1;
                 }
-                let mut pos = [0usize; LP + 1];
-                for p in 0..LP {
+                let mut pos = [0usize; HLP + 1];
+                for p in 0..HLP {
                     pos[p + 1] = pos[p] + cnt[p];
                 }
-                let mut cur = [0usize; LP];
-                cur.copy_from_slice(&pos[..LP]);
+                let mut cur = [0usize; HLP];
+                cur.copy_from_slice(&pos[..HLP]);
                 let mut flat = scatter_space[t].lock().unwrap().take().unwrap();
                 let ptr = flat.as_mut_ptr();
                 for (i, &(a, b)) in pairs_by_w[t].iter().enumerate() {
@@ -1780,36 +1863,48 @@ fn build_bucket_links_hybrid(
                         cur[pb] += 1;
                     }
                 }
-                unsafe { flat.set_len(pos[LP]) };
+                unsafe { flat.set_len(pos[HLP]) };
                 res.push(Scattered { flat, pos });
             })
             .into_iter()
             .flatten()
             .collect();
 
-        struct InternPart<'a> {
+        // Precompute exact per-partition upper bounds and disjoint offsets in `slot_c`
+        // (ZERO mutex locks and ZERO per-partition heap allocations during interning!).
+        let mut key_off = [0usize; HLP + 1];
+        for p in 0..HLP {
+            let n: usize = scattered.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
+            key_off[p + 1] = key_off[p] + n;
+        }
+        let mut sc_c = Scratch::from_slice(slot_c);
+        let mut keys_staging = sc_c.buffer::<u64>(key_off[HLP]);
+        let ks_ptr = SyncPtr(keys_staging.as_mut_ptr());
+
+        struct InternPart {
             p: usize,
             wid: u16,
-            keys: ArenaVec<'a, u64>,
+            key_start: usize,
+            key_len: u32,
             lb_start: usize,
             lb_len: usize,
             lm_start: usize,
             lm_len: usize,
         }
         let mut sc_b = Scratch::from_slice(slot_b);
-        let mut ep = sc_b.buffer::<u64>(2 * nl);
+        let mut ep = sc_b.buffer::<u32>(2 * nl);
         let epp = SyncPtr(ep.as_mut_ptr());
         let scattered_ref = &scattered;
-        let key_space = Mutex::new(Scratch::from_slice(slot_c));
-        let key_space_ref = &key_space;
+        let key_off_ref = &key_off;
+        let ov_ref = &overflow_flag;
         let worker_outs = par::run(
             threads,
-            LP,
+            HLP,
             |tid| {
                 (
                     tid as u16,
-                    Vec::<InternPart<'_>>::with_capacity(LP / threads.max(1) + 8),
-                    Map63::with_capacity(1024),
+                    Vec::<InternPart>::with_capacity(HLP / threads.max(1) + 8),
+                    LinkShortMap4::with_capacity(2048),
                     Vec::<u64>::new(),
                     Vec::<u32>::new(),
                     Vec::<u8>::with_capacity(64 << 10),
@@ -1817,7 +1912,8 @@ fn build_bucket_links_hybrid(
                 )
             },
             move |(wid, res, short_m, long_tbl, long_node_ids, w_lb, w_lm), p| {
-                let n: usize = scattered_ref.iter().map(|s| s.pos[p + 1] - s.pos[p]).sum();
+                let k_start = key_off_ref[p];
+                let n = key_off_ref[p + 1] - k_start;
                 short_m.reset(n);
                 let mut lcap = ((n / 4).max(16) * 2).next_power_of_two();
                 if long_tbl.len() < lcap {
@@ -1826,26 +1922,43 @@ fn build_bucket_links_hybrid(
                 long_tbl[..lcap].fill(0);
                 let mut lmask = lcap - 1;
                 long_node_ids.clear();
-                // Unique node rate is ~68% of endpoints; size to 75% + 32 so ArenaVec never spills to heap!
-                let mut keys = key_space_ref.lock().unwrap().buffer::<u64>(n * 3 / 4 + 32);
+                let mut k_len = 0u32;
                 let lb_start = w_lb.len();
                 let lm_start = w_lm.len();
+                let p_hi = (p as u32) << 23;
+                let mut tmp33 = [0u8; 33];
 
                 for s in scattered_ref.iter() {
                     for &(k, e) in &s.flat[s.pos[p]..s.pos[p + 1]] {
                         let id = if is_short(k) {
-                            let (id, ins) = short_m.insert(k, keys.len() as u32);
+                            let (id, ins) = short_m.insert(k, k_len);
                             if ins {
-                                keys.push(k);
+                                unsafe { ks_ptr.write(k_start + k_len as usize, k) };
+                                k_len += 1;
                             }
                             id
                         } else {
                             let tid = ((k >> 57) & 31) as usize;
-                            let bytes =
-                                unsafe { get_long_bytes(raw_long_by_w.get_unchecked(tid), k as u32) };
+                            let arena = unsafe { *raw_long_by_w.get_unchecked(tid) };
+                            let raw_ptr = unsafe { arena.as_ptr().add(k as u32 as usize) };
+                            let b0 = unsafe { *raw_ptr };
                             let h25 = long_user_hash25(k);
+                            let packed_opt = if b0 == 0 {
+                                Some(unsafe {
+                                    (*raw_ptr.add(1), ld8(raw_ptr.add(2)), ld8(raw_ptr.add(10)))
+                                })
+                            } else {
+                                None
+                            };
                             let mut slot = if lcap > (1 << 16) {
-                                (hash_long(bytes) as usize) & lmask
+                                let fh = match packed_opt {
+                                    Some((pt, hi, lo)) => hash_packed_33(pt, hi, lo),
+                                    None => {
+                                        let bytes = unsafe { get_verbatim_bytes(raw_ptr, b0) };
+                                        unsafe { hash_long_general(bytes.as_ptr(), bytes.len()) }
+                                    }
+                                };
+                                (fh as usize) & lmask
                             } else {
                                 (h25 as usize) & lmask
                             };
@@ -1853,24 +1966,35 @@ fn build_bucket_links_hybrid(
                                 let v = unsafe { *long_tbl.get_unchecked(slot) };
                                 if v == 0 {
                                     let lidx = (w_lm.len() - lm_start) as u32;
-                                    let nid = keys.len() as u32;
+                                    let nid = k_len;
                                     let aoff = w_lb.len() as u64;
-                                    w_lb.extend_from_slice(bytes);
-                                    let (full_h, pk) = if bytes.len() == 33 {
-                                        if let Some(pk) = unsafe { try_pack_hex33(bytes.as_ptr()) } {
-                                            (hash_packed_33(pk.0, pk.1, pk.2), pk)
-                                        } else {
-                                            (unsafe { hash_long_general(bytes.as_ptr(), 33) }, (0, 0, 0))
+                                    let (blen, full_h, pk) = match packed_opt {
+                                        Some((pt, hi, lo)) => {
+                                            unpack_hex33(pt, hi, lo, &mut tmp33);
+                                            w_lb.extend_from_slice(&tmp33);
+                                            (33u32, hash_packed_33(pt, hi, lo), (pt, hi, lo))
                                         }
-                                    } else {
-                                        (
-                                            unsafe { hash_long_general(bytes.as_ptr(), bytes.len()) },
-                                            (0, 0, 0),
-                                        )
+                                        None => {
+                                            let bytes = unsafe { get_verbatim_bytes(raw_ptr, b0) };
+                                            w_lb.extend_from_slice(bytes);
+                                            (
+                                                bytes.len() as u32,
+                                                unsafe {
+                                                    hash_long_general(bytes.as_ptr(), bytes.len())
+                                                },
+                                                (0, 0, 0),
+                                            )
+                                        }
                                     };
-                                    w_lm.push((aoff, bytes.len() as u32, full_h, pk));
+                                    w_lm.push((aoff, blen, full_h, pk));
                                     long_node_ids.push(nid);
-                                    keys.push(LONG_BIT | (lidx as u64));
+                                    unsafe {
+                                        ks_ptr.write(
+                                            k_start + k_len as usize,
+                                            LONG_BIT | (lidx as u64),
+                                        );
+                                    }
+                                    k_len += 1;
                                     unsafe {
                                         *long_tbl.get_unchecked_mut(slot) =
                                             ((h25 as u64) << 32) | (lidx as u64 + 1);
@@ -1884,7 +2008,9 @@ fn build_bucket_links_hybrid(
                                         }
                                         long_tbl[..lcap].fill(0);
                                         let wide = lcap > (1 << 16);
-                                        for (li, &(_, _, mh, _)) in w_lm[lm_start..].iter().enumerate() {
+                                        for (li, &(_, _, mh, _)) in
+                                            w_lm[lm_start..].iter().enumerate()
+                                        {
                                             let mh25 = (mh >> 39) as u32;
                                             let mut ms = if wide {
                                                 (mh as usize) & lmask
@@ -1904,28 +2030,40 @@ fn build_bucket_links_hybrid(
                                 }
                                 if (v >> 32) as u32 == h25 {
                                     let li = (v as u32 - 1) as usize;
-                                    let (moff, mlen, _, _) =
+                                    let (moff, mlen, _, mpk) =
                                         unsafe { *w_lm.get_unchecked(lm_start + li) };
-                                    if mlen as usize == bytes.len()
-                                        && unsafe {
-                                            w_lb.get_unchecked(
-                                                moff as usize..moff as usize + mlen as usize,
-                                            )
-                                        } == bytes
-                                    {
+                                    let matched = match packed_opt {
+                                        Some(pk) => mpk == pk,
+                                        None => {
+                                            let bytes = unsafe { get_verbatim_bytes(raw_ptr, b0) };
+                                            mpk.0 == 0
+                                                && mlen as usize == bytes.len()
+                                                && unsafe {
+                                                    w_lb.get_unchecked(
+                                                        moff as usize
+                                                            ..moff as usize + mlen as usize,
+                                                    )
+                                                } == bytes
+                                        }
+                                    };
+                                    if matched {
                                         break unsafe { *long_node_ids.get_unchecked(li) };
                                     }
                                 }
                                 slot = (slot + 1) & lmask;
                             }
                         };
-                        unsafe { epp.write(e as usize, ((p as u64) << 32) | id as u64) };
+                        unsafe { epp.write(e as usize, p_hi | id) };
                     }
+                }
+                if (k_len as usize) > MAX_HLP_LOCAL_ID {
+                    ov_ref.store(1, Ordering::Relaxed);
                 }
                 res.push(InternPart {
                     p,
                     wid: *wid,
-                    keys,
+                    key_start: k_start,
+                    key_len: k_len,
                     lb_start,
                     lb_len: w_lb.len() - lb_start,
                     lm_start,
@@ -1933,12 +2071,15 @@ fn build_bucket_links_hybrid(
                 });
             },
         );
+        if overflow_flag.load(Ordering::Relaxed) != 0 {
+            return Err(Need::Slow);
+        }
         unsafe { ep.set_len(2 * nl) };
         drop(scattered);
         drop(scatter_space);
         drop(sc_a);
 
-        let mut parts: Vec<InternPart<'_>> = Vec::with_capacity(LP);
+        let mut parts: Vec<InternPart> = Vec::with_capacity(HLP);
         let mut w_long_bytes: Vec<Vec<u8>> = Vec::with_capacity(worker_outs.len());
         let mut w_long_meta: Vec<Vec<(u64, u32, u64, (u8, u64, u64))>> =
             Vec::with_capacity(worker_outs.len());
@@ -1949,17 +2090,17 @@ fn build_bucket_links_hybrid(
         }
         parts.sort_unstable_by_key(|x| x.p);
 
-        let mut base = vec![0u32; LP + 1];
-        let mut long_id_base = vec![0u32; LP + 1];
-        let mut long_byte_base = vec![0usize; LP + 1];
-        for p in 0..LP {
-            base[p + 1] = base[p] + parts[p].keys.len() as u32;
+        let mut base = vec![0u32; HLP + 1];
+        let mut long_id_base = vec![0u32; HLP + 1];
+        let mut long_byte_base = vec![0usize; HLP + 1];
+        for p in 0..HLP {
+            base[p + 1] = base[p] + parts[p].key_len;
             long_id_base[p + 1] = long_id_base[p] + parts[p].lm_len as u32;
             long_byte_base[p + 1] = long_byte_base[p] + parts[p].lb_len;
         }
-        let nn = base[LP] as usize;
-        let total_long_ids = long_id_base[LP] as usize;
-        let total_long_bytes = long_byte_base[LP];
+        let nn = base[HLP] as usize;
+        let total_long_ids = long_id_base[HLP] as usize;
+        let total_long_bytes = long_byte_base[HLP];
 
         let mut link_bytes: Vec<u8> = Vec::with_capacity(total_long_bytes);
         let mut link_meta = Vec::with_capacity(total_long_ids);
@@ -1986,11 +2127,11 @@ fn build_bucket_links_hybrid(
             let (parts_ref, base_ref, lib_ref, lbb_ref, wlb_ref, wlm_ref) =
                 (&parts, &base, &long_id_base, &long_byte_base, &w_long_bytes, &w_long_meta);
             // Fused single barrier: materialize `link_store` AND `keys` + `parent` together.
-            par::run(threads, LP, |_| (), move |_, p| {
+            par::run(threads, HLP, |_| (), move |_, p| {
                 let ip = &parts_ref[p];
                 let s = base_ref[p] as usize;
                 let lbase = lib_ref[p] as u64;
-                let src = &ip.keys;
+                let src = unsafe { ks_ptr.slice(ip.key_start, ip.key_len as usize) };
                 for (k, &v) in src.iter().enumerate() {
                     let gv = if is_short(v) { v } else { LONG_BIT | (lbase + (v as u32 as u64)) };
                     unsafe {
@@ -2021,11 +2162,12 @@ fn build_bucket_links_hybrid(
             parent.set_len(nn);
         }
         drop(parts);
+        drop(keys_staging);
         drop(w_long_bytes);
         drop(w_long_meta);
         let link_store = LinkLongStore { bytes: link_bytes, meta: link_meta, packed: link_packed };
 
-        let node = |code: u64| base[(code >> 32) as usize] + code as u32;
+        let node = |code: u32| base[(code >> 23) as usize] + (code & (MAX_HLP_LOCAL_ID as u32));
         let step = 1 << 16;
         let (parent_ref, ep_ref, keys_ref, ls_ref) = (&parent, &ep, &keys, &link_store);
         par::run(threads, nl.div_ceil(step), |_| (), |_, t| {
@@ -2044,15 +2186,15 @@ fn build_bucket_links_hybrid(
     let p2_long = 1usize << p2_long_bits;
     let short_shift = 63 - p2_short_bits;
     let long_shift = 64 - p2_long_bits;
-    let short_split = p2_short_bits > LP_BITS;
-    let short_sub_bits = p2_short_bits.saturating_sub(LP_BITS);
+    let short_split = p2_short_bits > HLP_BITS;
+    let short_sub_bits = p2_short_bits.saturating_sub(HLP_BITS);
     let short_sub = 1usize << short_sub_bits;
-    let long_split = p2_long_bits > LP_BITS;
-    let long_sub_bits = p2_long_bits.saturating_sub(LP_BITS);
+    let long_split = p2_long_bits > HLP_BITS;
+    let long_sub_bits = p2_long_bits.saturating_sub(HLP_BITS);
     let long_sub = 1usize << long_sub_bits;
     debug_assert!(short_sub <= 16 && long_sub <= 16);
 
-    // Reuse ALREADY-FAULTED `slot_bc` (`ep` + `parts_keys` pages) for `short_tmp` + `long_tmp`!
+    // Reuse ALREADY-FAULTED `slot_bc` (`ep` + `keys_staging` pages) for `short_tmp` + `long_tmp`!
     let mut sc_tmp = Scratch::from_slice(slot_bc);
     let mut short_tmp = sc_tmp.buffer::<(u64, u64)>(nn);
     let mut long_tmp = sc_tmp.buffer::<LongLinkPair>(total_long_ids.max(1));
@@ -2061,8 +2203,8 @@ fn build_bucket_links_hybrid(
 
     let mut short_sub_counts = if short_split { vec![0usize; p2_short] } else { Vec::new() };
     let mut long_sub_counts = if long_split { vec![0usize; p2_long] } else { Vec::new() };
-    let mut short_plen = [0usize; LP];
-    let mut long_plen = [0usize; LP];
+    let mut short_plen = [0usize; HLP];
+    let mut long_plen = [0usize; HLP];
 
     {
         let (base_ref, lib_ref, parent_ref, keys_ref, lh_ref, ls_ref) =
@@ -2072,7 +2214,7 @@ fn build_bucket_links_hybrid(
         let sp_ptr = SyncPtr(short_plen.as_mut_ptr());
         let lp_ptr = SyncPtr(long_plen.as_mut_ptr());
 
-        par::run(threads, LP, |_| (), move |_, p| {
+        par::run(threads, HLP, |_| (), move |_, p| {
             let (s, e) = (base_ref[p] as usize, base_ref[p + 1] as usize);
             let ls = lib_ref[p] as usize;
             let sbase_q = p << short_sub_bits;
@@ -2088,7 +2230,7 @@ fn build_bucket_links_hybrid(
                 let k = unsafe { *keys_ref.get_unchecked(i) };
                 if c != k {
                     let canon_tagged = if is_short(c) {
-                        mix63(c)
+                        c
                     } else {
                         let cid = c as u32;
                         let ch = unsafe { *lh_ref.get_unchecked(cid as usize) };
@@ -2096,12 +2238,11 @@ fn build_bucket_links_hybrid(
                         make_link_long_user(p2_short + clq, ch, cid)
                     };
                     if is_short(k) {
-                        let rh = mix63(k);
                         if short_split {
-                            let sub_i = ((rh >> short_shift) as usize) - sbase_q;
+                            let sub_i = ((k >> short_shift) as usize) - sbase_q;
                             slocal[sub_i] += 1;
                         }
-                        unsafe { stmp_ptr.write(sw, (rh, canon_tagged)) };
+                        unsafe { stmp_ptr.write(sw, (k, canon_tagged)) };
                         sw += 1;
                     } else {
                         let kid = k as u32;
@@ -2148,7 +2289,7 @@ fn build_bucket_links_hybrid(
     drop(keys);
     drop(link_hashes);
 
-    let mut short_lp_off = [0usize; LP + 1];
+    let mut short_lp_off = [0usize; HLP + 1];
     let mut short_offsets = Vec::with_capacity(p2_short + 1);
     let sacc: usize;
     if short_split {
@@ -2161,19 +2302,19 @@ fn build_bucket_links_hybrid(
         sacc = acc;
     } else {
         let mut acc = 0usize;
-        for p in 0..LP {
+        for p in 0..HLP {
             short_lp_off[p] = acc;
             acc += short_plen[p];
         }
-        short_lp_off[LP] = acc;
-        let merge_shift = LP_BITS - p2_short_bits;
+        short_lp_off[HLP] = acc;
+        let merge_shift = HLP_BITS - p2_short_bits;
         for q in 0..=p2_short {
             short_offsets.push(short_lp_off[q << merge_shift]);
         }
         sacc = acc;
     }
 
-    let mut long_lp_off = [0usize; LP + 1];
+    let mut long_lp_off = [0usize; HLP + 1];
     let mut long_offsets = Vec::with_capacity(p2_long + 1);
     let lacc: usize;
     if long_split {
@@ -2186,12 +2327,12 @@ fn build_bucket_links_hybrid(
         lacc = acc;
     } else {
         let mut acc = 0usize;
-        for p in 0..LP {
+        for p in 0..HLP {
             long_lp_off[p] = acc;
             acc += long_plen[p];
         }
-        long_lp_off[LP] = acc;
-        let merge_shift = LP_BITS - p2_long_bits;
+        long_lp_off[HLP] = acc;
+        let merge_shift = HLP_BITS - p2_long_bits;
         for lq in 0..=p2_long {
             long_offsets.push(long_lp_off[lq << merge_shift]);
         }
@@ -2203,7 +2344,7 @@ fn build_bucket_links_hybrid(
         sacc + lacc
     );
     if sacc + lacc == 0 {
-        return HybridBucketLinks::empty();
+        return Ok(HybridBucketLinks::empty());
     }
 
     let mut short_pairs = Vec::with_capacity(sacc);
@@ -2221,7 +2362,7 @@ fn build_bucket_links_hybrid(
         &long_lp_off,
     );
 
-    par::run(threads, LP, |_| (), move |_, p| {
+    par::run(threads, HLP, |_| (), move |_, p| {
         let slen = splen_ref[p];
         if slen > 0 {
             let src = unsafe { stmp_ptr.slice(base_ref[p] as usize, slen) };
@@ -2264,14 +2405,14 @@ fn build_bucket_links_hybrid(
         long_pairs.set_len(lacc);
     }
 
-    HybridBucketLinks {
+    Ok(HybridBucketLinks {
         has_links: true,
         short_pairs,
         short_offsets,
         long_pairs,
         long_offsets,
         link_store,
-    }
+    })
 }
 
 // ============================================================================
@@ -2490,7 +2631,7 @@ unsafe fn parse_purchase_tail(
 }
 
 #[inline(always)]
-unsafe fn event_hybrid(
+unsafe fn event_hybrid<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
     rows: &ParseRowsH<'_>,
     p: *const u8,
     st: &mut ParseStateH,
@@ -2526,7 +2667,7 @@ unsafe fn event_hybrid(
         if ing as u64 >= u32::MAX as u64 - 1 {
             return None;
         }
-        let (ts_rel, ok) = if rows.ws_whole_sec {
+        let (ts_rel, ok) = if WS_WHOLE_SEC || rows.ws_whole_sec {
             let dsec = ts_sec.wrapping_sub(rows.ws_sec);
             let ok = ((dsec as u64) < rows.win_len_sec) & (ing - ts_sec <= 86_400);
             ((dsec as u32).wrapping_mul(1000), ok)
@@ -2538,28 +2679,43 @@ unsafe fn event_hybrid(
         };
         (ts_rel, ing, ok, after)
     };
-    let (p, emask, eexpect, eq) = open(after_ingest);
-    let ew = ld8(p);
-    let word = ew as u32;
-    let d_diff = u32::from((((ew >> 32) as u16) & emask) ^ eexpect);
-    let (valid, ts_or_purch, next_p) = if any_zero_u32(
-        (word ^ u32::from_le_bytes(*b"view")) | d_diff,
-        (word ^ u32::from_le_bytes(*b"cart")) | d_diff,
+    // Direct 2-entry LUT for `view,` / `"view",` / `cart,` / `"cart",` (zero `open()` overhead!).
+    const MASK_VC: [u64; 2] = [0x0000_00FF_FFFF_FFFF, 0x00FF_FFFF_FFFF_FFFF];
+    const EXP_VIEW: [u64; 2] = [
+        u64::from_le_bytes(*b"view,\0\0\0"),
+        u64::from_le_bytes(*b"\"view\",\0"),
+    ];
+    const EXP_CART: [u64; 2] = [
+        u64::from_le_bytes(*b"cart,\0\0\0"),
+        u64::from_le_bytes(*b"\"cart\",\0"),
+    ];
+    let eq = usize::from(*after_ingest == b'"');
+    let ew_raw = ld8(after_ingest);
+    let masked = ew_raw & *MASK_VC.get_unchecked(eq);
+    let (valid, ts_or_purch, next_p) = if any_zero_u64(
+        masked ^ *EXP_VIEW.get_unchecked(eq),
+        masked ^ *EXP_CART.get_unchecked(eq),
     ) {
-        let p = p.add(5 + eq);
+        let p = after_ingest.add(5 + eq + eq);
         let tail = tail(p)?;
         let prod_nonempty = tail.wrapping_view_cart()?;
         let valid = valid_time & prod_nonempty;
-        let ts_or_purch = if !valid || (ts_rel as i32) >= 0 {
+        let ts_or_purch = if SHORT_WIN || !valid || (ts_rel as i32) >= 0 {
             ts_rel
         } else {
             st.push_purch(ts_rel, 0, rows.flag)
         };
         (valid, ts_or_purch, p.add(tail.lf + 1))
-    } else if (ew == u64::from_le_bytes(*b"purchase")) & ends(p, 8, emask, eexpect) {
-        parse_purchase_tail(rows, p.add(9 + eq), valid_time, ts_rel, st)?
     } else {
-        return None;
+        let p = after_ingest.add(eq);
+        let ew = ld8(p);
+        let emask = if eq != 0 { 0xFFFFu16 } else { 0x00FFu16 };
+        let eexpect = if eq != 0 { u16::from_le_bytes(*b"\",") } else { b',' as u16 };
+        if (ew == u64::from_le_bytes(*b"purchase")) & ends(p, 8, emask, eexpect) {
+            parse_purchase_tail(rows, p.add(9 + eq), valid_time, ts_rel, st)?
+        } else {
+            return None;
+        }
     };
     // Single shared emit site (1 b.push_idx + 1 tok.push instead of 4 duplicated copies!).
     let loc = if valid {
@@ -2773,7 +2929,13 @@ fn click_slow_hybrid(
 }
 
 #[inline(never)]
-fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+fn parse_events_buf_hybrid_impl<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
+    rows: &ParseRowsH<'_>,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    st: &mut ParseStateH,
+) {
     if lo >= hi {
         return;
     }
@@ -2783,11 +2945,20 @@ fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usi
     let end = unsafe { base.add(hi) };
     while p < end {
         p = unsafe {
-            match event_hybrid(rows, p, st) {
+            match event_hybrid::<WS_WHOLE_SEC, SHORT_WIN>(rows, p, st) {
                 Some(next) => next,
                 None => base.add(event_slow_hybrid(rows, buf, p.offset_from(base) as usize, hi, st)),
             }
         };
+    }
+}
+
+#[inline(always)]
+fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+    if rows.ws_whole_sec && rows.win_len_ms <= i32::MAX as u64 {
+        parse_events_buf_hybrid_impl::<true, true>(rows, buf, lo, hi, st);
+    } else {
+        parse_events_buf_hybrid_impl::<false, false>(rows, buf, lo, hi, st);
     }
 }
 
@@ -2821,17 +2992,20 @@ struct InputSample {
     avg_long_cid_len: usize,
 }
 
-/// Sample across up to 4 events files + 4 clicks files (~400 rows, < 50 us) for low-variance
-/// arena & `ArenaBytes` sizing.
+/// Sample across up to 8 events files + 8 clicks files (head + middle windows, ~2,000 rows,
+/// < 200 us) for accurate split-cap `Sinks` & `ArenaBytes` sizing with zero sampling skew.
 fn sample_input_stats(files: &[FileInfo]) -> InputSample {
-    const SAMPLE_BYTES: usize = 8192;
+    const SAMPLE_BYTES: usize = 12288;
     let mut buf = vec![0u8; SAMPLE_BYTES + scan::PAD + 1];
 
-    let read_head = |fi: &FileInfo, buf: &mut [u8]| -> Option<(usize, usize)> {
-        let n = (fi.len as usize).min(SAMPLE_BYTES);
+    let read_window = |fi: &FileInfo, off: u64, buf: &mut [u8]| -> Option<(usize, usize)> {
+        if off >= fi.len {
+            return None;
+        }
+        let n = ((fi.len - off) as usize).min(SAMPLE_BYTES);
         let mut got = 0usize;
         while got < n {
-            match fi.handle.read_at(&mut buf[got..n], got as u64) {
+            match fi.handle.read_at(&mut buf[got..n], off + got as u64) {
                 Ok(0) => break,
                 Ok(k) => got += k,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -2842,12 +3016,13 @@ fn sample_input_stats(files: &[FileInfo]) -> InputSample {
             return None;
         }
         buf[got..got + scan::PAD + 1].fill(0);
+        // Always skip first partial/header line cleanly.
         let first_nl = scan::memchr(b'\n', &buf[..got])?;
         let pos = first_nl + 1;
         if pos >= got {
             return None;
         }
-        let hi = if fi.len > got as u64 {
+        let hi = if (off + got as u64) < fi.len {
             let p = buf[pos..got].iter().rposition(|&b| b == b'\n')?;
             pos + p + 1
         } else if buf[got - 1] != b'\n' {
@@ -2864,45 +3039,56 @@ fn sample_input_stats(files: &[FileInfo]) -> InputSample {
     let (mut long_user, mut long_user_bytes) = (0usize, 0usize);
     let mut ev_files_sampled = 0usize;
     for fi in files.iter().filter(|f| f.kind == Kind::Events && f.len > 64) {
-        let Some((mut pos, hi)) = read_head(fi, &mut buf) else {
-            continue;
+        let mut offsets = [0u64, 0u64];
+        let n_win = if fi.len > (SAMPLE_BYTES as u64) * 3 {
+            offsets[1] = fi.len / 2;
+            2
+        } else {
+            1
         };
         let mut f_rows = 0usize;
-        while pos < hi && f_rows < 100 && ev_rows < 400 {
-            let Some(rel_lf) = scan::memchr(b'\n', &buf[pos..hi]) else {
-                break;
+        for &off in &offsets[..n_win] {
+            let Some((mut pos, hi)) = read_window(fi, off, &mut buf) else {
+                continue;
             };
-            let lf = pos + rel_lf;
-            if let Some(f) = scan::row_fields::<7>(&buf, pos, lf) {
-                if flen(f[0]) > 0 {
-                    ev_rows += 1;
-                    f_rows += 1;
-                    ev_bytes += lf + 1 - pos;
-                    let s0 = field(&buf, f[0]);
-                    if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
-                        long_eid += 1;
-                        long_eid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
-                            17
-                        } else {
-                            s0.len()
-                        };
-                    }
-                    let s1 = field(&buf, f[1]);
-                    if !s1.is_empty() && unsafe { u64::enc(s1.as_ptr(), s1.len()) }.is_none() {
-                        long_user += 1;
-                        long_user_bytes += if s1.len() == 33 && unsafe { try_pack_hex33(s1.as_ptr()) }.is_some() {
-                            17
-                        } else {
-                            s1.len()
-                        };
+            let mut w_rows = 0usize;
+            while pos < hi && w_rows < 125 && ev_rows < 2000 {
+                let Some(rel_lf) = scan::memchr(b'\n', &buf[pos..hi]) else {
+                    break;
+                };
+                let lf = pos + rel_lf;
+                if let Some(f) = scan::row_fields::<7>(&buf, pos, lf) {
+                    if flen(f[0]) > 0 {
+                        ev_rows += 1;
+                        f_rows += 1;
+                        w_rows += 1;
+                        ev_bytes += lf + 1 - pos;
+                        let s0 = field(&buf, f[0]);
+                        if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
+                            long_eid += 1;
+                            long_eid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
+                                17
+                            } else {
+                                s0.len()
+                            };
+                        }
+                        let s1 = field(&buf, f[1]);
+                        if !s1.is_empty() && unsafe { u64::enc(s1.as_ptr(), s1.len()) }.is_none() {
+                            long_user += 1;
+                            long_user_bytes += if s1.len() == 33 && unsafe { try_pack_hex33(s1.as_ptr()) }.is_some() {
+                                17
+                            } else {
+                                s1.len()
+                            };
+                        }
                     }
                 }
+                pos = lf + 1;
             }
-            pos = lf + 1;
         }
         if f_rows > 0 {
             ev_files_sampled += 1;
-            if ev_files_sampled >= 4 || ev_rows >= 400 {
+            if ev_files_sampled >= 8 || ev_rows >= 2000 {
                 break;
             }
         }
@@ -2911,36 +3097,47 @@ fn sample_input_stats(files: &[FileInfo]) -> InputSample {
     let (mut ck_rows, mut ck_bytes, mut long_cid, mut long_cid_bytes) = (0usize, 0usize, 0usize, 0usize);
     let mut ck_files_sampled = 0usize;
     for fi in files.iter().filter(|f| f.kind == Kind::Clicks && f.len > 64) {
-        let Some((mut pos, hi)) = read_head(fi, &mut buf) else {
-            continue;
+        let mut offsets = [0u64, 0u64];
+        let n_win = if fi.len > (SAMPLE_BYTES as u64) * 3 {
+            offsets[1] = fi.len / 2;
+            2
+        } else {
+            1
         };
         let mut f_rows = 0usize;
-        while pos < hi && f_rows < 100 && ck_rows < 400 {
-            let Some(rel_lf) = scan::memchr(b'\n', &buf[pos..hi]) else {
-                break;
+        for &off in &offsets[..n_win] {
+            let Some((mut pos, hi)) = read_window(fi, off, &mut buf) else {
+                continue;
             };
-            let lf = pos + rel_lf;
-            if let Some(f) = scan::row_fields::<4>(&buf, pos, lf) {
-                if flen(f[0]) > 0 {
-                    ck_rows += 1;
-                    f_rows += 1;
-                    ck_bytes += lf + 1 - pos;
-                    let s0 = field(&buf, f[0]);
-                    if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
-                        long_cid += 1;
-                        long_cid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
-                            17
-                        } else {
-                            s0.len()
-                        };
+            let mut w_rows = 0usize;
+            while pos < hi && w_rows < 125 && ck_rows < 2000 {
+                let Some(rel_lf) = scan::memchr(b'\n', &buf[pos..hi]) else {
+                    break;
+                };
+                let lf = pos + rel_lf;
+                if let Some(f) = scan::row_fields::<4>(&buf, pos, lf) {
+                    if flen(f[0]) > 0 {
+                        ck_rows += 1;
+                        f_rows += 1;
+                        w_rows += 1;
+                        ck_bytes += lf + 1 - pos;
+                        let s0 = field(&buf, f[0]);
+                        if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
+                            long_cid += 1;
+                            long_cid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
+                                17
+                            } else {
+                                s0.len()
+                            };
+                        }
                     }
                 }
+                pos = lf + 1;
             }
-            pos = lf + 1;
         }
         if f_rows > 0 {
             ck_files_sampled += 1;
-            if ck_files_sampled >= 4 || ck_rows >= 400 {
+            if ck_files_sampled >= 8 || ck_rows >= 2000 {
                 break;
             }
         }
@@ -3135,18 +3332,37 @@ fn relocate_hybrid(
     threads: usize,
 ) -> (Vec<Sinks<RecB12, SWCB_B>>, Vec<Sinks<RecC<u64>, SWCB_CK>>, Vec<SinkArena>) {
     let p2_total = p2_short + p2_long;
-    let total_ev: usize = b_sinks
+    let short_ev: usize = b_sinks
         .iter()
-        .map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>())
+        .map(|s| s.len[..p2_short].iter().map(|&x| x as usize).sum::<usize>())
         .sum();
-    let total_ck: usize = ck_sinks
+    let long_ev: usize = b_sinks
         .iter()
-        .map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>())
+        .map(|s| s.len[p2_short..].iter().map(|&x| x as usize).sum::<usize>())
         .sum();
-    let cap_rb = (total_ev * 62 / 100 / threads / p2_total).max(16) + 16;
-    let cap_rc = (total_ck * 62 / 100 / threads / p2_total).max(16) + 16;
-    let rb_bytes = Sinks::<RecB12, SWCB_B>::arena_bytes(p2_total, cap_rb);
-    let rc_bytes = Sinks::<RecC<u64>, SWCB_CK>::arena_bytes(p2_total, cap_rc);
+    let short_ck: usize = ck_sinks
+        .iter()
+        .map(|s| s.len[..p2_short].iter().map(|&x| x as usize).sum::<usize>())
+        .sum();
+    let long_ck: usize = ck_sinks
+        .iter()
+        .map(|s| s.len[p2_short..].iter().map(|&x| x as usize).sum::<usize>())
+        .sum();
+    let cap_rb_s = (short_ev * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rb_l = if long_ev > 0 {
+        (long_ev * 65 / 100 / threads / p2_long).max(16) + 16
+    } else {
+        16
+    };
+    let cap_rc_s = (short_ck * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rc_l = if long_ck > 0 {
+        (long_ck * 65 / 100 / threads / p2_long).max(16) + 16
+    } else {
+        16
+    };
+    let rb_bytes = Sinks::<RecB12, SWCB_B>::arena_bytes_split(p2_short, p2_long, cap_rb_s, cap_rb_l);
+    let rc_bytes =
+        Sinks::<RecC<u64>, SWCB_CK>::arena_bytes_split(p2_short, p2_long, cap_rc_s, cap_rc_l);
 
     let mut carved: Vec<Mutex<Option<(SinkArena, SinkArena)>>> = Vec::with_capacity(threads);
     let mut rem_arenas = Vec::with_capacity(free_arenas.len());
@@ -3183,9 +3399,15 @@ fn relocate_hybrid(
         |tid| {
             let (reloc_b, reloc_c) =
                 if let Some((rb_a, rc_a)) = carved_ref[tid].lock().unwrap().take() {
-                    (Sinks::in_arena(p2_total, cap_rb, rb_a), Sinks::in_arena(p2_total, cap_rc, rc_a))
+                    (
+                        Sinks::in_arena_split(p2_short, p2_long, cap_rb_s, cap_rb_l, rb_a),
+                        Sinks::in_arena_split(p2_short, p2_long, cap_rc_s, cap_rc_l, rc_a),
+                    )
                 } else {
-                    (Sinks::new(p2_total, cap_rb), Sinks::new(p2_total, cap_rc))
+                    (
+                        Sinks::new_split(p2_short, p2_long, cap_rb_s, cap_rb_l),
+                        Sinks::new_split(p2_short, p2_long, cap_rc_s, cap_rc_l),
+                    )
                 };
             RelocStateH {
                 short_map: ShortRelocMap::default(),
@@ -3327,36 +3549,131 @@ fn relocate_hybrid(
 }
 
 // ============================================================================
-// Stage 5: Disjoint Pure-Short / Pure-Long Group + Aggregate
+// Stage 5: Disjoint Pure-Short / Pure-Long Direct Block-Chain Group + Aggregate
 // ============================================================================
 
+const EV_BLOCK_CAP: usize = 31;
+
+/// 256-byte (4-cache-line) linked block of up to 31 `CompactEv`s per person.
+/// Eliminates the 3-pass `pid + ev_flat -> fill -> ev_buf` CSR copy completely:
+/// - `1..=16` events fit in 1 contiguous block -> sorted IN PLACE with zero copy!
+/// - `17..=31` events (`dense_min = 17`) fit in 1 contiguous block -> single-call `dense.scatter`!
+/// - `>= 32` events stream block-by-block into `DenseSessions` (2x fewer block links/chases)!
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EvBlock {
+    next: u32,
+    len: u32,
+    evs: [MaybeUninit<CompactEv>; EV_BLOCK_CAP],
+}
+
+const _: () = assert!(std::mem::size_of::<EvBlock>() == 256);
+
+impl EvBlock {
+    #[inline(always)]
+    unsafe fn init_first(dst: *mut Self, ev: CompactEv) {
+        std::ptr::addr_of_mut!((*dst).next).write(u32::MAX);
+        std::ptr::addr_of_mut!((*dst).len).write(1);
+        (*dst).evs.as_mut_ptr().write(MaybeUninit::new(ev));
+    }
+
+    #[inline(always)]
+    fn slice(&self) -> &[CompactEv] {
+        unsafe { std::slice::from_raw_parts(self.evs.as_ptr().cast(), self.len as usize) }
+    }
+
+    #[inline(always)]
+    fn slice_mut(&mut self) -> &mut [CompactEv] {
+        unsafe { std::slice::from_raw_parts_mut(self.evs.as_mut_ptr().cast(), self.len as usize) }
+    }
+}
+
+/// Register-cached cursor over `ArenaVec<'a, EvBlock>` during partition ingestion:
+/// avoids `ArenaVec::Borrowed`/`Heap` enum dispatch on the 92%-hit `append` hot path.
+struct EvBlockPool<'a, 'b> {
+    ptr: *mut EvBlock,
+    len: usize,
+    cap: usize,
+    vec: &'b mut ArenaVec<'a, EvBlock>,
+}
+
+impl<'a, 'b> EvBlockPool<'a, 'b> {
+    #[inline(always)]
+    fn new(vec: &'b mut ArenaVec<'a, EvBlock>) -> Self {
+        vec.clear();
+        let ptr = vec.as_mut_ptr();
+        let cap = vec.capacity();
+        Self { ptr, len: 0, cap, vec }
+    }
+
+    #[inline(always)]
+    unsafe fn get_mut(&mut self, id: u32) -> &mut EvBlock {
+        &mut *self.ptr.add(id as usize)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        unsafe { self.vec.set_len(self.len) };
+        self.vec.reserve(self.cap.max(4096));
+        self.ptr = self.vec.as_mut_ptr();
+        self.cap = self.vec.capacity();
+    }
+
+    #[inline(always)]
+    fn alloc_first(&mut self, ev: CompactEv) -> u32 {
+        if self.len == self.cap {
+            self.grow();
+        }
+        let id = self.len;
+        unsafe { EvBlock::init_first(self.ptr.add(id), ev) };
+        self.len = id + 1;
+        id as u32
+    }
+}
+
+impl Drop for EvBlockPool<'_, '_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        unsafe { self.vec.set_len(self.len) };
+    }
+}
+
 /// 4-way AVX2 cache-line bucketed group map for pre-mixed short `u64` keys (50% max load,
-/// 32 KiB L1d-resident per partition -> eliminates ~100k+ linear-probe mispredicts/M).
+/// 32 KiB L1d-resident per partition). Storing `tails` directly in the 64B bucket keeps the
+/// bucket READ-ONLY in L1d on the 92%-hit path (`blk.len < 15`) without touching `persons`.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(64))]
 struct ShortGroupBucket {
     keys: [u64; 4],
     ids: [u32; 4],
-    counts: [u32; 4],
+    tails: [u32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct ShortPersonHead {
+    slot: u32,
+    head: u32,
+    full_blocks: u32,
 }
 
 struct ShortGroupMap4 {
     buckets: Vec<ShortGroupBucket>,
-    person_slots: Vec<u32>,
+    persons: Vec<ShortPersonHead>,
     mask: usize,
     grow_at: usize,
 }
 
 impl ShortGroupMap4 {
     fn new() -> Self {
-        Self { buckets: Vec::new(), person_slots: Vec::with_capacity(2048), mask: 0, grow_at: 0 }
+        Self { buckets: Vec::new(), persons: Vec::with_capacity(2048), mask: 0, grow_at: 0 }
     }
 
     fn reset(&mut self, est_keys: usize) {
         let nb = ((est_keys + 1) / 2).next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(nb, ShortGroupBucket::default());
-        self.person_slots.clear();
+        self.persons.clear();
         self.mask = nb - 1;
         self.grow_at = nb * 2;
     }
@@ -3367,13 +3684,13 @@ impl ShortGroupMap4 {
         let old = std::mem::replace(&mut self.buckets, vec![ShortGroupBucket::default(); nb]);
         self.mask = nb - 1;
         self.grow_at = nb * 2;
-        for slot in &mut self.person_slots {
-            let obi = (*slot >> 2) as usize;
-            let olane = (*slot & 3) as usize;
+        for p in &mut self.persons {
+            let obi = (p.slot >> 2) as usize;
+            let olane = (p.slot & 3) as usize;
             let ob = unsafe { old.get_unchecked(obi) };
             let key = ob.keys[olane];
             let id = ob.ids[olane];
-            let cnt = ob.counts[olane];
+            let tail = ob.tails[olane];
             let mut bi = (key as usize) & self.mask;
             'ins: loop {
                 let b = unsafe { self.buckets.get_unchecked_mut(bi) };
@@ -3381,8 +3698,8 @@ impl ShortGroupMap4 {
                     if b.keys[lane] == 0 {
                         b.keys[lane] = key;
                         b.ids[lane] = id;
-                        b.counts[lane] = cnt;
-                        *slot = ((bi as u32) << 2) | (lane as u32);
+                        b.tails[lane] = tail;
+                        p.slot = ((bi as u32) << 2) | (lane as u32);
                         break 'ins;
                     }
                 }
@@ -3391,41 +3708,86 @@ impl ShortGroupMap4 {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn append_full(
+        &mut self,
+        bi: usize,
+        lane: usize,
+        tail: u32,
+        ev: CompactEv,
+        blocks: &mut EvBlockPool<'_, '_>,
+    ) {
+        let b = unsafe { self.buckets.get_unchecked_mut(bi) };
+        let id = unsafe { *b.ids.get_unchecked(lane) } as usize;
+        let new_tail = blocks.alloc_first(ev);
+        unsafe {
+            blocks.get_mut(tail).next = new_tail;
+            *b.tails.get_unchecked_mut(lane) = new_tail;
+            self.persons.get_unchecked_mut(id).full_blocks += 1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn append_new(
+        &mut self,
+        bi: usize,
+        lane: usize,
+        key: u64,
+        ev: CompactEv,
+        blocks: &mut EvBlockPool<'_, '_>,
+    ) {
+        let id = self.persons.len() as u32;
+        let blk_id = blocks.alloc_first(ev);
+        let b = unsafe { self.buckets.get_unchecked_mut(bi) };
+        unsafe {
+            *b.keys.get_unchecked_mut(lane) = key;
+            *b.ids.get_unchecked_mut(lane) = id;
+            *b.tails.get_unchecked_mut(lane) = blk_id;
+        }
+        self.persons.push(ShortPersonHead {
+            slot: ((bi as u32) << 2) | (lane as u32),
+            head: blk_id,
+            full_blocks: 0,
+        });
+        if self.persons.len() >= self.grow_at {
+            self.grow();
+        }
+    }
+
     #[inline(always)]
-    fn count(&mut self, key: u64) -> u32 {
+    fn append(&mut self, key: u64, ev: CompactEv, blocks: &mut EvBlockPool<'_, '_>) {
         debug_assert!(key != 0);
         let mut bi = (key as usize) & self.mask;
         let needle = unsafe { _mm256_set1_epi64x(key as i64) };
         let zero = unsafe { _mm256_setzero_si256() };
         loop {
-            let b = unsafe { self.buckets.get_unchecked_mut(bi) };
+            let b = unsafe { self.buckets.get_unchecked(bi) };
             let kv = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
             let hits = unsafe {
                 _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, needle)))
             } as u32;
             if hits != 0 {
                 let lane = hits.trailing_zeros() as usize;
-                unsafe {
-                    *b.counts.get_unchecked_mut(lane) += 1;
-                    return *b.ids.get_unchecked(lane);
+                let tail = unsafe { *b.tails.get_unchecked(lane) };
+                let blk = unsafe { blocks.get_mut(tail) };
+                let len = blk.len as usize;
+                if len < EV_BLOCK_CAP {
+                    unsafe { blk.evs.get_unchecked_mut(len).write(ev) };
+                    blk.len = (len + 1) as u32;
+                } else {
+                    self.append_full(bi, lane, tail, ev, blocks);
                 }
+                return;
             }
             let empties = unsafe {
                 _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kv, zero)))
             } as u32;
             if empties != 0 {
                 let lane = empties.trailing_zeros() as usize;
-                let id = self.person_slots.len() as u32;
-                unsafe {
-                    *b.keys.get_unchecked_mut(lane) = key;
-                    *b.ids.get_unchecked_mut(lane) = id;
-                    *b.counts.get_unchecked_mut(lane) = 1;
-                }
-                self.person_slots.push(((bi as u32) << 2) | (lane as u32));
-                if self.person_slots.len() >= self.grow_at {
-                    self.grow();
-                }
-                return id;
+                self.append_new(bi, lane, key, ev, blocks);
+                return;
             }
             bi = (bi + 1) & self.mask;
         }
@@ -3433,7 +3795,7 @@ impl ShortGroupMap4 {
 
     #[inline(always)]
     fn get(&self, key: u64) -> Option<u32> {
-        if self.person_slots.is_empty() {
+        if self.persons.is_empty() {
             return None;
         }
         let mut bi = (key as usize) & self.mask;
@@ -3456,22 +3818,77 @@ impl ShortGroupMap4 {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        self.person_slots.len()
+        self.persons.len()
     }
 
     #[inline(always)]
-    fn person(&self, id: usize) -> (u64, u32) {
-        let slot = unsafe { *self.person_slots.get_unchecked(id) };
-        let b = unsafe { self.buckets.get_unchecked((slot >> 2) as usize) };
-        let lane = (slot & 3) as usize;
-        unsafe { (*b.keys.get_unchecked(lane), *b.counts.get_unchecked(lane)) }
+    fn person(&self, id: usize) -> (u64, u32, u32, u32) {
+        let p = unsafe { *self.persons.get_unchecked(id) };
+        let b = unsafe { self.buckets.get_unchecked((p.slot >> 2) as usize) };
+        let lane = (p.slot & 3) as usize;
+        unsafe { (*b.keys.get_unchecked(lane), p.head, *b.tails.get_unchecked(lane), p.full_blocks) }
     }
 }
 
 #[derive(Clone, Copy)]
 struct LongGroupEntry {
     tag: u64,
-    count: u32,
+    head: u32,
+    tail: u32,
+    full_blocks: u32,
+    ptag: u8,
+    hi: u64,
+    lo: u64,
+}
+
+#[inline(always)]
+unsafe fn extract_packed_long(
+    tag: u64,
+    worker_arenas: &[&[u8]],
+    link_store: &LinkLongStore,
+) -> (u8, u64, u64) {
+    if (tag & LINK_LONG_BIT) != 0 {
+        link_store.get_packed(tag as u32)
+    } else {
+        let tid = ((tag >> 57) & 31) as usize;
+        let arena = worker_arenas.get_unchecked(tid);
+        let p = arena.as_ptr().add(tag as u32 as usize);
+        if *p == 0 {
+            (*p.add(1), ld8(p.add(2)), ld8(p.add(10)))
+        } else {
+            (0, 0, 0)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn eq_long_entry(
+    entry: &LongGroupEntry,
+    tag: u64,
+    worker_arenas: &[&[u8]],
+    link_store: &LinkLongStore,
+) -> bool {
+    if entry.tag == tag {
+        return true;
+    }
+    if entry.ptag != 0 {
+        if (tag & LINK_LONG_BIT) != 0 {
+            if (entry.tag & LINK_LONG_BIT) != 0 {
+                return false;
+            }
+            let (pt, h, l) = link_store.get_packed(tag as u32);
+            return (pt == entry.ptag) & (h == entry.hi) & (l == entry.lo);
+        }
+        let tb = ((tag >> 57) & 31) as usize;
+        return eq_arena_packed(
+            worker_arenas.get_unchecked(tb),
+            tag as u32,
+            entry.ptag,
+            entry.hi,
+            entry.lo,
+        );
+    }
+    eq_long_user_tags(entry.tag, tag, worker_arenas, link_store)
 }
 
 struct LongGroupMap {
@@ -3505,8 +3922,12 @@ impl LongGroupMap {
         for (pid, e) in self.entries.iter().enumerate() {
             let h20 = long_user_hash20(e.tag);
             let mut slot = if self.wide_hash {
-                (unsafe { hash_long_user_tag(e.tag, worker_arenas, link_store) } as usize)
-                    & self.mask
+                let h = if e.ptag != 0 {
+                    hash_packed_33(e.ptag, e.hi, e.lo)
+                } else {
+                    unsafe { hash_long_user_tag(e.tag, worker_arenas, link_store) }
+                };
+                (h as usize) & self.mask
             } else {
                 (h20 as usize) & self.mask
             };
@@ -3517,8 +3938,55 @@ impl LongGroupMap {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn append_new(
+        &mut self,
+        slot: usize,
+        h20: u32,
+        tag: u64,
+        ev: CompactEv,
+        blocks: &mut EvBlockPool<'_, '_>,
+        worker_arenas: &[&[u8]],
+        link_store: &LinkLongStore,
+    ) {
+        let pid = self.entries.len() as u32;
+        let blk_id = blocks.alloc_first(ev);
+        let (ptag, hi, lo) = unsafe { extract_packed_long(tag, worker_arenas, link_store) };
+        self.entries.push(LongGroupEntry {
+            tag,
+            head: blk_id,
+            tail: blk_id,
+            full_blocks: 0,
+            ptag,
+            hi,
+            lo,
+        });
+        unsafe { *self.table.get_unchecked_mut(slot) = ((h20 as u64) << 32) | (pid as u64 + 1) };
+        if self.entries.len() * 2 > self.table.len() {
+            self.grow(worker_arenas, link_store);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn append_full(&mut self, pid: usize, tail: u32, ev: CompactEv, blocks: &mut EvBlockPool<'_, '_>) {
+        let new_tail = blocks.alloc_first(ev);
+        unsafe { blocks.get_mut(tail).next = new_tail };
+        let entry = unsafe { self.entries.get_unchecked_mut(pid) };
+        entry.tail = new_tail;
+        entry.full_blocks += 1;
+    }
+
     #[inline(always)]
-    fn count(&mut self, tag: u64, worker_arenas: &[&[u8]], link_store: &LinkLongStore) -> u32 {
+    fn append(
+        &mut self,
+        tag: u64,
+        ev: CompactEv,
+        blocks: &mut EvBlockPool<'_, '_>,
+        worker_arenas: &[&[u8]],
+        link_store: &LinkLongStore,
+    ) {
         let h20 = long_user_hash20(tag);
         let mut slot = if self.wide_hash {
             (unsafe { hash_long_user_tag(tag, worker_arenas, link_store) } as usize) & self.mask
@@ -3528,20 +3996,23 @@ impl LongGroupMap {
         loop {
             let v = unsafe { *self.table.get_unchecked(slot) };
             if v == 0 {
-                let pid = self.entries.len() as u32;
-                self.entries.push(LongGroupEntry { tag, count: 1 });
-                unsafe { *self.table.get_unchecked_mut(slot) = ((h20 as u64) << 32) | (pid as u64 + 1) };
-                if self.entries.len() * 2 > self.table.len() {
-                    self.grow(worker_arenas, link_store);
-                }
-                return pid;
+                self.append_new(slot, h20, tag, ev, blocks, worker_arenas, link_store);
+                return;
             }
             if (v >> 32) as u32 == h20 {
                 let pid = (v as u32 - 1) as usize;
-                let entry = unsafe { self.entries.get_unchecked_mut(pid) };
-                if unsafe { eq_long_user_tags(entry.tag, tag, worker_arenas, link_store) } {
-                    entry.count += 1;
-                    return pid as u32;
+                let entry = unsafe { self.entries.get_unchecked(pid) };
+                if unsafe { eq_long_entry(entry, tag, worker_arenas, link_store) } {
+                    let tail = entry.tail;
+                    let blk = unsafe { blocks.get_mut(tail) };
+                    let len = blk.len as usize;
+                    if len < EV_BLOCK_CAP {
+                        unsafe { blk.evs.get_unchecked_mut(len).write(ev) };
+                        blk.len = (len + 1) as u32;
+                    } else {
+                        self.append_full(pid, tail, ev, blocks);
+                    }
+                    return;
                 }
             }
             slot = (slot + 1) & self.mask;
@@ -3566,8 +4037,8 @@ impl LongGroupMap {
             }
             if (v >> 32) as u32 == h20 {
                 let pid = (v as u32 - 1) as usize;
-                let stored = unsafe { self.entries.get_unchecked(pid).tag };
-                if unsafe { eq_long_user_tags(stored, tag, worker_arenas, link_store) } {
+                let entry = unsafe { self.entries.get_unchecked(pid) };
+                if unsafe { eq_long_entry(entry, tag, worker_arenas, link_store) } {
                     return Some(pid as u32);
                 }
             }
@@ -3709,6 +4180,87 @@ fn radix_sort_clicks_var(
         cl.copy_from_slice(buf);
     }
     tiebreak_clicks_var(cl, cid_arenas);
+}
+
+#[inline(never)]
+fn radix_sort_clicks_var_small(cl: &mut [CompactClick<u64>], cid_arenas: &[&[u8]]) {
+    let n = cl.len();
+    debug_assert!(n <= 256);
+    let mut buf = [MaybeUninit::<CompactClick<u64>>::uninit(); 256];
+    let mut c0 = [0u16; 256];
+    let mut c1 = [0u16; 256];
+    let mut c2 = [0u16; 256];
+    let mut c3 = [0u16; 256];
+    for c in cl.iter() {
+        let t = c.ts;
+        c0[(t & 0xFF) as usize] += 1;
+        c1[((t >> 8) & 0xFF) as usize] += 1;
+        c2[((t >> 16) & 0xFF) as usize] += 1;
+        c3[(t >> 24) as usize] += 1;
+    }
+    let t0 = unsafe { cl.get_unchecked(0).ts };
+    let n16 = n as u16;
+    let skip0 = c0[(t0 & 0xFF) as usize] == n16;
+    let skip1 = c1[((t0 >> 8) & 0xFF) as usize] == n16;
+    let skip2 = c2[((t0 >> 16) & 0xFF) as usize] == n16;
+    let skip3 = c3[(t0 >> 24) as usize] == n16;
+    let mut in_buf = false;
+
+    macro_rules! pass {
+        ($counts:ident, $shift:expr, $skip:ident) => {
+            if !$skip {
+                let mut acc = 0u16;
+                for c in $counts.iter_mut() {
+                    let v = *c;
+                    *c = acc;
+                    acc += v;
+                }
+                if in_buf {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr().cast::<CompactClick<u64>>(), n)
+                    };
+                    for &c in src {
+                        let b = ((c.ts >> $shift) & 0xFF) as usize;
+                        let dst = unsafe { $counts.get_unchecked_mut(b) };
+                        let pos = *dst as usize;
+                        *dst = (pos + 1) as u16;
+                        unsafe { *cl.get_unchecked_mut(pos) = c };
+                    }
+                } else {
+                    for &c in cl.iter() {
+                        let b = ((c.ts >> $shift) & 0xFF) as usize;
+                        let dst = unsafe { $counts.get_unchecked_mut(b) };
+                        let pos = *dst as usize;
+                        *dst = (pos + 1) as u16;
+                        unsafe { buf.get_unchecked_mut(pos).write(c) };
+                    }
+                }
+                in_buf = !in_buf;
+            }
+        };
+    }
+
+    pass!(c0, 0, skip0);
+    pass!(c1, 8, skip1);
+    pass!(c2, 16, skip2);
+    pass!(c3, 24, skip3);
+
+    if in_buf {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.as_ptr().cast::<CompactClick<u64>>(),
+                cl.as_mut_ptr(),
+                n,
+            );
+        }
+    }
+    let mut eq_ts = false;
+    for i in 1..n {
+        eq_ts |= unsafe { cl.get_unchecked(i).ts == cl.get_unchecked(i - 1).ts };
+    }
+    if eq_ts {
+        tiebreak_clicks_var(cl, cid_arenas);
+    }
 }
 
 /// Unified L1i-lean click sorter for BOTH short and long click IDs:
@@ -3893,8 +4445,12 @@ fn sort_clicks_var_only(
                 unsafe { *cl.get_unchecked_mut(j) = v };
             }
         }
-        21..=256 => {
+        21..=79 => {
             cl.sort_unstable_by_key(|a| a.ts);
+        }
+        80..=256 => {
+            radix_sort_clicks_var_small(cl, cid_arenas);
+            return;
         }
         _ => {
             radix_sort_clicks_var(cl, tmp, cid_arenas);
@@ -3967,8 +4523,7 @@ struct FusedWorkerH<'a, P> {
     short_map: ShortGroupMap4,
     long_map: LongGroupMap,
     fill: Vec<u32>,
-    pid: ArenaVec<'a, u32>,
-    ev_flat: ArenaVec<'a, CompactEv>,
+    ev_blocks: ArenaVec<'a, EvBlock>,
     ev_buf: ArenaVec<'a, CompactEv>,
     ev_tmp: ArenaVec<'a, CompactEv>,
     cl_pid: ArenaVec<'a, u32>,
@@ -3995,8 +4550,8 @@ struct FusedWorkerH<'a, P> {
 fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
     w: &mut FusedWorkerH<'_, P>,
     dense_person: bool,
-    ev_st: usize,
-    ev_en: usize,
+    single_blk: u32,
+    ev_cnt: usize,
     cl_st: usize,
     cl_end: usize,
     id_bytes: &[u8],
@@ -4014,7 +4569,6 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
     let cl_slice_end = cl_end + usize::from(HAS_CLICKS);
 
     if dense_person {
-        w.dense.scatter(&w.ev_buf[ev_st..ev_en]);
         let mut has_sess = false;
         let mut sess_start = 0u32;
         let mut sess_max = 0u32;
@@ -4128,9 +4682,15 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
             );
         }
     } else {
-        let mut i = ev_st;
-        while i < ev_en {
-            let first = unsafe { *w.ev_buf.get_unchecked(i) };
+        // SAFETY: `sessionize_person` never mutates `w.ev_blocks` or `w.ev_buf`.
+        let evs_ptr: *const CompactEv = if single_blk != u32::MAX {
+            unsafe { w.ev_blocks.get_unchecked(single_blk as usize).evs.as_ptr().cast() }
+        } else {
+            w.ev_buf.as_ptr()
+        };
+        let mut i = 0usize;
+        while i < ev_cnt {
+            let first = unsafe { *evs_ptr.add(i) };
             let s = first.ts();
             if s >= next_day_s {
                 if ud_sessions != 0 {
@@ -4168,10 +4728,10 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
                     }
                     *slot += cents as u64;
                 }
-                if k == ev_en {
+                if k == ev_cnt {
                     break;
                 }
-                let e = unsafe { *w.ev_buf.get_unchecked(k) };
+                let e = unsafe { *evs_ptr.add(k) };
                 let ets = e.ts();
                 if ets - prev > GAP_MS_U32 {
                     break;
@@ -4220,8 +4780,9 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
 fn aggregate_person<P: GroupProfile>(
     w: &mut FusedWorkerH<'_, P>,
     pi: usize,
-    ev_st: usize,
-    ev_cnt: usize,
+    head: u32,
+    tail: u32,
+    full_blocks: u32,
     ncl_raw: usize,
     id_bytes: &[u8],
     use_dense: bool,
@@ -4232,11 +4793,35 @@ fn aggregate_person<P: GroupProfile>(
     categories: &[Vec<u8>],
     wlc_ref: &[&[u8]],
 ) {
-    let ev_en = ev_st + ev_cnt;
+    let ev_cnt = (full_blocks as usize) * EV_BLOCK_CAP
+        + unsafe { w.ev_blocks.get_unchecked(tail as usize).len as usize };
     let dense_person = use_dense && ev_cnt >= dense_min;
-    if !dense_person {
-        sort_ev_slice(&mut w.ev_buf[ev_st..ev_en], &mut w.ev_tmp);
-    }
+    let single_blk = if dense_person {
+        u32::MAX
+    } else if full_blocks == 0 {
+        let blk = unsafe { w.ev_blocks.get_unchecked_mut(head as usize) };
+        sort_ev_slice(blk.slice_mut(), &mut w.ev_tmp);
+        head
+    } else {
+        w.ev_buf.clear();
+        w.ev_buf.reserve(ev_cnt);
+        let dst = w.ev_buf.as_mut_ptr();
+        let mut off = 0usize;
+        let mut b = head;
+        while b != u32::MAX {
+            let blk = unsafe { w.ev_blocks.get_unchecked(b as usize) };
+            let n = blk.len as usize;
+            unsafe {
+                std::ptr::copy_nonoverlapping(blk.evs.as_ptr().cast::<CompactEv>(), dst.add(off), n);
+            }
+            off += n;
+            b = blk.next;
+        }
+        debug_assert_eq!(off, ev_cnt);
+        unsafe { w.ev_buf.set_len(ev_cnt) };
+        sort_ev_slice(&mut w.ev_buf[..ev_cnt], &mut w.ev_tmp);
+        u32::MAX
+    };
     let (cl_st, cl_len) = if ncl_raw > 0 {
         let cs = unsafe { *w.ck_off.get_unchecked(pi) } as usize;
         let ce = unsafe { *w.ck_off.get_unchecked(pi + 1) } as usize;
@@ -4251,20 +4836,35 @@ fn aggregate_person<P: GroupProfile>(
     };
     w.profile.end(GroupPhase::Sort);
 
+    if dense_person {
+        if full_blocks == 0 {
+            let blk = unsafe { w.ev_blocks.get_unchecked(head as usize) };
+            w.dense.scatter(blk.slice());
+        } else {
+            w.dense.reset_purch();
+            let mut b = head;
+            while b != u32::MAX {
+                let blk = unsafe { w.ev_blocks.get_unchecked(b as usize) };
+                w.dense.scatter_slice(blk.slice());
+                b = blk.next;
+            }
+        }
+    }
+
     if cl_len > 0 {
         w.assists.clear_sessions();
         let cl_end = cl_st + cl_len;
         let saved_cl = unsafe { *w.cl_buf.get_unchecked(cl_end) };
         unsafe { w.cl_buf.get_unchecked_mut(cl_end).ts = u32::MAX };
         sessionize_person::<P, true>(
-            w, dense_person, ev_st, ev_en, cl_st, cl_end, id_bytes, day0, ws_rem, organic,
+            w, dense_person, single_blk, ev_cnt, cl_st, cl_end, id_bytes, day0, ws_rem, organic,
             categories,
         );
         unsafe { *w.cl_buf.get_unchecked_mut(cl_end) = saved_cl };
         w.assists.count(&mut w.camp, &w.cl_buf[cl_st..cl_end]);
     } else {
         sessionize_person::<P, false>(
-            w, dense_person, ev_st, ev_en, 0, 0, id_bytes, day0, ws_rem, organic, categories,
+            w, dense_person, single_blk, ev_cnt, 0, 0, id_bytes, day0, ws_rem, organic, categories,
         );
     }
     w.profile.end(GroupPhase::Aggregate);
@@ -4326,59 +4926,28 @@ fn group_short_part<P: GroupProfile>(
     categories: &[Vec<u8>],
 ) {
     w.profile.start();
-    w.pid.clear();
-    w.pid.reserve(raw_n);
-    w.ev_flat.clear();
-    w.ev_flat.reserve(raw_n);
-    let pid = w.pid.as_mut_ptr();
-    let ev_flat = w.ev_flat.as_mut_ptr();
     let mut live = 0usize;
-
     w.short_map.reset(raw_n / 25 + 16);
-    for_each_live(b_sinks, dead, q, |r| {
-        let id = w.short_map.count(r.person());
-        let ev = unpack_ev(r.ts_or_purch, wp_ref);
-        unsafe {
-            pid.add(live).write(id);
-            ev_flat.add(live).write(ev);
-        }
-        live += 1;
-    });
-    for_each_live(reloc_b, None, q, |r| {
-        let id = w.short_map.count(r.person());
-        let ev = unpack_ev(r.ts_or_purch, wp_ref);
-        unsafe {
-            pid.add(live).write(id);
-            ev_flat.add(live).write(ev);
-        }
-        live += 1;
-    });
+    {
+        let mut pool = EvBlockPool::new(&mut w.ev_blocks);
+        let short_map = &mut w.short_map;
+        for_each_live(b_sinks, dead, q, |r| {
+            let ev = unpack_ev(r.ts_or_purch, wp_ref);
+            short_map.append(r.person(), ev, &mut pool);
+            live += 1;
+        });
+        for_each_live(reloc_b, None, q, |r| {
+            let ev = unpack_ev(r.ts_or_purch, wp_ref);
+            short_map.append(r.person(), ev, &mut pool);
+            live += 1;
+        });
+    }
     if live == 0 {
         return;
     }
     w.ne += live;
-    unsafe {
-        w.pid.set_len(live);
-        w.ev_flat.set_len(live);
-    }
     let np = w.short_map.len();
     w.np += np;
-    w.fill.clear();
-    w.fill.reserve(np);
-    let mut acc = 0u32;
-    for pi in 0..np {
-        w.fill.push(acc);
-        acc += w.short_map.person(pi).1;
-    }
-    w.ev_buf.clear();
-    w.ev_buf.reserve(live);
-    let ev_ptr = w.ev_buf.as_mut_ptr();
-    for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
-        let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
-        unsafe { ev_ptr.add(*pos as usize).write(ev) };
-        *pos += 1;
-    }
-    unsafe { w.ev_buf.set_len(live) };
 
     let ncl_raw = if raw_ck > 0 {
         w.cl_pid.clear();
@@ -4425,17 +4994,16 @@ fn group_short_part<P: GroupProfile>(
     w.profile.end(GroupPhase::Csr);
 
     let use_dense = w.dense.enabled();
-    let mut ev_st = 0usize;
     let mut id_buf = [0u8; 16];
     for pi in 0..np {
-        let (key, count) = w.short_map.person(pi);
-        let ev_cnt = count as usize;
+        let (key, head, tail, full_blocks) = w.short_map.person(pi);
         let n = unmix63(key).unpack_buf(&mut id_buf);
         aggregate_person(
             w,
             pi,
-            ev_st,
-            ev_cnt,
+            head,
+            tail,
+            full_blocks,
             ncl_raw,
             &id_buf[..n],
             use_dense,
@@ -4446,7 +5014,6 @@ fn group_short_part<P: GroupProfile>(
             categories,
             wlc_ref,
         );
-        ev_st += ev_cnt;
     }
 }
 
@@ -4473,59 +5040,28 @@ fn group_long_part<P: GroupProfile>(
     categories: &[Vec<u8>],
 ) {
     w.profile.start();
-    w.pid.clear();
-    w.pid.reserve(raw_n);
-    w.ev_flat.clear();
-    w.ev_flat.reserve(raw_n);
-    let pid = w.pid.as_mut_ptr();
-    let ev_flat = w.ev_flat.as_mut_ptr();
     let mut live = 0usize;
-
     w.long_map.reset(raw_n / 25 + 16);
-    for_each_live(b_sinks, dead, q, |r| {
-        let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
-        let ev = unpack_ev(r.ts_or_purch, wp_ref);
-        unsafe {
-            pid.add(live).write(id);
-            ev_flat.add(live).write(ev);
-        }
-        live += 1;
-    });
-    for_each_live(reloc_b, None, q, |r| {
-        let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
-        let ev = unpack_ev(r.ts_or_purch, wp_ref);
-        unsafe {
-            pid.add(live).write(id);
-            ev_flat.add(live).write(ev);
-        }
-        live += 1;
-    });
+    {
+        let mut pool = EvBlockPool::new(&mut w.ev_blocks);
+        let long_map = &mut w.long_map;
+        for_each_live(b_sinks, dead, q, |r| {
+            let ev = unpack_ev(r.ts_or_purch, wp_ref);
+            long_map.append(r.person(), ev, &mut pool, wlu_ref, ls_ref);
+            live += 1;
+        });
+        for_each_live(reloc_b, None, q, |r| {
+            let ev = unpack_ev(r.ts_or_purch, wp_ref);
+            long_map.append(r.person(), ev, &mut pool, wlu_ref, ls_ref);
+            live += 1;
+        });
+    }
     if live == 0 {
         return;
     }
     w.ne += live;
-    unsafe {
-        w.pid.set_len(live);
-        w.ev_flat.set_len(live);
-    }
     let np = w.long_map.entries.len();
     w.np += np;
-    w.fill.clear();
-    w.fill.reserve(np);
-    let mut acc = 0u32;
-    for e in &w.long_map.entries {
-        w.fill.push(acc);
-        acc += e.count;
-    }
-    w.ev_buf.clear();
-    w.ev_buf.reserve(live);
-    let ev_ptr = w.ev_buf.as_mut_ptr();
-    for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
-        let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
-        unsafe { ev_ptr.add(*pos as usize).write(ev) };
-        *pos += 1;
-    }
-    unsafe { w.ev_buf.set_len(live) };
 
     let ncl_raw = if raw_ck > 0 {
         w.cl_pid.clear();
@@ -4572,17 +5108,21 @@ fn group_long_part<P: GroupProfile>(
     w.profile.end(GroupPhase::Csr);
 
     let use_dense = w.dense.enabled();
-    let mut ev_st = 0usize;
     let mut id_tmp = [0u8; 33];
     for pi in 0..np {
         let entry = unsafe { *w.long_map.entries.get_unchecked(pi) };
-        let ev_cnt = entry.count as usize;
-        let id_bytes = unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref, &mut id_tmp) };
+        let id_bytes = if entry.ptag != 0 {
+            unpack_hex33(entry.ptag, entry.hi, entry.lo, &mut id_tmp);
+            &id_tmp[..]
+        } else {
+            unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref, &mut id_tmp) }
+        };
         aggregate_person(
             w,
             pi,
-            ev_st,
-            ev_cnt,
+            entry.head,
+            entry.tail,
+            entry.full_blocks,
             ncl_raw,
             id_bytes,
             use_dense,
@@ -4593,7 +5133,6 @@ fn group_long_part<P: GroupProfile>(
             categories,
             wlc_ref,
         );
-        ev_st += ev_cnt;
     }
 }
 
@@ -4677,6 +5216,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         65536
     };
+    let block_cap = (event_cap / 10 + 4096).min(event_cap).max(4096);
     let click_cap = if group_scratch_available {
         raw_ck_part.iter().copied().max().unwrap_or(0).max(16384)
     } else {
@@ -4695,9 +5235,8 @@ fn group_fused_hybrid<P: GroupProfile>(
                 short_map: ShortGroupMap4::new(),
                 long_map: LongGroupMap::new(),
                 fill: Vec::with_capacity(2048),
-                pid: scratch.buffer(event_cap),
-                ev_flat: scratch.buffer(event_cap),
-                ev_buf: scratch.buffer(event_cap),
+                ev_blocks: scratch.buffer(block_cap),
+                ev_buf: ArenaVec::default(),
                 ev_tmp: if group_scratch_available {
                     scratch.buffer(8192)
                 } else {
@@ -4780,14 +5319,13 @@ fn group_fused_hybrid<P: GroupProfile>(
             w.written = w.writer.finish();
             w.profile.end(GroupPhase::Write);
             w.writer.release_buffers();
+            drop(std::mem::take(&mut w.ev_blocks));
             drop(std::mem::take(&mut w.ev_buf));
             drop(std::mem::take(&mut w.ev_tmp));
             drop(std::mem::take(&mut w.cl_buf));
             drop(std::mem::take(&mut w.cl_tmp));
             drop(std::mem::take(&mut w.cl_pid));
             drop(std::mem::take(&mut w.cl_flat));
-            drop(std::mem::take(&mut w.pid));
-            drop(std::mem::take(&mut w.ev_flat));
         },
     );
 
@@ -4876,24 +5414,45 @@ pub(super) fn run_to_output(
     let p2_total = p2_short + p2_long;
     debug_assert!(p2_total <= 1024);
 
-    // Zero-overflow capacity sizing (`1.12x` + `16/32` slack, sized to the denser of short vs
-    // long bucket share so long partitions never spill into non-THP glibc heap Vecs on the VM!).
-    let p1_per = (est_ev * (100usize.saturating_sub(sample.long_eid_pct)) / 100 / p1_short)
-        .max(est_ev * sample.long_eid_pct / 100 / p1_long)
-        .max(est_ev / p1_total);
-    let p2_ev_per = (est_ev * (100usize.saturating_sub(sample.long_user_pct)) / 100 / p2_short)
-        .max(est_ev * sample.long_user_pct / 100 / p2_long)
-        .max(est_ev / p2_total);
-    let p2_ck_per = (est_ck * (100usize.saturating_sub(sample.long_user_pct)) / 100 / p2_short)
-        .max(est_ck * sample.long_user_pct / 100 / p2_long)
-        .max(est_ck / p2_total);
-    let cap_tok = (p1_per * 112 / 100 / workers).max(16) + 16;
-    let cap_b = (p2_ev_per * 96 / 100 * 112 / 100 / workers).max(16) + 32;
-    let cap_ck = (p2_ck_per * 112 / 100 / workers).max(16) + 32;
+    // Split-cap zero-overflow capacity sizing: size short and long tiers independently to their
+    // sampled densities (eliminates ~120+ MB of dead pre-faulted slack on 512 short buckets while
+    // eliminating long-bucket glibc heap overflows!).
+    let short_eid_pct = 100usize.saturating_sub(sample.long_eid_pct);
+    let short_user_pct = 100usize.saturating_sub(sample.long_user_pct);
+    let cap_tok_s = if short_eid_pct > 0 {
+        (est_ev * short_eid_pct / 100 / p1_short * 110 / 100 / workers).max(16) + 16
+    } else {
+        16
+    };
+    let cap_tok_l = if sample.long_eid_pct > 0 {
+        (est_ev * sample.long_eid_pct / 100 / p1_long * 115 / 100 / workers).max(16) + 16
+    } else {
+        16
+    };
+    let cap_b_s = if short_user_pct > 0 {
+        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 110 / 100 / workers).max(16) + 32
+    } else {
+        16
+    };
+    let cap_b_l = if sample.long_user_pct > 0 {
+        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 118 / 100 / workers).max(16) + 32
+    } else {
+        16
+    };
+    let cap_ck_s = if short_user_pct > 0 {
+        (est_ck * short_user_pct / 100 / p2_short * 110 / 100 / workers).max(16) + 32
+    } else {
+        16
+    };
+    let cap_ck_l = if sample.long_user_pct > 0 {
+        (est_ck * sample.long_user_pct / 100 / p2_long * 118 / 100 / workers).max(16) + 32
+    } else {
+        16
+    };
 
-    let tok_bytes = Sinks::<Tok, SWCB_TOK>::arena_bytes(p1_total, cap_tok);
-    let b_bytes = Sinks::<RecB12, SWCB_B>::arena_bytes(p2_total, cap_b);
-    let ck_bytes = Sinks::<RecC<u64>, SWCB_CK>::arena_bytes(p2_total, cap_ck);
+    let tok_bytes = Sinks::<Tok, SWCB_TOK>::arena_bytes_split(p1_short, p1_long, cap_tok_s, cap_tok_l);
+    let b_bytes = Sinks::<RecB12, SWCB_B>::arena_bytes_split(p2_short, p2_long, cap_b_s, cap_b_l);
+    let ck_bytes = Sinks::<RecC<u64>, SWCB_CK>::arena_bytes_split(p2_short, p2_long, cap_ck_s, cap_ck_l);
 
     // Pre-size 2 MiB THP `ArenaBytes` for long IDs (never populated upfront -> zero unused faults!).
     // Cap per-kind arena reservation at 512 MiB total so extreme 100%-long-ID 60M datasets
@@ -4910,7 +5469,7 @@ pub(super) fn run_to_output(
     let le_bytes = if le_est.saturating_mul(workers) <= MAX_LONG_ARENA_TOTAL { le_est } else { 0 };
     let lu_est = if sample.long_user_pct > 0 {
         let pct = (sample.long_user_pct + 4).min(105);
-        let cache_keep = if sample.long_user_pct > 50 { 95 } else { 55 };
+        let cache_keep = if sample.long_user_pct > 50 { 95 } else { 80 };
         (((est_ev + est_ck) * pct / 100 / workers * cache_keep / 100) * (sample.avg_long_user_len + 1))
             .max(64 << 10)
             .next_multiple_of(64)
@@ -5066,9 +5625,9 @@ pub(super) fn run_to_output(
             (
                 ParseStateH {
                     tid,
-                    tok: Sinks::in_arena(p1_total, cap_tok, tok),
-                    b: Sinks::in_arena(p2_total, cap_b, b),
-                    ck: Sinks::in_arena(p2_total, cap_ck, ck),
+                    tok: Sinks::in_arena_split(p1_short, p1_long, cap_tok_s, cap_tok_l, tok),
+                    b: Sinks::in_arena_split(p2_short, p2_long, cap_b_s, cap_b_l, b),
+                    ck: Sinks::in_arena_split(p2_short, p2_long, cap_ck_s, cap_ck_l, ck),
                     purch: Vec::with_capacity(est_purch_cap),
                     long_eids: le.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
                     long_users: lu.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
@@ -5375,26 +5934,25 @@ mod tests {
 
     #[test]
     fn hybrid_links_split_and_merge_p2_exact() {
-        let mut arena = Vec::new();
-        let o1 = push_long_bytes(&mut arena, b"u00000000000000000000000000000001").unwrap();
-        let o2 = push_long_bytes(&mut arena, b"uzz000000000000000000000000000002").unwrap();
+        let mut arena = ArenaBytes::new_heap(256);
+        let o1 = arena.push_bytes(b"u00000000000000000000000000000001").unwrap();
+        let o2 = arena.push_bytes(b"uzz000000000000000000000000000002").unwrap();
         let h1 = hash_long(b"u00000000000000000000000000000001");
         let h2 = hash_long(b"uzz000000000000000000000000000002");
         let t1 = make_parse_long_user(0, h1, o1);
         let t2 = make_parse_long_user(0, h2, o2);
-        let s_mid = u64::enc_slice(b"u5abcdef").unwrap();
+        let s_mid = mix63(u64::enc_slice(b"u5abcdef").unwrap());
         let pairs = vec![vec![(t1, s_mid), (s_mid, t2)]];
-        let raw_long = vec![arena];
-        let raw_slices: Vec<&[u8]> = raw_long.iter().map(Vec::as_slice).collect();
+        let raw_slices: Vec<&[u8]> = vec![arena.as_slice()];
 
         for &(ps_bits, pl_bits) in &[(9u32, 6u32), (4u32, 9u32), (8u32, 5u32)] {
-            let bl = build_bucket_links_hybrid(&pairs, &raw_long, ps_bits, pl_bits, 2, &mut []);
+            let bl = build_bucket_links_hybrid(&pairs, &raw_slices, ps_bits, pl_bits, 2, &mut []).unwrap();
             assert!(bl.has_links);
             let p2_short = 1usize << ps_bits;
-            let q_mid = (mix63(s_mid) >> (63 - ps_bits)) as usize;
+            let q_mid = (s_mid >> (63 - ps_bits)) as usize;
             let mut sm = ShortRelocMap::default();
             sm.build(bl.short_part(q_mid));
-            let canon = sm.get(mix63(s_mid)).unwrap();
+            let canon = sm.get(s_mid).unwrap();
             assert!(!is_short(canon));
             assert_eq!(
                 canon_q_of(canon, 63 - ps_bits),

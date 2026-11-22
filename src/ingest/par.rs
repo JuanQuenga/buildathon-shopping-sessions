@@ -13,7 +13,9 @@ struct Job {
     func: fn(*const u8, usize),
     data: *const u8,
     active_workers: usize,
+    total_bg: usize,
     done: AtomicUsize,
+    waiter_parked: AtomicBool,
 }
 
 struct PoolShared {
@@ -22,6 +24,8 @@ struct PoolShared {
     parked: AtomicUsize,
     mu: Mutex<u64>,
     cv: Condvar,
+    done_mu: Mutex<()>,
+    done_cv: Condvar,
 }
 
 struct Pool {
@@ -41,6 +45,8 @@ fn get_pool() -> &'static Pool {
             parked: AtomicUsize::new(0),
             mu: Mutex::new(0),
             cv: Condvar::new(),
+            done_mu: Mutex::new(()),
+            done_cv: Condvar::new(),
         }));
         Pool {
             shared,
@@ -68,7 +74,7 @@ fn ensure_workers(pool: &Pool, need_bg: usize) -> usize {
             .spawn(move || {
                 let mut seen = init_epoch;
                 loop {
-                    // Short spin catches back-to-back stages in < 1 us without burning CPU when idle.
+                    // Spin across back-to-back stages (~200 us) before parking on futex.
                     let mut spins = 0u32;
                     let cur_ep = loop {
                         let e = shared.epoch.load(Ordering::Acquire);
@@ -76,7 +82,7 @@ fn ensure_workers(pool: &Pool, need_bg: usize) -> usize {
                             break e;
                         }
                         spins += 1;
-                        if spins >= 512 {
+                        if spins >= 16_384 {
                             shared.parked.fetch_add(1, Ordering::SeqCst);
                             let mut g = shared.mu.lock().unwrap();
                             while shared.epoch.load(Ordering::SeqCst) == seen {
@@ -95,7 +101,12 @@ fn ensure_workers(pool: &Pool, need_bg: usize) -> usize {
                     if wid < job.active_workers {
                         (job.func)(job.data, wid);
                     }
-                    job.done.fetch_add(1, Ordering::Release);
+                    if job.done.fetch_add(1, Ordering::AcqRel) + 1 == job.total_bg {
+                        if job.waiter_parked.load(Ordering::SeqCst) {
+                            let _g = shared.done_mu.lock().unwrap();
+                            shared.done_cv.notify_one();
+                        }
+                    }
                 }
             })
             .expect("spawn pool worker");
@@ -185,7 +196,9 @@ where
         func: tramp::<S, I, T, F>,
         data: (&ctx as *const Ctx<'_, S, I, T, F>) as *const u8,
         active_workers: threads,
+        total_bg,
         done: AtomicUsize::new(0),
+        waiter_parked: AtomicBool::new(false),
     };
 
     let shared = pool.shared;
@@ -200,13 +213,20 @@ where
     tramp::<S, I, T, F>(job.data, 0);
 
     // Wait for ALL spawned background workers before releasing stack `job`/`ctx`.
+    // Short spin then clean futex park (eliminates `sched_yield` syscall storms on SMT siblings!).
     let mut w_spins = 0u32;
     while job.done.load(Ordering::Acquire) < total_bg {
-        if w_spins < 256 {
+        if w_spins < 4096 {
             std::hint::spin_loop();
             w_spins += 1;
         } else {
-            std::thread::yield_now();
+            let mut g = shared.done_mu.lock().unwrap();
+            job.waiter_parked.store(true, Ordering::SeqCst);
+            while job.done.load(Ordering::SeqCst) < total_bg {
+                g = shared.done_cv.wait(g).unwrap();
+            }
+            drop(g);
+            break;
         }
     }
     shared.job.store(std::ptr::null_mut(), Ordering::Release);
@@ -602,7 +622,10 @@ struct SwcbLine<const SWCB: usize>([u8; SWCB]);
 pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     base: *mut T,
     arena: SinkArena,
-    cap: usize,
+    n_short: usize,
+    cap_short: usize,
+    cap_long: usize,
+    long_base: usize,
     swcb: Vec<SwcbLine<SWCB>>,
     pub len: Vec<u32>,
     pub over: Vec<Vec<T>>,
@@ -760,6 +783,14 @@ impl<T> ArenaVec<'_, T> {
         }
     }
 
+    #[inline]
+    pub(super) fn capacity(&self) -> usize {
+        match self {
+            Self::Borrowed(a) => a.slots.len(),
+            Self::Heap(v) => v.capacity(),
+        }
+    }
+
     /// All elements in the new initialized range must be valid `T`s.
     #[inline]
     pub(super) unsafe fn set_len(&mut self, len: usize) {
@@ -857,17 +888,51 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         cap.max(Self::per_line()).next_multiple_of(Self::per_line())
     }
 
-    pub(super) fn in_arena(parts: usize, cap: usize, arena: SinkArena) -> Self {
-        assert_eq!(arena.bytes, Self::arena_bytes(parts, cap));
-        let cap = Self::aligned_cap(cap);
+    #[inline(always)]
+    fn part_off_cap(&self, p: usize) -> (usize, usize) {
+        if p < self.n_short {
+            (p * self.cap_short, self.cap_short)
+        } else {
+            (self.long_base + (p - self.n_short) * self.cap_long, self.cap_long)
+        }
+    }
+
+    pub(super) fn in_arena_split(
+        n_short: usize,
+        n_long: usize,
+        cap_short: usize,
+        cap_long: usize,
+        arena: SinkArena,
+    ) -> Self {
+        assert_eq!(arena.bytes, Self::arena_bytes_split(n_short, n_long, cap_short, cap_long));
+        let cs = Self::aligned_cap(cap_short);
+        let cl = Self::aligned_cap(cap_long);
+        let parts = n_short + n_long;
         Sinks {
             base: arena.base.cast(),
             arena,
-            cap,
+            n_short,
+            cap_short: cs,
+            cap_long: cl,
+            long_base: n_short * cs,
             swcb: vec![SwcbLine([0u8; SWCB]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
         }
+    }
+
+    pub(super) fn arena_bytes_split(
+        n_short: usize,
+        n_long: usize,
+        cap_short: usize,
+        cap_long: usize,
+    ) -> usize {
+        (n_short * Self::aligned_cap(cap_short) + n_long * Self::aligned_cap(cap_long))
+            * std::mem::size_of::<T>()
+    }
+
+    pub(super) fn in_arena(parts: usize, cap: usize, arena: SinkArena) -> Self {
+        Self::in_arena_split(parts, 0, cap, cap, arena)
     }
 
     pub(super) fn arena_bytes(parts: usize, cap: usize) -> usize {
@@ -876,6 +941,16 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
 
     pub fn new(parts: usize, cap: usize) -> Self {
         Self::in_arena(parts, cap, SinkArena::new(Self::arena_bytes(parts, cap)))
+    }
+
+    pub(super) fn new_split(n_short: usize, n_long: usize, cap_short: usize, cap_long: usize) -> Self {
+        Self::in_arena_split(
+            n_short,
+            n_long,
+            cap_short,
+            cap_long,
+            SinkArena::new(Self::arena_bytes_split(n_short, n_long, cap_short, cap_long)),
+        )
     }
 
     pub(super) fn into_arena(self) -> SinkArena {
@@ -909,10 +984,11 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     fn flush_full(&mut self, p: usize, nl: usize, line_ptr: *const T) {
         let pl = Self::per_line();
         let base_idx = nl - pl;
-        if nl <= self.cap {
+        let (part_off, cap) = self.part_off_cap(p);
+        if nl <= cap {
             unsafe {
                 use std::arch::x86_64::*;
-                let dst = self.base.add(p * self.cap + base_idx) as *mut __m256i;
+                let dst = self.base.add(part_off + base_idx) as *mut __m256i;
                 let src = line_ptr as *const __m256i;
                 debug_assert_eq!(dst as usize & 63, 0);
                 debug_assert_eq!(src as usize & 63, 0);
@@ -945,10 +1021,11 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
             let rem = l & (pl - 1);
             if rem != 0 {
                 let base_idx = l - rem;
+                let (part_off, cap) = self.part_off_cap(p);
                 let src = unsafe { std::slice::from_raw_parts(self.swcb.as_ptr().add(p) as *const T, rem) };
-                if l <= self.cap {
+                if l <= cap {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(p * self.cap + base_idx), rem);
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(part_off + base_idx), rem);
                     }
                 } else {
                     self.over[p].extend_from_slice(src);
@@ -960,12 +1037,14 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
 
     #[inline]
     pub fn part(&self, p: usize) -> (&[T], &[T]) {
-        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), (self.len[p] as usize).min(self.cap)) };
+        let (part_off, cap) = self.part_off_cap(p);
+        let a = unsafe { std::slice::from_raw_parts(self.base.add(part_off), (self.len[p] as usize).min(cap)) };
         (a, &self.over[p])
     }
 
     pub fn count(&self, p: usize) -> usize {
-        (self.len[p] as usize).min(self.cap) + self.over[p].len()
+        let (_, cap) = self.part_off_cap(p);
+        (self.len[p] as usize).min(cap) + self.over[p].len()
     }
 
     /// Raw disjoint mutable access to partition `p` for parallel per-partition
@@ -976,11 +1055,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         p: usize,
         mut keep: impl FnMut(usize, T) -> bool,
     ) {
-        let arena_ptr = self.base.add(p * self.cap);
+        let (part_off, cap) = self.part_off_cap(p);
+        let arena_ptr = self.base.add(part_off);
         let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
         let orig_len = *len_ptr as usize;
-        let arena_len = orig_len.min(self.cap);
+        let arena_len = orig_len.min(cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
         for i in 0..arena_len {
@@ -994,7 +1074,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         for j in 0..over_len {
             let v = *over_data.add(j);
             if keep(arena_len + j, v) {
-                if w < self.cap {
+                if w < cap {
                     *arena_ptr.add(w) = v;
                     w += 1;
                 } else {
@@ -1017,11 +1097,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         dead_words: &[std::sync::atomic::AtomicU64],
         mut keep: impl FnMut(T) -> bool,
     ) {
-        let arena_ptr = self.base.add(p * self.cap);
+        let (part_off, cap) = self.part_off_cap(p);
+        let arena_ptr = self.base.add(part_off);
         let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
         let orig_len = *len_ptr as usize;
-        let arena_len = orig_len.min(self.cap);
+        let arena_len = orig_len.min(cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
         let mut done = 0usize;
@@ -1061,7 +1142,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
                 live &= live - 1;
                 let v = *over_data.add(odone + tz);
                 if keep(v) {
-                    if w < self.cap {
+                    if w < cap {
                         *arena_ptr.add(w) = v;
                         w += 1;
                     } else {
@@ -1092,11 +1173,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let mbuf_limit = move_buf.len() - 65;
         let mbuf_ptr = move_buf.as_mut_ptr();
         let mut m = 0usize;
-        let arena_ptr = self.base.add(p * self.cap);
+        let (part_off, cap) = self.part_off_cap(p);
+        let arena_ptr = self.base.add(part_off);
         let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
         let orig_len = *len_ptr as usize;
-        let arena_len = orig_len.min(self.cap);
+        let arena_len = orig_len.min(cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
         let mut done = 0usize;
@@ -1149,7 +1231,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
                 if moved {
                     *mbuf_ptr.add(m) = out_v;
                     m += 1;
-                } else if w < self.cap {
+                } else if w < cap {
                     *arena_ptr.add(w) = v;
                     w += 1;
                 } else {
@@ -1183,11 +1265,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let mbuf_limit = move_buf.len() - 65;
         let mbuf_ptr = move_buf.as_mut_ptr();
         let mut m = 0usize;
-        let arena_ptr = self.base.add(p * self.cap);
+        let (part_off, cap) = self.part_off_cap(p);
+        let arena_ptr = self.base.add(part_off);
         let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
         let orig_len = *len_ptr as usize;
-        let arena_len = orig_len.min(self.cap);
+        let arena_len = orig_len.min(cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
         let mut done = 0usize;
@@ -1220,7 +1303,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
                     flush_moved(std::slice::from_raw_parts(mbuf_ptr, m));
                     m = 0;
                 }
-            } else if w < self.cap {
+            } else if w < cap {
                 *arena_ptr.add(w) = v;
                 w += 1;
             } else {
