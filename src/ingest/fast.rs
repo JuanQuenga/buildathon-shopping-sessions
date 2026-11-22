@@ -2452,6 +2452,7 @@ impl GroupProfile for GroupTimings {
 
 struct FusedAssists {
     s_start: Vec<u32>,
+    s_day: Vec<u16>,
     s_run: Vec<u16>,
     /// Contiguous same-day session runs `(rel_day, exclusive_end_sess_idx)`.
     day_runs: Vec<(u16, u16)>,
@@ -2463,6 +2464,7 @@ impl FusedAssists {
     fn new(ncamp: usize) -> Self {
         Self {
             s_start: Vec::with_capacity(256),
+            s_day: Vec::with_capacity(256),
             s_run: Vec::with_capacity(256),
             day_runs: Vec::with_capacity(32),
             stamp: 0,
@@ -2473,30 +2475,19 @@ impl FusedAssists {
     #[inline(always)]
     fn clear_sessions(&mut self) {
         self.s_start.clear();
-        self.s_run.clear();
-        self.day_runs.clear();
+        self.s_day.clear();
     }
 
     #[inline(always)]
     fn push_session(&mut self, s: u32, rel_day: u16) {
-        let next_idx = (self.s_start.len() + 1) as u16;
         self.s_start.push(s);
-        if let Some(last) = self.day_runs.last_mut() {
-            if last.0 == rel_day {
-                last.1 = next_idx;
-                self.s_run.push((self.day_runs.len() - 1) as u16);
-                return;
-            }
-        }
-        let ri = self.day_runs.len() as u16;
-        self.day_runs.push((rel_day, next_idx));
-        self.s_run.push(ri);
+        self.s_day.push(rel_day);
     }
 
     #[inline]
     fn count<K: Key>(&mut self, camp: &mut CampStore, clicks: &[CompactClick<K>]) {
         let n_sess = self.s_start.len();
-        if n_sess == 0 {
+        if n_sess == 0 || clicks.is_empty() {
             return;
         }
         debug_assert!(n_sess <= u16::MAX as usize);
@@ -2508,7 +2499,7 @@ impl FusedAssists {
         let stamp = self.stamp;
         if n_sess == 1 {
             let s0 = unsafe { *self.s_start.get_unchecked(0) };
-            let day0_rel = unsafe { self.day_runs.get_unchecked(0).0 } as usize;
+            let day0_rel = unsafe { *self.s_day.get_unchecked(0) } as usize;
             let hi = s0 + WEEK_MS_U32;
             for click in clicks {
                 let cts = click.ts;
@@ -2530,6 +2521,132 @@ impl FusedAssists {
                 }
             }
             return;
+        }
+        // Branchless AVX2 bitmask assist sweep for persons with 2..=16 sessions (~92% of persons!):
+        // evaluates all session windows in parallel with zero inner `while` loops or interval branches.
+        let max_cts = unsafe { clicks.get_unchecked(clicks.len() - 1).ts };
+        let max_s = unsafe { *self.s_start.get_unchecked(n_sess - 1) };
+        if n_sess <= 16 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
+            let mut sa = [i32::MAX; 16];
+            for i in 0..n_sess {
+                sa[i] = unsafe { *self.s_start.get_unchecked(i) } as i32;
+            }
+            let min_s = sa[0] as u32;
+            let max_hi = (max_s).saturating_add(WEEK_MS_U32);
+            unsafe {
+                use std::arch::x86_64::*;
+                let v_s0 = _mm256_loadu_si256(sa.as_ptr().cast::<__m256i>());
+                if n_sess <= 8 {
+                    for click in clicks {
+                        let cts = click.ts;
+                        if cts > max_hi {
+                            break;
+                        }
+                        if cts < min_s {
+                            continue;
+                        }
+                        let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
+                        let v_lo = _mm256_set1_epi32(lo - 1);
+                        let v_hi = _mm256_set1_epi32((cts as i32) + 1);
+                        let m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+                            _mm256_cmpgt_epi32(v_s0, v_lo),
+                            _mm256_cmpgt_epi32(v_hi, v_s0),
+                        ))) as u16;
+                        if m == 0 {
+                            continue;
+                        }
+                        let seen = self.campaigns.get_unchecked_mut(click.campaign as usize);
+                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let mut new_bits = m & !prev;
+                        if new_bits == 0 {
+                            continue;
+                        }
+                        *seen = (stamp, prev | m);
+                        if let Some(row) = camp.assisted_row(click.campaign) {
+                            while new_bits != 0 {
+                                let si = new_bits.trailing_zeros() as usize;
+                                new_bits &= new_bits - 1;
+                                let d = *self.s_day.get_unchecked(si) as usize;
+                                *row.get_unchecked_mut(d) += 1;
+                            }
+                        } else {
+                            while new_bits != 0 {
+                                let si = new_bits.trailing_zeros() as usize;
+                                new_bits &= new_bits - 1;
+                                let d = *self.s_day.get_unchecked(si);
+                                let day = camp.day0.wrapping_add(i32::from(d));
+                                camp.add_assisted(click.campaign, day, 1);
+                            }
+                        }
+                    }
+                } else {
+                    let v_s1 = _mm256_loadu_si256(sa.as_ptr().add(8).cast::<__m256i>());
+                    for click in clicks {
+                        let cts = click.ts;
+                        if cts > max_hi {
+                            break;
+                        }
+                        if cts < min_s {
+                            continue;
+                        }
+                        let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
+                        let v_lo = _mm256_set1_epi32(lo - 1);
+                        let v_hi = _mm256_set1_epi32((cts as i32) + 1);
+                        let m0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+                            _mm256_cmpgt_epi32(v_s0, v_lo),
+                            _mm256_cmpgt_epi32(v_hi, v_s0),
+                        ))) as u32;
+                        let m1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+                            _mm256_cmpgt_epi32(v_s1, v_lo),
+                            _mm256_cmpgt_epi32(v_hi, v_s1),
+                        ))) as u32;
+                        let m = (m0 | (m1 << 8)) as u16;
+                        if m == 0 {
+                            continue;
+                        }
+                        let seen = self.campaigns.get_unchecked_mut(click.campaign as usize);
+                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let mut new_bits = m & !prev;
+                        if new_bits == 0 {
+                            continue;
+                        }
+                        *seen = (stamp, prev | m);
+                        if let Some(row) = camp.assisted_row(click.campaign) {
+                            while new_bits != 0 {
+                                let si = new_bits.trailing_zeros() as usize;
+                                new_bits &= new_bits - 1;
+                                let d = *self.s_day.get_unchecked(si) as usize;
+                                *row.get_unchecked_mut(d) += 1;
+                            }
+                        } else {
+                            while new_bits != 0 {
+                                let si = new_bits.trailing_zeros() as usize;
+                                new_bits &= new_bits - 1;
+                                let d = *self.s_day.get_unchecked(si);
+                                let day = camp.day0.wrapping_add(i32::from(d));
+                                camp.add_assisted(click.campaign, day, 1);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // Lazily build same-day session runs only for high-session persons (`n_sess > 16`).
+        self.day_runs.clear();
+        self.s_run.clear();
+        for (idx, &rel_day) in self.s_day.iter().enumerate() {
+            let next_idx = (idx + 1) as u16;
+            if let Some(last) = self.day_runs.last_mut() {
+                if last.0 == rel_day {
+                    last.1 = next_idx;
+                    self.s_run.push((self.day_runs.len() - 1) as u16);
+                    continue;
+                }
+            }
+            let ri = self.day_runs.len() as u16;
+            self.day_runs.push((rel_day, next_idx));
+            self.s_run.push(ri);
         }
         // Sentinel `u32::MAX` is strictly greater than any valid click timestamp (`< u32::MAX`),
         // eliminating loop bounds checks on `starts[first]` and `starts[end]`.
@@ -2682,11 +2799,12 @@ fn emit_session<K: Key>(
             }
             *cj += 1;
         }
-        if *grp_first != cl_buf.len() - 1 && *last_ts >= s {
-            unsafe { cl_buf.get_unchecked(*grp_first).campaign }
-        } else {
-            organic
-        }
+        let camp_cand = unsafe { cl_buf.get_unchecked(*grp_first).campaign };
+        std::hint::select_unpredictable(
+            (*grp_first != cl_buf.len() - 1) & (*last_ts >= s),
+            camp_cand,
+            organic,
+        )
     } else {
         organic
     };

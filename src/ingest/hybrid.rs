@@ -1177,26 +1177,50 @@ impl ShortRelocMap {
         }
     }
 
+    /// Branchless fast-path probe: returns `(canon_tagged, is_mapped)`.
+    /// Eliminates the 57%/43% hit-vs-miss branch on ~98% of lookups (`hits != 0 || b.keys[3] == 0`).
+    /// Caller guarantees `!self.buckets.is_empty()`.
     #[inline(always)]
+    fn get_branchless(&self, raw_mixed: u64) -> (u64, bool) {
+        let slot = (raw_mixed as usize) & self.mask;
+        let needle = unsafe { _mm256_set1_epi64x(raw_mixed as i64) };
+        let b = unsafe { self.buckets.get_unchecked(slot) };
+        let keys = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
+        let hits = unsafe {
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
+        } as u32;
+        if (((hits != 0) as u8) | ((b.keys[3] == 0) as u8)) != 0 {
+            let lane = (hits.trailing_zeros() & 3) as usize;
+            return (unsafe { *b.vals.get_unchecked(lane) }, hits != 0);
+        }
+        self.get_overflow(slot, needle)
+    }
+
+    #[cfg(test)]
     fn get(&self, raw_mixed: u64) -> Option<u64> {
         if self.buckets.is_empty() {
             return None;
         }
-        let mut slot = (raw_mixed as usize) & self.mask;
-        let needle = unsafe { _mm256_set1_epi64x(raw_mixed as i64) };
+        let (v, ok) = self.get_branchless(raw_mixed);
+        if ok { Some(v) } else { None }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_overflow(&self, mut slot: usize, needle: __m256i) -> (u64, bool) {
         loop {
+            slot = (slot + 1) & self.mask;
             let b = unsafe { self.buckets.get_unchecked(slot) };
             let keys = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
             let hits = unsafe {
                 _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
             } as u32;
             if hits != 0 {
-                return Some(unsafe { *b.vals.get_unchecked(hits.trailing_zeros() as usize) });
+                return (unsafe { *b.vals.get_unchecked(hits.trailing_zeros() as usize) }, true);
             }
             if b.keys[3] == 0 {
-                return None;
+                return (0, false);
             }
-            slot = (slot + 1) & self.mask;
         }
     }
 }
@@ -2921,13 +2945,18 @@ fn relocate_hybrid(
                 for (tid, sink) in b_sinks.iter().enumerate() {
                     unsafe {
                         sink.compact_part_with_dead_disjoint(q, dead.words(tid, q), |r| {
-                            if let Some(canon_tagged) = sm.get(r.person) {
-                                let cq = canon_q_of(canon_tagged, p2_short_shift);
-                                reloc_b.push(cq, RecB { person: canon_tagged, ts: r.ts, cc: r.cc });
-                                false
-                            } else {
-                                true
-                            }
+                            let (canon_tagged, mapped) = sm.get_branchless(r.person);
+                            let cq = std::hint::select_unpredictable(
+                                mapped,
+                                canon_q_of(canon_tagged, p2_short_shift),
+                                p2_total,
+                            );
+                            reloc_b.push_cond(
+                                cq,
+                                RecB { person: canon_tagged, ts: r.ts, cc: r.cc },
+                                mapped,
+                            );
+                            !mapped
                         });
                     }
                 }
@@ -2935,21 +2964,23 @@ fn relocate_hybrid(
                 for sink in ck_sinks.iter() {
                     unsafe {
                         sink.compact_part_disjoint(q, |_, r| {
-                            if let Some(canon_tagged) = sm.get(r.person) {
-                                let cq = canon_q_of(canon_tagged, p2_short_shift);
-                                reloc_c.push(
-                                    cq,
-                                    RecC {
-                                        person: canon_tagged,
-                                        cid: r.cid,
-                                        ts: r.ts,
-                                        campaign: r.campaign,
-                                    },
-                                );
-                                false
-                            } else {
-                                true
-                            }
+                            let (canon_tagged, mapped) = sm.get_branchless(r.person);
+                            let cq = std::hint::select_unpredictable(
+                                mapped,
+                                canon_q_of(canon_tagged, p2_short_shift),
+                                p2_total,
+                            );
+                            reloc_c.push_cond(
+                                cq,
+                                RecC {
+                                    person: canon_tagged,
+                                    cid: r.cid,
+                                    ts: r.ts,
+                                    campaign: r.campaign,
+                                },
+                                mapped,
+                            );
+                            !mapped
                         });
                     }
                 }
@@ -4265,8 +4296,7 @@ pub(super) fn run_to_output(
     let p2_total = p2_short + p2_long;
     debug_assert!(p2_total <= 1024);
 
-    // Tight capacity sizing (`1.06×` + `16` slack) cuts unused `populate_write` faults
-    // while `Sinks::flush_overflow` (`ov.reserve(128)`) handles any rare tail spill cleanly.
+    // Tight capacity sizing (`1.06x + 16` slack) minimizes unused populate_write faults.
     let cap_tok = (est_ev * 106 / 100 / workers / p1_total).max(16) + 16;
     let cap_b = (est_ev * 95 / 100 * 106 / 100 / workers / p2_total).max(16) + 16;
     let cap_ck = (est_ck * 106 / 100 / workers / p2_total).max(16) + 16;
