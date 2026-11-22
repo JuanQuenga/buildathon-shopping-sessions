@@ -498,41 +498,25 @@ impl ArenaBytes {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(32))]
-struct PackedCacheSlot {
-    hi: u64,
-    lo: u64,
-    off: u32,
-    tag: u8, // 0 = empty; packed33 tags are always >= 0x30
-}
-
-/// Per-worker L2-resident (64 KiB) inline-value cache deduplicating repeated long `user_id`s
-/// with ZERO random arena chases on hit while keeping L2 headroom on Cascade Lake!
+/// Per-worker L2-resident (32 KiB) direct-mapped cache deduplicating repeated long `user_id`s.
 struct LongUserCache {
-    slots: Vec<PackedCacheSlot>,
-    verb: Vec<(u32, u32)>,
+    slots: Vec<(u32, u32)>, // (hash_hi32 | 1, arena_off)
 }
 
 impl LongUserCache {
-    const CAP: usize = 2048;
+    const CAP: usize = 4096;
     const MASK: usize = Self::CAP - 1;
-    const VERB_CAP: usize = 2048;
-    const VERB_MASK: usize = Self::VERB_CAP - 1;
 
     fn new() -> Self {
-        Self { slots: vec![PackedCacheSlot::default(); Self::CAP], verb: Vec::new() }
+        Self { slots: vec![(0, 0); Self::CAP] }
     }
 
     #[allow(dead_code)]
     #[inline(always)]
     fn intern_vec(&mut self, arena: &mut Vec<u8>, s: &[u8], uh: u64) -> Option<u32> {
-        if self.verb.is_empty() {
-            self.verb.resize(Self::VERB_CAP, (0, 0));
-        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::VERB_MASK;
-        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::MASK;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { get_long_bytes(arena, slot.1) } == s {
             return Some(slot.1);
         }
@@ -550,13 +534,14 @@ impl LongUserCache {
         lo: u64,
         uh: u64,
     ) -> Option<u32> {
+        let fp = ((uh >> 32) as u32) | 1;
         let idx = (uh as usize) & Self::MASK;
         let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-        if (slot.tag == tag) & (slot.hi == hi) & (slot.lo == lo) {
-            return Some(slot.off);
+        if slot.0 == fp && unsafe { eq_arena_packed(arena.as_slice(), slot.1, tag, hi, lo) } {
+            return Some(slot.1);
         }
         let off = arena.push_packed33(tag, hi, lo)?;
-        *slot = PackedCacheSlot { hi, lo, off, tag };
+        *slot = (fp, off);
         Some(off)
     }
 
@@ -567,12 +552,9 @@ impl LongUserCache {
                 return self.intern_arena_packed33(arena, tag, hi, lo, uh);
             }
         }
-        if self.verb.is_empty() {
-            self.verb.resize(Self::VERB_CAP, (0, 0));
-        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::VERB_MASK;
-        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::MASK;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { eq_arena_raw(arena.as_slice(), slot.1, s) } {
             return Some(slot.1);
         }
@@ -1001,10 +983,14 @@ unsafe fn parse_eid_33_cold(
 
 #[cold]
 #[inline(never)]
-unsafe fn parse_user_33_cold(
+unsafe fn parse_user_33_cold_raw(
     p: *const u8,
     quoted: usize,
-    st: &mut ParseStateH,
+    tid: usize,
+    long_users: &mut ArenaBytes,
+    user_cache: &mut LongUserCache,
+    p2_short: usize,
+    p2_long_shift: u32,
     flag: &Flag,
 ) -> Option<(u64, usize, *const u8)> {
     if !is_valid_opaque_33(p) {
@@ -1012,12 +998,12 @@ unsafe fn parse_user_33_cold(
     }
     let s = std::slice::from_raw_parts(p, 33);
     let uh = hash_long(s);
-    let Some(off) = st.user_cache.intern_arena(&mut st.long_users, s, uh) else {
+    let Some(off) = user_cache.intern_arena(long_users, s, uh) else {
         flag.set(Need::Slow);
         return None;
     };
-    let q = st.p2_short + ((uh >> st.p2_long_shift) as usize);
-    Some((make_parse_long_user(st.tid, uh, off), q, p.add(34 + quoted)))
+    let q = p2_short + ((uh >> p2_long_shift) as usize);
+    Some((make_parse_long_user(tid, uh, off), q, p.add(34 + quoted)))
 }
 
 #[cold]
@@ -1025,7 +1011,7 @@ unsafe fn parse_user_33_cold(
 unsafe fn parse_cid_33_cold(
     p: *const u8,
     quoted: usize,
-    st: &mut ParseStateH,
+    st: &mut ParseClickStateH,
     flag: &Flag,
 ) -> Option<(u64, *const u8)> {
     if !is_valid_opaque_33(p) {
@@ -1075,9 +1061,14 @@ unsafe fn parse_eid_delim<const DELIM: u8>(
 }
 
 #[inline(always)]
-unsafe fn parse_user_delim<const DELIM: u8>(
+unsafe fn parse_user_delim_raw<const DELIM: u8>(
     p: *const u8,
-    st: &mut ParseStateH,
+    tid: usize,
+    long_users: &mut ArenaBytes,
+    user_cache: &mut LongUserCache,
+    p2_short: usize,
+    p2_short_shift: u32,
+    p2_long_shift: u32,
     flag: &Flag,
 ) -> Option<(u64, usize, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
@@ -1087,7 +1078,7 @@ unsafe fn parse_user_delim<const DELIM: u8>(
     if any_zero_u16(d8, d9) {
         let (key, len) = try_encode_89(p, end4, d8 == 0)?;
         let m = mix63(key);
-        let q = (m >> st.p2_short_shift) as usize;
+        let q = (m >> p2_short_shift) as usize;
         return Some((m, q, p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
@@ -1095,25 +1086,50 @@ unsafe fn parse_user_delim<const DELIM: u8>(
         if b0.wrapping_sub(0x30) < 0x50 {
             if let Some((tag, hi, lo)) = try_pack_hex33(p) {
                 let uh = hash_packed_33(tag, hi, lo);
-                let Some(off) =
-                    st.user_cache.intern_arena_packed33(&mut st.long_users, tag, hi, lo, uh)
-                else {
+                let Some(off) = user_cache.intern_arena_packed33(long_users, tag, hi, lo, uh) else {
                     flag.set(Need::Slow);
                     return None;
                 };
-                let q = st.p2_short + ((uh >> st.p2_long_shift) as usize);
-                return Some((make_parse_long_user(st.tid, uh, off), q, p.add(34 + quoted)));
+                let q = p2_short + ((uh >> p2_long_shift) as usize);
+                return Some((make_parse_long_user(tid, uh, off), q, p.add(34 + quoted)));
             }
         }
-        return parse_user_33_cold(p, quoted, st, flag);
+        return parse_user_33_cold_raw(
+            p,
+            quoted,
+            tid,
+            long_users,
+            user_cache,
+            p2_short,
+            p2_long_shift,
+            flag,
+        );
     }
     None
 }
 
 #[inline(always)]
-unsafe fn parse_cid_delim<const DELIM: u8>(
+unsafe fn parse_user_delim<const DELIM: u8>(
     p: *const u8,
     st: &mut ParseStateH,
+    flag: &Flag,
+) -> Option<(u64, usize, *const u8)> {
+    parse_user_delim_raw::<DELIM>(
+        p,
+        st.tid,
+        &mut st.long_users,
+        &mut st.user_cache,
+        st.p2_short,
+        st.p2_short_shift,
+        st.p2_long_shift,
+        flag,
+    )
+}
+
+#[inline(always)]
+unsafe fn parse_cid_delim<const DELIM: u8>(
+    p: *const u8,
+    st: &mut ParseClickStateH,
     flag: &Flag,
 ) -> Option<(u64, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
@@ -1240,26 +1256,20 @@ struct LongLinkPair {
 
 struct HybridBucketLinks {
     has_links: bool,
-    pairs_arena: Option<SinkArena>,
-    short_len: usize,
-    long_off: usize,
-    long_len: usize,
+    short_pairs: Vec<(u64, u64)>,
     short_offsets: Vec<usize>,
+    long_pairs: Vec<LongLinkPair>,
     long_offsets: Vec<usize>,
     link_store: LinkLongStore,
 }
-
-unsafe impl Sync for HybridBucketLinks {}
 
 impl HybridBucketLinks {
     fn empty() -> Self {
         Self {
             has_links: false,
-            pairs_arena: None,
-            short_len: 0,
-            long_off: 0,
-            long_len: 0,
+            short_pairs: Vec::new(),
             short_offsets: Vec::new(),
+            long_pairs: Vec::new(),
             long_offsets: Vec::new(),
             link_store: LinkLongStore::default(),
         }
@@ -1267,29 +1277,12 @@ impl HybridBucketLinks {
 
     #[inline(always)]
     fn short_part(&self, q: usize) -> &[(u64, u64)] {
-        let Some(ref arena) = self.pairs_arena else {
-            return &[];
-        };
-        let s = self.short_offsets[q];
-        let e = self.short_offsets[q + 1];
-        debug_assert!(e <= self.short_len);
-        unsafe { std::slice::from_raw_parts((arena.as_ptr() as *const (u64, u64)).add(s), e - s) }
+        &self.short_pairs[self.short_offsets[q]..self.short_offsets[q + 1]]
     }
 
     #[inline(always)]
     fn long_part(&self, lq: usize) -> &[LongLinkPair] {
-        let Some(ref arena) = self.pairs_arena else {
-            return &[];
-        };
-        let s = self.long_offsets[lq];
-        let e = self.long_offsets[lq + 1];
-        debug_assert!(e <= self.long_len);
-        unsafe {
-            std::slice::from_raw_parts(
-                (arena.as_ptr().add(self.long_off) as *const LongLinkPair).add(s),
-                e - s,
-            )
-        }
+        &self.long_pairs[self.long_offsets[lq]..self.long_offsets[lq + 1]]
     }
 }
 
@@ -1502,18 +1495,14 @@ fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
         }
         let gp = unsafe { p.get_unchecked(px as usize) }.load(Ordering::Relaxed);
         if gp != px {
-            let _ = unsafe { p.get_unchecked(x as usize) }.compare_exchange_weak(
-                px,
-                gp,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            );
+            let _ = unsafe { p.get_unchecked(x as usize) }
+                .compare_exchange_weak(px, gp, Ordering::Relaxed, Ordering::Relaxed);
         }
         x = gp;
     }
 }
 
-/// Read-only root lookup after union-find completes: zero `lock cmpxchg` / cache-line bouncing!
+/// Lock-free read-only find for Pass 5 after all unions have settled (zero atomic RMWs).
 #[inline(always)]
 fn uf_find_ro(p: &[AtomicU32], mut x: u32) -> u32 {
     loop {
@@ -1575,9 +1564,9 @@ fn uf_union_min_hybrid(p: &[AtomicU32], keys: &[u64], link_store: &LinkLongStore
     }
 }
 
-struct LinkParseWorker<'a> {
+struct LinkParseWorker {
     tid: usize,
-    pairs: ArenaVec<'a, (u64, u64)>,
+    pairs: Vec<(u64, u64)>,
     long_bytes: ArenaBytes,
     cache: LongUserCache,
     buf: Vec<u8>,
@@ -1607,7 +1596,7 @@ fn links_direct_hybrid(
     lo: usize,
     hi: usize,
     tid: usize,
-    pairs: &mut ArenaVec<'_, (u64, u64)>,
+    pairs: &mut Vec<(u64, u64)>,
     long_bytes: &mut ArenaBytes,
     cache: &mut LongUserCache,
     flag: &Flag,
@@ -1781,33 +1770,13 @@ fn read_links_hybrid(
     } else {
         0
     };
-    let pair_cap = (est_per_thr * 5 / 4).max(1024);
-    let pairs_bytes = ((pair_cap * std::mem::size_of::<(u64, u64)>() + 64) * threads).next_multiple_of(4096);
-    let uf_need = (pairs_bytes * 4 + 65536).next_multiple_of(4096);
-    let (uf_scratch, pairs_scratch) = if uf_need + pairs_bytes <= scratch_buf.len() {
-        let (uf, rest) = scratch_buf.split_at_mut(uf_need);
-        (uf, &mut rest[..pairs_bytes])
-    } else {
-        (scratch_buf, &mut [][..])
-    };
-    let use_arena_pairs = !pairs_scratch.is_empty();
-    let mut pairs_sc = Scratch::from_slice(pairs_scratch);
-    let pair_slots: Vec<_> = (0..threads)
-        .map(|_| {
-            Mutex::new(Some(if use_arena_pairs {
-                pairs_sc.buffer::<(u64, u64)>(pair_cap)
-            } else {
-                ArenaVec::Heap(Vec::with_capacity(est_per_thr))
-            }))
-        })
-        .collect();
 
-    let mut workers: Vec<LinkParseWorker<'_>> = par::run(
+    let mut workers: Vec<LinkParseWorker> = par::run(
         threads,
         link_chunks.len(),
         |tid| LinkParseWorker {
             tid,
-            pairs: pair_slots[tid].lock().unwrap().take().unwrap(),
+            pairs: Vec::with_capacity(est_per_thr),
             long_bytes: ArenaBytes::new_heap(est_long_bytes),
             cache: LongUserCache::new(),
             buf: std::mem::take(&mut *ctx.readers[tid].lock().unwrap()),
@@ -1847,24 +1816,23 @@ fn read_links_hybrid(
         pairs_by_w.push(w.pairs);
         raw_long_by_w.push(w.long_bytes);
     }
-    let pair_slices: Vec<&[(u64, u64)]> = pairs_by_w.iter().map(|v| &v[..]).collect();
     let raw_long_slices: Vec<&[u8]> = raw_long_by_w.iter().map(ArenaBytes::as_slice).collect();
     let links = build_bucket_links_hybrid(
-        &pair_slices,
+        &pairs_by_w,
         &raw_long_slices,
         p2_short_bits,
         p2_long_bits,
         threads,
-        uf_scratch,
+        scratch_buf,
     )?;
-    drop(pairs_by_w);
-    par::drop_par(threads, raw_long_by_w);
+    let to_drop: Vec<_> = pairs_by_w.into_iter().zip(raw_long_by_w).collect();
+    par::drop_par(threads, to_drop);
     tm.lap("links-uf");
     Ok(links)
 }
 
 fn build_bucket_links_hybrid(
-    pairs_by_w: &[&[(u64, u64)]],
+    pairs_by_w: &[Vec<(u64, u64)>],
     raw_long_by_w: &[&[u8]],
     p2_short_bits: u32,
     p2_long_bits: u32,
@@ -1921,7 +1889,7 @@ fn build_bucket_links_hybrid(
         let scattered: Vec<Scattered<'_>> =
             par::run(threads, pairs_by_w.len(), |_| Vec::new(), |res, t| {
                 let mut cnt = [0usize; HLP];
-                for &(a, b) in pairs_by_w[t] {
+                for &(a, b) in &pairs_by_w[t] {
                     cnt[ep_part(a)] += 1;
                     cnt[ep_part(b)] += 1;
                 }
@@ -2430,11 +2398,10 @@ fn build_bucket_links_hybrid(
         return Ok(HybridBucketLinks::empty());
     }
 
-    let short_bytes = (sacc * std::mem::size_of::<(u64, u64)>()).next_multiple_of(64);
-    let long_bytes = (lacc * std::mem::size_of::<LongLinkPair>()).next_multiple_of(64);
-    let pairs_arena = SinkArena::new((short_bytes + long_bytes).max(64));
-    let sp_out = SyncPtr(pairs_arena.as_mut_ptr() as *mut (u64, u64));
-    let lp_out = SyncPtr(unsafe { pairs_arena.as_mut_ptr().add(short_bytes) } as *mut LongLinkPair);
+    let mut short_pairs = Vec::with_capacity(sacc);
+    let mut long_pairs = Vec::with_capacity(lacc);
+    let sp_out = SyncPtr(short_pairs.as_mut_ptr());
+    let lp_out = SyncPtr(long_pairs.as_mut_ptr());
     let (base_ref, lib_ref, soff_ref, loff_ref, splen_ref, lplen_ref, slp_ref, llp_ref) = (
         &base,
         &long_id_base,
@@ -2484,14 +2451,16 @@ fn build_bucket_links_hybrid(
             }
         }
     });
+    unsafe {
+        short_pairs.set_len(sacc);
+        long_pairs.set_len(lacc);
+    }
 
     Ok(HybridBucketLinks {
         has_links: true,
-        pairs_arena: Some(pairs_arena),
-        short_len: sacc,
-        long_off: short_bytes,
-        long_len: lacc,
+        short_pairs,
         short_offsets,
+        long_pairs,
         long_offsets,
         link_store,
     })
@@ -2524,11 +2493,9 @@ struct ParseStateH {
     tid: usize,
     tok: Sinks<Tok, SWCB_TOK>,
     b: Sinks<RecB12, SWCB_B>,
-    ck: Sinks<RecC<u64>, SWCB_CK>,
     purch: Vec<CompactEv>,
     long_eids: ArenaBytes,
     long_users: ArenaBytes,
-    long_cids: ArenaBytes,
     user_cache: LongUserCache,
     p1_short: usize,
     p1_short_shift: u32,
@@ -2536,6 +2503,48 @@ struct ParseStateH {
     p2_short: usize,
     p2_short_shift: u32,
     p2_long_shift: u32,
+}
+
+struct ParseClickStateH {
+    tid: usize,
+    ck: Sinks<RecC<u64>, SWCB_CK>,
+    long_users: ArenaBytes,
+    long_cids: ArenaBytes,
+    user_cache: LongUserCache,
+    p2_short: usize,
+    p2_short_shift: u32,
+    p2_long_shift: u32,
+}
+
+impl ParseClickStateH {
+    #[inline(always)]
+    fn encode_user_slice(&mut self, s: &[u8], flag: &Flag) -> Option<(u64, usize)> {
+        if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
+            let m = mix63(k);
+            Some((m, (m >> self.p2_short_shift) as usize))
+        } else {
+            let uh = hash_long(s);
+            let Some(off) = self.user_cache.intern_arena(&mut self.long_users, s, uh) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            let q = self.p2_short + ((uh >> self.p2_long_shift) as usize);
+            Some((make_parse_long_user(self.tid, uh, off), q))
+        }
+    }
+
+    #[inline(always)]
+    fn encode_cid_slice(&mut self, s: &[u8], flag: &Flag) -> Option<u64> {
+        if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
+            Some(k)
+        } else {
+            let Some(off) = self.long_cids.push_bytes(s) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            Some(make_long_cid(self.tid, off))
+        }
+    }
 }
 
 impl ParseStateH {
@@ -2568,19 +2577,6 @@ impl ParseStateH {
             };
             let q = self.p2_short + ((uh >> self.p2_long_shift) as usize);
             Some((make_parse_long_user(self.tid, uh, off), q))
-        }
-    }
-
-    #[inline(always)]
-    fn encode_cid_slice(&mut self, s: &[u8], flag: &Flag) -> Option<u64> {
-        if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
-            Some(k)
-        } else {
-            let Some(off) = self.long_cids.push_bytes(s) else {
-                flag.set(Need::Slow);
-                return None;
-            };
-            Some(make_long_cid(self.tid, off))
         }
     }
 
@@ -2917,10 +2913,19 @@ fn event_slow_hybrid(
 unsafe fn click_hybrid(
     rows: &ParseRowsH<'_>,
     p: *const u8,
-    st: &mut ParseStateH,
+    st: &mut ParseClickStateH,
 ) -> Option<*const u8> {
     let (cid_tag, p) = parse_cid_delim::<b','>(p, st, rows.flag)?;
-    let (person_tag, user_q, p) = parse_user_delim::<b','>(p, st, rows.flag)?;
+    let (person_tag, user_q, p) = parse_user_delim_raw::<b','>(
+        p,
+        st.tid,
+        &mut st.long_users,
+        &mut st.user_cache,
+        st.p2_short,
+        st.p2_short_shift,
+        st.p2_long_shift,
+        rows.flag,
+    )?;
     let (cp, _, _, cq) = open(p);
     let cv = _mm_loadu_si128(cp.cast::<__m128i>());
     let c_commas = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b',' as i8))) as u32;
@@ -2982,7 +2987,7 @@ fn click_slow_hybrid(
     buf: &[u8],
     lo: usize,
     hi: usize,
-    st: &mut ParseStateH,
+    st: &mut ParseClickStateH,
 ) -> usize {
     let lf = lo + scan::memchr(b'\n', &buf[lo..hi]).expect("LF-terminated chunk");
     if let Some(f) = scan::row_fields::<4>(buf, lo, lf) {
@@ -3044,7 +3049,7 @@ fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usi
 }
 
 #[inline(never)]
-fn parse_clicks_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+fn parse_clicks_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseClickStateH) {
     if lo >= hi {
         return;
     }
@@ -3278,15 +3283,15 @@ fn dedup_long_part(
     };
 
     if total < (1 << 18) - 1 {
-        let nb = ((total * 5) / 14 + 1).next_power_of_two().max(4);
+        let nb = ((total * 10) / 68 + 1).next_power_of_two().max(4);
         let bmask = nb - 1;
         if t32.len() < nb {
             t32.resize(nb, DedupBucket32::default());
         }
         let table = &mut t32[..nb];
         table.fill(DedupBucket32::default());
-        let fp_mask = unsafe { _mm_set1_epi32(0xFFFC_0000u32 as i32) };
-        let zero = unsafe { _mm_setzero_si128() };
+        let fp_mask = unsafe { _mm256_set1_epi32(0xFFFC_0000u32 as i32) };
+        let zero = unsafe { _mm256_setzero_si256() };
         let mut flat = 0u32;
         for &(sl, _, cur_tid) in active {
             let cur_arena = unsafe { *long_eids.get_unchecked(cur_tid as usize) };
@@ -3294,14 +3299,14 @@ fn dedup_long_part(
                 let h = (r.eid >> 32) as u32;
                 let r_off = r.eid as u32;
                 let fp_hi = (h & 0x7FFC_0000) | 0x8000_0000;
-                let fp_vec = unsafe { _mm_set1_epi32(fp_hi as i32) };
+                let fp_vec = unsafe { _mm256_set1_epi32(fp_hi as i32) };
                 let mut bi = (h as usize) & bmask;
                 'probe: loop {
                     let b = unsafe { table.get_unchecked_mut(bi) };
-                    let vals = unsafe { _mm_load_si128(b.0.as_ptr().cast()) };
+                    let vals = unsafe { _mm256_load_si256(b.0.as_ptr().cast()) };
                     let mut hits = unsafe {
-                        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
-                            _mm_and_si128(vals, fp_mask),
+                        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+                            _mm256_and_si256(vals, fp_mask),
                             fp_vec,
                         )))
                     } as u32;
@@ -3328,7 +3333,7 @@ fn dedup_long_part(
                         }
                     }
                     let empties = unsafe {
-                        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(vals, zero)))
+                        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(vals, zero)))
                     } as u32;
                     if empties != 0 {
                         let lane = empties.trailing_zeros() as usize;
@@ -3429,15 +3434,15 @@ fn relocate_hybrid(
         .iter()
         .map(|s| s.len[p2_short..].iter().map(|&x| x as usize).sum::<usize>())
         .sum();
-    let cap_rb_s = (short_ev * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rb_s = (short_ev * 48 / 100 / threads / p2_short).max(16) + 16;
     let cap_rb_l = if long_ev > 0 {
-        (long_ev * 65 / 100 / threads / p2_long).max(16) + 16
+        (long_ev * 52 / 100 / threads / p2_long).max(16) + 16
     } else {
         16
     };
-    let cap_rc_s = (short_ck * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rc_s = (short_ck * 48 / 100 / threads / p2_short).max(16) + 16;
     let cap_rc_l = if long_ck > 0 {
-        (long_ck * 65 / 100 / threads / p2_long).max(16) + 16
+        (long_ck * 52 / 100 / threads / p2_long).max(16) + 16
     } else {
         16
     };
@@ -5580,7 +5585,10 @@ pub(super) fn run_to_output(
     let lc_bytes = if lc_est.saturating_mul(workers) <= MAX_LONG_ARENA_TOTAL { lc_est } else { 0 };
 
     let do_populate = env_usize("INGEST_POPULATE").unwrap_or(1) != 0;
-    let parse_bytes = (tok_bytes + le_bytes + b_bytes + ck_bytes + lu_bytes + lc_bytes) * workers;
+    // Clean Arena Recycling (`parse_events -> dedup -> parse_clicks`): exclude `ck + lc` from
+    // upfront `parse_mapping` (`-155 MB` / `-39k minflt` on 20M, `-450 MB` / `-113k minflt` on 60M!)
+    // and carve `ck`, `reloc`, and `group_scratch` strictly from 100%-already-faulted `tok` pages!
+    let parse_bytes = (tok_bytes + le_bytes + b_bytes + lu_bytes) * workers;
 
     let (arena, parse_mapping) = SinkArena::new(parse_bytes).split_at(parse_bytes);
     let (mut tokens, mut arena) = arena.split_at((tok_bytes + le_bytes) * workers);
@@ -5612,20 +5620,13 @@ pub(super) fn run_to_output(
         };
         tokens = rest;
         let (b, rest) = arena.split_at(b_bytes);
-        let (ck, rest) = rest.split_at(ck_bytes);
         let (lu, rest) = if lu_bytes > 0 {
             let (a, r) = rest.split_at(lu_bytes);
             (Some(a), r)
         } else {
             (None, rest)
         };
-        let (lc, rest) = if lc_bytes > 0 {
-            let (a, r) = rest.split_at(lc_bytes);
-            (Some(a), r)
-        } else {
-            (None, rest)
-        };
-        slices.push(Mutex::new(Some((tok, le, b, ck, lu, lc))));
+        slices.push(Mutex::new(Some((tok, le, b, lu))));
         arena = rest;
     }
 
@@ -5647,83 +5648,30 @@ pub(super) fn run_to_output(
     let p1_long_shift = 64 - p1_long_bits;
     let p2_short_shift = 63 - p2_short_bits;
     let p2_long_shift = 64 - p2_long_bits;
-    // Default to reusable thread-local pread buffers (mmap_mode=0): avoids ~520k 4 KiB
-    // minor page faults + MADV_DONTNEED TLB shootdowns inside virtualized cloud VMs.
-    let mmap_mode = env_usize("INGEST_MMAP_INPUT").unwrap_or(0);
     let files = &ctx.files;
-    let main_chunks = &ctx.main_chunks;
-
-    let mut mapped_slots: Vec<Mutex<Option<scan::MappedFile>>> = Vec::new();
-    let mut mapped_files: Vec<Option<scan::MappedFile>> = Vec::new();
-    let mut chunk_rem: Vec<AtomicU32> = Vec::new();
-    if mmap_mode != 0 {
-        let advice = match mmap_mode {
-            2 => 2, // MADV_SEQUENTIAL
-            _ => 0,
-        };
-        if mmap_mode == 4 {
-            let mut counts = vec![0u32; files.len()];
-            for c in main_chunks.iter() {
-                counts[c.file as usize] += 1;
-            }
-            chunk_rem = counts.into_iter().map(AtomicU32::new).collect();
-            mapped_slots = files
-                .iter()
-                .map(|fi| {
-                    let m = if fi.kind != Kind::Links {
-                        scan::MappedFile::open(&fi.handle, fi.len, advice)
-                    } else {
-                        None
-                    };
-                    Mutex::new(m)
-                })
-                .collect();
-        } else {
-            mapped_files = files
-                .iter()
-                .map(|fi| {
-                    if fi.kind != Kind::Links {
-                        scan::MappedFile::open(&fi.handle, fi.len, advice)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if mmap_mode == 3 || mmap_mode == 7 {
-                let mf_ref = &mapped_files;
-                par::run(workers, mf_ref.len(), |_| (), |_, fi| {
-                    if let Some(ref m) = mf_ref[fi] {
-                        m.populate_read();
-                    }
-                });
-            }
-        }
-    }
-    let mf_ref = &mapped_files;
-    let ms_ref = &mapped_slots;
-    let crem_ref = &chunk_rem;
+    let ev_chunks: Vec<scan::Chunk> =
+        ctx.main_chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Events).collect();
+    let ck_chunks: Vec<scan::Chunk> =
+        ctx.main_chunks.iter().copied().filter(|c| files[c.file as usize].kind == Kind::Clicks).collect();
     let est_purch_cap = (est_ev / 25 / workers).max(1024);
 
-    let mut states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
+    let ev_states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
         workers,
-        main_chunks.len(),
+        ev_chunks.len(),
         |tid| {
-            let (tok, le, b, ck, lu, lc) = slices[tid].lock().unwrap().take().unwrap();
+            let (tok, le, b, lu) = slices[tid].lock().unwrap().take().unwrap();
             if do_populate {
                 tok.populate_write();
                 b.populate_write();
-                ck.populate_write();
             }
             (
                 ParseStateH {
                     tid,
                     tok: Sinks::in_arena_split(p1_short, p1_long, cap_tok_s, cap_tok_l, tok),
                     b: Sinks::in_arena_split(p2_short, p2_long, cap_b_s, cap_b_l, b),
-                    ck: Sinks::in_arena_split(p2_short, p2_long, cap_ck_s, cap_ck_l, ck),
                     purch: Vec::with_capacity(est_purch_cap),
                     long_eids: le.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
                     long_users: lu.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
-                    long_cids: lc.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
                     user_cache: LongUserCache::new(),
                     p1_short,
                     p1_short_shift,
@@ -5739,106 +5687,37 @@ pub(super) fn run_to_output(
             if flag.get().is_some() {
                 return;
             }
-            let c = main_chunks[i];
-            let fidx = c.file as usize;
-            let fi = &files[fidx];
-            if mmap_mode == 4 {
-                // SAFETY: slot stays Some until the last chunk decrements crem_ref[fidx] to 1.
-                let used_map = {
-                    let guard = ms_ref[fidx].lock().unwrap();
-                    let ptr_opt = guard.as_ref().map(|m| m as *const scan::MappedFile);
-                    drop(guard);
-                    if let Some(mptr) = ptr_opt {
-                        let m = unsafe { &*mptr };
-                        if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
-                            match fi.kind {
-                                Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
-                                Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
-                                Kind::Links => unreachable!(),
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
-                if !used_map {
-                    let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
-                    match fi.kind {
-                        Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
-                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, buf, lo, hi, st),
-                        Kind::Links => unreachable!(),
-                    }
-                }
-                if crem_ref[fidx].fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let _ = ms_ref[fidx].lock().unwrap().take();
-                }
-                return;
-            }
-            if let Some(Some(m)) = mf_ref.get(fidx) {
-                if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
-                    match fi.kind {
-                        Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
-                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
-                        Kind::Links => unreachable!(),
-                    }
-                    return;
-                }
-            }
+            let c = ev_chunks[i];
+            let fi = &files[c.file as usize];
             let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
-            match fi.kind {
-                Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
-                Kind::Clicks => parse_clicks_buf_hybrid(&rows, buf, lo, hi, st),
-                Kind::Links => unreachable!(),
-            }
+            parse_events_buf_hybrid(&rows, buf, lo, hi, st);
         },
         |(st, _)| {
             st.tok.finish();
             st.b.finish();
-            st.ck.finish();
         },
     );
-    if mmap_mode == 6 || mmap_mode == 7 {
-        let mf_ref = &mapped_files;
-        par::run(workers, mf_ref.len(), |_| (), |_, fi| {
-            if let Some(ref m) = mf_ref[fi] {
-                m.release_pages();
-            }
-        });
-        drop(mapped_files);
-    } else if mmap_mode == 1 || mmap_mode == 2 || mmap_mode == 3 {
-        drop(mapped_files);
-    }
-    ctx.prefetch.stop();
-    for (tid, (_, buf)) in states.iter_mut().enumerate() {
-        *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
-    }
     if let Some(n) = flag.get() {
-        par::drop_par(workers, states);
+        ctx.prefetch.stop();
+        par::drop_par(workers, ev_states);
         drop(parse_mapping);
         return Err(n);
     }
-    tm.lap("parse");
+    tm.lap("parse-ev");
 
-    let mut tok_sinks = Vec::with_capacity(states.len());
-    let mut b_sinks = Vec::with_capacity(states.len());
-    let mut ck_sinks = Vec::with_capacity(states.len());
-    let mut worker_purch = Vec::with_capacity(states.len());
-    let mut long_eids = Vec::with_capacity(states.len());
-    let mut worker_long_users = Vec::with_capacity(states.len());
-    let mut worker_long_cids = Vec::with_capacity(states.len());
+    let mut tok_sinks = Vec::with_capacity(ev_states.len());
+    let mut b_sinks = Vec::with_capacity(ev_states.len());
+    let mut worker_purch = Vec::with_capacity(ev_states.len());
+    let mut long_eids = Vec::with_capacity(ev_states.len());
+    let mut click_carry = Vec::with_capacity(ev_states.len());
     let mut ne_raw = 0usize;
-    for (st, _) in states {
+    for (st, buf) in ev_states {
         ne_raw += st.tok.len.iter().map(|&x| x as usize).sum::<usize>();
         tok_sinks.push(st.tok);
         b_sinks.push(st.b);
-        ck_sinks.push(st.ck);
         worker_purch.push(st.purch);
         long_eids.push(st.long_eids);
-        worker_long_users.push(st.long_users);
-        worker_long_cids.push(st.long_cids);
+        click_carry.push(Mutex::new(Some((st.long_users, st.user_cache, buf))));
     }
 
     let dead = DeadEvents::new(&b_sinks, p2_total, threads);
@@ -5863,19 +5742,102 @@ pub(super) fn run_to_output(
             },
         );
     }
-    // Rejoin `tok` + `long_eids` back into ONE contiguous huge-page arena per worker!
-    let group_scratch: Vec<SinkArena> = tok_sinks
-        .into_iter()
-        .zip(long_eids)
-        .map(|(tok_s, le)| {
-            let tok_a = tok_s.into_arena();
-            match le.into_arena() {
-                Some(le_a) => SinkArena::merge(tok_a, le_a),
-                None => tok_a,
+
+    // Carve `ck` from 100%-already-faulted `tok` pages (leaving remaining 100%-faulted `tok`
+    // for `reloc` + `group_scratch`), and carve `lc` from already-faulted `le` pages!
+    let mut ck_slots: Vec<Mutex<Option<(SinkArena, Option<SinkArena>, bool)>>> =
+        Vec::with_capacity(workers);
+    let mut group_scratch: Vec<SinkArena> = Vec::with_capacity(workers);
+    for (tok_s, le) in tok_sinks.into_iter().zip(long_eids) {
+        let tok_a = tok_s.into_arena();
+        let le_a = le.into_arena();
+        let (ck_a, mut rem, need_pop) = if tok_a.bytes() >= ck_bytes + (4 << 20) {
+            let (c, r) = tok_a.split_at(ck_bytes);
+            (c, r, false)
+        } else {
+            (SinkArena::new(ck_bytes), tok_a, do_populate)
+        };
+        let lc_a = if lc_bytes > 0 {
+            if let Some(la) = le_a {
+                if la.bytes() >= lc_bytes {
+                    let (lc, _) = la.split_at(lc_bytes);
+                    Some(lc)
+                } else if rem.bytes() >= lc_bytes + (4 << 20) {
+                    let (lc, r) = rem.split_at(lc_bytes);
+                    rem = r;
+                    Some(lc)
+                } else {
+                    None
+                }
+            } else if rem.bytes() >= lc_bytes + (4 << 20) {
+                let (lc, r) = rem.split_at(lc_bytes);
+                rem = r;
+                Some(lc)
+            } else {
+                None
             }
-        })
-        .collect();
+        } else {
+            None
+        };
+        ck_slots.push(Mutex::new(Some((ck_a, lc_a, need_pop))));
+        group_scratch.push(rem);
+    }
     tm.lap("dedup");
+
+    let mut ck_states: Vec<(ParseClickStateH, Vec<u8>)> = par::run_fini(
+        workers,
+        ck_chunks.len(),
+        |tid| {
+            let (long_users, user_cache, buf) = click_carry[tid].lock().unwrap().take().unwrap();
+            let (ck_a, lc_a, need_pop) = ck_slots[tid].lock().unwrap().take().unwrap();
+            if need_pop {
+                ck_a.populate_write();
+            }
+            (
+                ParseClickStateH {
+                    tid,
+                    ck: Sinks::in_arena_split(p2_short, p2_long, cap_ck_s, cap_ck_l, ck_a),
+                    long_users,
+                    long_cids: lc_a.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
+                    user_cache,
+                    p2_short,
+                    p2_short_shift,
+                    p2_long_shift,
+                },
+                buf,
+            )
+        },
+        |(st, buf), i| {
+            if flag.get().is_some() {
+                return;
+            }
+            let c = ck_chunks[i];
+            let fi = &files[c.file as usize];
+            let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
+            parse_clicks_buf_hybrid(&rows, buf, lo, hi, st);
+        },
+        |(st, _)| {
+            st.ck.finish();
+        },
+    );
+    ctx.prefetch.stop();
+    for (tid, (_, buf)) in ck_states.iter_mut().enumerate() {
+        *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
+    }
+    if let Some(n) = flag.get() {
+        par::drop_par(workers, ck_states);
+        drop((b_sinks, worker_purch, group_scratch, parse_mapping));
+        return Err(n);
+    }
+    let mut ck_sinks = Vec::with_capacity(ck_states.len());
+    let mut worker_long_users = Vec::with_capacity(ck_states.len());
+    let mut worker_long_cids = Vec::with_capacity(ck_states.len());
+    for (st, _) in ck_states {
+        ck_sinks.push(st.ck);
+        worker_long_users.push(st.long_users);
+        worker_long_cids.push(st.long_cids);
+    }
+    tm.lap("parse-ck");
 
     let (reloc_b, reloc_c, dead, group_scratch) = if links.has_links {
         let wlu_slices: Vec<&[u8]> = worker_long_users.iter().map(ArenaBytes::as_slice).collect();
@@ -5891,8 +5853,9 @@ pub(super) fn run_to_output(
             p2_short_shift,
             threads,
         );
-        links.pairs_arena = None;
+        links.short_pairs = Vec::new();
         links.short_offsets = Vec::new();
+        links.long_pairs = Vec::new();
         links.long_offsets = Vec::new();
         drop(dead);
         tm.lap("relocate");
@@ -6034,11 +5997,10 @@ mod tests {
         let t2 = make_parse_long_user(0, h2, o2);
         let s_mid = mix63(u64::enc_slice(b"u5abcdef").unwrap());
         let pairs = vec![vec![(t1, s_mid), (s_mid, t2)]];
-        let pair_slices: Vec<&[(u64, u64)]> = pairs.iter().map(Vec::as_slice).collect();
         let raw_slices: Vec<&[u8]> = vec![arena.as_slice()];
 
         for &(ps_bits, pl_bits) in &[(9u32, 6u32), (4u32, 9u32), (8u32, 5u32)] {
-            let bl = build_bucket_links_hybrid(&pair_slices, &raw_slices, ps_bits, pl_bits, 2, &mut []).unwrap();
+            let bl = build_bucket_links_hybrid(&pairs, &raw_slices, ps_bits, pl_bits, 2, &mut []).unwrap();
             assert!(bl.has_links);
             let p2_short = 1usize << ps_bits;
             let q_mid = (s_mid >> (63 - ps_bits)) as usize;

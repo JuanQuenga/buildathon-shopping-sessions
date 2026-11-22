@@ -663,16 +663,6 @@ impl SinkArena {
         Self { base, bytes, mapping: Arc::new(SinkMapping { raw, len }) }
     }
 
-    #[inline(always)]
-    pub(super) fn as_ptr(&self) -> *const u8 {
-        self.base
-    }
-
-    #[inline(always)]
-    pub(super) fn as_mut_ptr(&self) -> *mut u8 {
-        self.base
-    }
-
     pub(super) fn split_at(self, offset: usize) -> (Self, Self) {
         assert!(offset <= self.bytes && offset % 64 == 0);
         let rest = Self {

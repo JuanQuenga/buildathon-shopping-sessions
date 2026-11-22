@@ -158,8 +158,8 @@ impl DateTable {
             return None;
         }
         let both = _mm_madd_epi16(times, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
-        let seconds = _mm_hadd_epi32(both, both);
-        Some((_mm_cvtsi128_si32(seconds) as i64, _mm_extract_epi32::<1>(seconds) as i64))
+        let sum = _mm_add_epi32(both, _mm_srli_si128::<4>(both));
+        Some((_mm_cvtsi128_si32(sum) as i64, _mm_extract_epi32::<2>(sum) as i64))
     }
 
     /// Both fields have an independently checked F1 terminator and delimiter.

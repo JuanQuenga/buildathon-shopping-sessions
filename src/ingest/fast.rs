@@ -819,9 +819,9 @@ impl<K: Key> Candidate for RecA<K> {
     fn ingest(&self) -> u32 { self.ingest }
 }
 
-#[repr(C, align(16))]
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Default)]
-struct DedupBucket32([u32; 4]);
+struct DedupBucket32([u32; 8]);
 
 #[derive(Default)]
 struct DedupTable {
@@ -849,29 +849,30 @@ impl DedupTable {
 
         if total < (1 << 18) - 1 {
             use std::arch::x86_64::*;
-            // 4-way SSE2 open addressing (<= 70% load -> half L2 footprint, >96% 1-bucket hit/insert).
-            let nb = ((total * 5) / 14 + 1).next_power_of_two().max(4);
+            // 8-way AVX2 open addressing (<= 85% load -> halves 60M table from 1 MiB -> 512 KiB
+            // to fit Cascade Lake 1 MiB L2 while keeping >99% 1-bucket hit/insert!).
+            let nb = ((total * 10) / 68 + 1).next_power_of_two().max(4);
             let bmask = nb - 1;
             if self.t32.len() < nb {
                 self.t32.resize(nb, DedupBucket32::default());
             }
             let table = &mut self.t32[..nb];
             table.fill(DedupBucket32::default());
-            let fp_mask = unsafe { _mm_set1_epi32(0xFFFC_0000u32 as i32) };
-            let zero = unsafe { _mm_setzero_si128() };
+            let fp_mask = unsafe { _mm256_set1_epi32(0xFFFC_0000u32 as i32) };
+            let zero = unsafe { _mm256_setzero_si256() };
             let mut flat = 0u32;
             for &(sl, _, cur_tid) in active {
                 for r in sl {
                     let h = r.hash32();
                     let fp_hi = (h & 0x7FFC_0000) | 0x8000_0000;
-                    let fp_vec = unsafe { _mm_set1_epi32(fp_hi as i32) };
+                    let fp_vec = unsafe { _mm256_set1_epi32(fp_hi as i32) };
                     let mut bi = (h as usize) & bmask;
                     'probe: loop {
                         let b = unsafe { table.get_unchecked_mut(bi) };
-                        let vals = unsafe { _mm_load_si128(b.0.as_ptr().cast()) };
+                        let vals = unsafe { _mm256_load_si256(b.0.as_ptr().cast()) };
                         let mut hits = unsafe {
-                            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
-                                _mm_and_si128(vals, fp_mask),
+                            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+                                _mm256_and_si256(vals, fp_mask),
                                 fp_vec,
                             )))
                         } as u32;
@@ -891,7 +892,7 @@ impl DedupTable {
                             }
                         }
                         let empties = unsafe {
-                            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(vals, zero)))
+                            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(vals, zero)))
                         } as u32;
                         if empties != 0 {
                             let lane = empties.trailing_zeros() as usize;
@@ -2349,6 +2350,15 @@ impl DenseSessions {
         self.word_mask = 0;
     }
 
+    #[cold]
+    #[inline(never)]
+    fn push_purch_node(&mut self, bin_idx: usize, cc: u32) {
+        let bin = unsafe { self.bins.get_unchecked_mut(bin_idx) };
+        let idx = self.purch_nodes.len() as u32;
+        self.purch_nodes.push(PurchNode { cc, next: bin.purch_head });
+        bin.purch_head = idx;
+    }
+
     #[inline(always)]
     fn scatter_slice(&mut self, events: &[CompactEv]) {
         let mut wm = self.word_mask;
@@ -2364,10 +2374,8 @@ impl DenseSessions {
             bin.min_ts = bin.min_ts.min(ts);
             bin.max_ts = bin.max_ts.max(ts);
             bin.count += 1;
-            if (cc & 0x00FF_FFFF) != 0 {
-                let idx = self.purch_nodes.len() as u32;
-                self.purch_nodes.push(PurchNode { cc, next: bin.purch_head });
-                bin.purch_head = idx;
+            if cc != 0 {
+                self.push_purch_node(bi, cc);
             }
         }
         self.word_mask = wm;
@@ -2380,7 +2388,8 @@ impl DenseSessions {
     }
 }
 
-#[inline(always)]
+#[cold]
+#[inline(never)]
 fn add_bin_purchases(
     purch_nodes: &[PurchNode],
     mut head: u32,
@@ -2541,6 +2550,11 @@ impl FusedAssists {
         if n_sess <= 64 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
             let min_s = unsafe { *self.s_start.get_unchecked(0) };
             let max_hi = max_s.saturating_add(WEEK_MS_U32);
+            let mut c0 = 0usize;
+            while c0 < clicks.len() && unsafe { clicks.get_unchecked(c0).ts } < min_s {
+                c0 += 1;
+            }
+            let clicks = &clicks[c0..];
             unsafe {
                 use std::arch::x86_64::*;
                 if n_sess <= 8 {
@@ -2553,9 +2567,6 @@ impl FusedAssists {
                         let cts = click.ts;
                         if cts > max_hi {
                             break;
-                        }
-                        if cts < min_s {
-                            continue;
                         }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
@@ -2597,9 +2608,6 @@ impl FusedAssists {
                         let cts = click.ts;
                         if cts > max_hi {
                             break;
-                        }
-                        if cts < min_s {
-                            continue;
                         }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
@@ -2645,9 +2653,6 @@ impl FusedAssists {
                         let cts = click.ts;
                         if cts > max_hi {
                             break;
-                        }
-                        if cts < min_s {
-                            continue;
                         }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
