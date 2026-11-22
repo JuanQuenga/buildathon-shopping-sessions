@@ -2467,6 +2467,7 @@ struct FusedAssists {
     /// Contiguous same-day session runs `(rel_day, exclusive_end_sess_idx)`.
     day_runs: Vec<(u16, u16)>,
     stamp: u32,
+    /// Power-of-two 16B per-campaign `(stamp, mask_64)` (or `prev_end` in `count_sparse`).
     campaigns: Vec<(u32, u64)>,
 }
 
@@ -2534,7 +2535,7 @@ impl FusedAssists {
             return;
         }
         // Branchless AVX2 bitmask assist sweep for persons with 2..=64 sessions (~99.9% of persons!):
-        // evaluates all session windows in parallel with zero inner `while` loops or interval branches.
+        // evaluates all session windows in parallel with zero inner interval branches.
         let max_cts = unsafe { clicks.get_unchecked(clicks.len() - 1).ts };
         let max_s = unsafe { *self.s_start.get_unchecked(n_sess - 1) };
         if n_sess <= 64 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
@@ -2568,18 +2569,21 @@ impl FusedAssists {
                         }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
                         let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
                         *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
-                        while new_bits != 0 {
+                        loop {
                             let si = new_bits.trailing_zeros() as usize;
                             new_bits &= new_bits - 1;
                             let d = *self.s_day.get_unchecked(si) as usize;
                             *row.add(d) += 1;
+                            if new_bits == 0 {
+                                break;
+                            }
                         }
                     }
                 } else if n_sess <= 16 {
@@ -2614,18 +2618,21 @@ impl FusedAssists {
                         }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
                         let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
                         *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
-                        while new_bits != 0 {
+                        loop {
                             let si = new_bits.trailing_zeros() as usize;
                             new_bits &= new_bits - 1;
                             let d = *self.s_day.get_unchecked(si) as usize;
                             *row.add(d) += 1;
+                            if new_bits == 0 {
+                                break;
+                            }
                         }
                     }
                 } else {
@@ -2659,18 +2666,21 @@ impl FusedAssists {
                         }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
                         let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
                         *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
-                        while new_bits != 0 {
+                        loop {
                             let si = new_bits.trailing_zeros() as usize;
                             new_bits &= new_bits - 1;
                             let d = *self.s_day.get_unchecked(si) as usize;
                             *row.add(d) += 1;
+                            if new_bits == 0 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2722,7 +2732,7 @@ impl FusedAssists {
             }
             let campaign = click.campaign as usize;
             let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
-            let prev = if seen.0 == stamp { seen.1 as usize } else { 0 };
+            let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1 as usize, 0);
             let begin = first.max(prev);
             if begin >= end {
                 continue;

@@ -323,7 +323,7 @@ unsafe fn hash_arena_rec(arena: &[u8], off: u32) -> u64 {
 #[inline(always)]
 unsafe fn eq_arena_packed(arena: &[u8], off: u32, tag: u8, hi: u64, lo: u64) -> bool {
     let p = arena.as_ptr().add(off as usize);
-    (*p == 0) & (*p.add(1) == tag) & (ld8(p.add(2)) == hi) & (ld8(p.add(10)) == lo)
+    (*p == 0) && ((*p.add(1) == tag) & (ld8(p.add(2)) == hi) & (ld8(p.add(10)) == lo))
 }
 
 #[inline(always)]
@@ -2689,8 +2689,7 @@ unsafe fn click_hybrid(
     let c_commas = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b',' as i8))) as u32;
     let c_quotes = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'"' as i8))) as u32;
     let c_nls = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8))) as u32;
-    let cq_mask = (cq as u32).wrapping_neg();
-    let delim_mask = (c_quotes & cq_mask) | (c_commas & !cq_mask);
+    let delim_mask = std::hint::select_unpredictable(cq != 0, c_quotes, c_commas);
     if delim_mask == 0 {
         return None;
     }
@@ -3583,8 +3582,16 @@ fn cswap_click_ts(a: &mut [CompactClick<u64>], i: usize, j: usize) {
         let x = *a.get_unchecked(i);
         let y = *a.get_unchecked(j);
         let swap = x.ts > y.ts;
-        *a.get_unchecked_mut(i) = if swap { y } else { x };
-        *a.get_unchecked_mut(j) = if swap { x } else { y };
+        let x0 = ((x.campaign as u64) << 32) | (x.ts as u64);
+        let y0 = ((y.campaign as u64) << 32) | (y.ts as u64);
+        let lo0 = std::hint::select_unpredictable(swap, y0, x0);
+        let hi0 = std::hint::select_unpredictable(swap, x0, y0);
+        let lo1 = std::hint::select_unpredictable(swap, y.cid, x.cid);
+        let hi1 = std::hint::select_unpredictable(swap, x.cid, y.cid);
+        *a.get_unchecked_mut(i) =
+            CompactClick { ts: lo0 as u32, campaign: (lo0 >> 32) as u32, cid: lo1 };
+        *a.get_unchecked_mut(j) =
+            CompactClick { ts: hi0 as u32, campaign: (hi0 >> 32) as u32, cid: hi1 };
     }
 }
 
@@ -3817,7 +3824,65 @@ fn sort_clicks_var_only(
                 cswap_click_ts(cl, i, j);
             }
         }
-        13..=20 => {
+        13 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (2, 8), (2, 4), (5, 6), (9, 10), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click_ts(cl, i, j);
+            }
+        }
+        14 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click_ts(cl, i, j);
+            }
+        }
+        15 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click_ts(cl, i, j);
+            }
+        }
+        16 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14), (13, 15),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14), (11, 15),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click_ts(cl, i, j);
+            }
+        }
+        17..=20 => {
             for i in 1..n {
                 let v = unsafe { *cl.get_unchecked(i) };
                 let mut j = i;
@@ -4240,6 +4305,298 @@ fn finalize_click_csr<P>(w: &mut FusedWorkerH<'_, P>, np: usize, ncl_raw: usize)
     ncl_raw
 }
 
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn group_short_part<P: GroupProfile>(
+    w: &mut FusedWorkerH<'_, P>,
+    q: usize,
+    raw_n: usize,
+    raw_ck: usize,
+    b_sinks: &[Sinks<RecB12, SWCB_B>],
+    reloc_b: &[Sinks<RecB12, SWCB_B>],
+    ck_sinks: &[Sinks<RecC<u64>, SWCB_CK>],
+    reloc_c: &[Sinks<RecC<u64>, SWCB_CK>],
+    dead: Option<&DeadEvents>,
+    wp_ref: &[&[CompactEv]],
+    wlc_ref: &[&[u8]],
+    dense_min: usize,
+    day0: i32,
+    ws_rem: u32,
+    organic: u32,
+    categories: &[Vec<u8>],
+) {
+    w.profile.start();
+    w.pid.clear();
+    w.pid.reserve(raw_n);
+    w.ev_flat.clear();
+    w.ev_flat.reserve(raw_n);
+    let pid = w.pid.as_mut_ptr();
+    let ev_flat = w.ev_flat.as_mut_ptr();
+    let mut live = 0usize;
+
+    w.short_map.reset(raw_n / 25 + 16);
+    for_each_live(b_sinks, dead, q, |r| {
+        let id = w.short_map.count(r.person());
+        let ev = unpack_ev(r.ts_or_purch, wp_ref);
+        unsafe {
+            pid.add(live).write(id);
+            ev_flat.add(live).write(ev);
+        }
+        live += 1;
+    });
+    for_each_live(reloc_b, None, q, |r| {
+        let id = w.short_map.count(r.person());
+        let ev = unpack_ev(r.ts_or_purch, wp_ref);
+        unsafe {
+            pid.add(live).write(id);
+            ev_flat.add(live).write(ev);
+        }
+        live += 1;
+    });
+    if live == 0 {
+        return;
+    }
+    w.ne += live;
+    unsafe {
+        w.pid.set_len(live);
+        w.ev_flat.set_len(live);
+    }
+    let np = w.short_map.len();
+    w.np += np;
+    w.fill.clear();
+    w.fill.reserve(np);
+    let mut acc = 0u32;
+    for pi in 0..np {
+        w.fill.push(acc);
+        acc += w.short_map.person(pi).1;
+    }
+    w.ev_buf.clear();
+    w.ev_buf.reserve(live);
+    let ev_ptr = w.ev_buf.as_mut_ptr();
+    for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
+        let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
+        unsafe { ev_ptr.add(*pos as usize).write(ev) };
+        *pos += 1;
+    }
+    unsafe { w.ev_buf.set_len(live) };
+
+    let ncl_raw = if raw_ck > 0 {
+        w.cl_pid.clear();
+        w.cl_pid.reserve(raw_ck);
+        w.cl_flat.clear();
+        w.cl_flat.reserve(raw_ck);
+        let cl_pid = w.cl_pid.as_mut_ptr();
+        let cl_flat = w.cl_flat.as_mut_ptr();
+        let mut ncl = 0usize;
+        w.ck_cnt.clear();
+        w.ck_cnt.resize(np, 0);
+        for_each_live(ck_sinks, None, q, |r| {
+            if let Some(id) = w.short_map.get(r.person) {
+                unsafe {
+                    cl_pid.add(ncl).write(id);
+                    cl_flat.add(ncl).write(CompactClick {
+                        ts: r.ts,
+                        campaign: r.campaign,
+                        cid: r.cid,
+                    });
+                    *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
+                }
+                ncl += 1;
+            }
+        });
+        for_each_live(reloc_c, None, q, |r| {
+            if let Some(id) = w.short_map.get(r.person) {
+                unsafe {
+                    cl_pid.add(ncl).write(id);
+                    cl_flat.add(ncl).write(CompactClick {
+                        ts: r.ts,
+                        campaign: r.campaign,
+                        cid: r.cid,
+                    });
+                    *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
+                }
+                ncl += 1;
+            }
+        });
+        finalize_click_csr(w, np, ncl)
+    } else {
+        0
+    };
+    w.profile.end(GroupPhase::Csr);
+
+    let use_dense = w.dense.enabled();
+    let mut ev_st = 0usize;
+    let mut id_buf = [0u8; 16];
+    for pi in 0..np {
+        let (key, count) = w.short_map.person(pi);
+        let ev_cnt = count as usize;
+        let n = unmix63(key).unpack_buf(&mut id_buf);
+        aggregate_person(
+            w,
+            pi,
+            ev_st,
+            ev_cnt,
+            ncl_raw,
+            &id_buf[..n],
+            use_dense,
+            dense_min,
+            day0,
+            ws_rem,
+            organic,
+            categories,
+            wlc_ref,
+        );
+        ev_st += ev_cnt;
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn group_long_part<P: GroupProfile>(
+    w: &mut FusedWorkerH<'_, P>,
+    q: usize,
+    raw_n: usize,
+    raw_ck: usize,
+    b_sinks: &[Sinks<RecB12, SWCB_B>],
+    reloc_b: &[Sinks<RecB12, SWCB_B>],
+    ck_sinks: &[Sinks<RecC<u64>, SWCB_CK>],
+    reloc_c: &[Sinks<RecC<u64>, SWCB_CK>],
+    dead: Option<&DeadEvents>,
+    wp_ref: &[&[CompactEv]],
+    wlu_ref: &[&[u8]],
+    wlc_ref: &[&[u8]],
+    ls_ref: &LinkLongStore,
+    dense_min: usize,
+    day0: i32,
+    ws_rem: u32,
+    organic: u32,
+    categories: &[Vec<u8>],
+) {
+    w.profile.start();
+    w.pid.clear();
+    w.pid.reserve(raw_n);
+    w.ev_flat.clear();
+    w.ev_flat.reserve(raw_n);
+    let pid = w.pid.as_mut_ptr();
+    let ev_flat = w.ev_flat.as_mut_ptr();
+    let mut live = 0usize;
+
+    w.long_map.reset(raw_n / 25 + 16);
+    for_each_live(b_sinks, dead, q, |r| {
+        let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
+        let ev = unpack_ev(r.ts_or_purch, wp_ref);
+        unsafe {
+            pid.add(live).write(id);
+            ev_flat.add(live).write(ev);
+        }
+        live += 1;
+    });
+    for_each_live(reloc_b, None, q, |r| {
+        let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
+        let ev = unpack_ev(r.ts_or_purch, wp_ref);
+        unsafe {
+            pid.add(live).write(id);
+            ev_flat.add(live).write(ev);
+        }
+        live += 1;
+    });
+    if live == 0 {
+        return;
+    }
+    w.ne += live;
+    unsafe {
+        w.pid.set_len(live);
+        w.ev_flat.set_len(live);
+    }
+    let np = w.long_map.entries.len();
+    w.np += np;
+    w.fill.clear();
+    w.fill.reserve(np);
+    let mut acc = 0u32;
+    for e in &w.long_map.entries {
+        w.fill.push(acc);
+        acc += e.count;
+    }
+    w.ev_buf.clear();
+    w.ev_buf.reserve(live);
+    let ev_ptr = w.ev_buf.as_mut_ptr();
+    for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
+        let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
+        unsafe { ev_ptr.add(*pos as usize).write(ev) };
+        *pos += 1;
+    }
+    unsafe { w.ev_buf.set_len(live) };
+
+    let ncl_raw = if raw_ck > 0 {
+        w.cl_pid.clear();
+        w.cl_pid.reserve(raw_ck);
+        w.cl_flat.clear();
+        w.cl_flat.reserve(raw_ck);
+        let cl_pid = w.cl_pid.as_mut_ptr();
+        let cl_flat = w.cl_flat.as_mut_ptr();
+        let mut ncl = 0usize;
+        w.ck_cnt.clear();
+        w.ck_cnt.resize(np, 0);
+        for_each_live(ck_sinks, None, q, |r| {
+            if let Some(id) = w.long_map.get(r.person, wlu_ref, ls_ref) {
+                unsafe {
+                    cl_pid.add(ncl).write(id);
+                    cl_flat.add(ncl).write(CompactClick {
+                        ts: r.ts,
+                        campaign: r.campaign,
+                        cid: r.cid,
+                    });
+                    *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
+                }
+                ncl += 1;
+            }
+        });
+        for_each_live(reloc_c, None, q, |r| {
+            if let Some(id) = w.long_map.get(r.person, wlu_ref, ls_ref) {
+                unsafe {
+                    cl_pid.add(ncl).write(id);
+                    cl_flat.add(ncl).write(CompactClick {
+                        ts: r.ts,
+                        campaign: r.campaign,
+                        cid: r.cid,
+                    });
+                    *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
+                }
+                ncl += 1;
+            }
+        });
+        finalize_click_csr(w, np, ncl)
+    } else {
+        0
+    };
+    w.profile.end(GroupPhase::Csr);
+
+    let use_dense = w.dense.enabled();
+    let mut ev_st = 0usize;
+    let mut id_tmp = [0u8; 33];
+    for pi in 0..np {
+        let entry = unsafe { *w.long_map.entries.get_unchecked(pi) };
+        let ev_cnt = entry.count as usize;
+        let id_bytes = unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref, &mut id_tmp) };
+        aggregate_person(
+            w,
+            pi,
+            ev_st,
+            ev_cnt,
+            ncl_raw,
+            id_bytes,
+            use_dense,
+            dense_min,
+            day0,
+            ws_rem,
+            organic,
+            categories,
+            wlc_ref,
+        );
+        ev_st += ev_cnt;
+    }
+}
+
 fn group_fused_hybrid<P: GroupProfile>(
     ctx: &Ctx<'_>,
     deduped: DedupedHybrid,
@@ -4294,7 +4651,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(24);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -4375,247 +4732,47 @@ fn group_fused_hybrid<P: GroupProfile>(
             if raw_n == 0 {
                 return;
             }
-            w.profile.start();
-            w.pid.clear();
-            w.pid.reserve(raw_n);
-            w.ev_flat.clear();
-            w.ev_flat.reserve(raw_n);
-            let pid = w.pid.as_mut_ptr();
-            let ev_flat = w.ev_flat.as_mut_ptr();
-            let mut live = 0usize;
-
+            let raw_ck = raw_ck_part[q];
             if q < p2_short {
-                w.short_map.reset(raw_n / 25 + 16);
-                for_each_live(&b_sinks, dead.as_ref(), q, |r| {
-                    let id = w.short_map.count(r.person());
-                    let ev = unpack_ev(r.ts_or_purch, wp_ref);
-                    unsafe {
-                        pid.add(live).write(id);
-                        ev_flat.add(live).write(ev);
-                    }
-                    live += 1;
-                });
-                for_each_live(&reloc_b, None, q, |r| {
-                    let id = w.short_map.count(r.person());
-                    let ev = unpack_ev(r.ts_or_purch, wp_ref);
-                    unsafe {
-                        pid.add(live).write(id);
-                        ev_flat.add(live).write(ev);
-                    }
-                    live += 1;
-                });
-                if live == 0 {
-                    return;
-                }
-                w.ne += live;
-                unsafe {
-                    w.pid.set_len(live);
-                    w.ev_flat.set_len(live);
-                }
-                let np = w.short_map.len();
-                w.np += np;
-                w.fill.clear();
-                w.fill.reserve(np);
-                let mut acc = 0u32;
-                for pi in 0..np {
-                    w.fill.push(acc);
-                    acc += w.short_map.person(pi).1;
-                }
-                w.ev_buf.clear();
-                w.ev_buf.reserve(live);
-                let ev_ptr = w.ev_buf.as_mut_ptr();
-                for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
-                    let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
-                    unsafe { ev_ptr.add(*pos as usize).write(ev) };
-                    *pos += 1;
-                }
-                unsafe { w.ev_buf.set_len(live) };
-
-                let raw_ck = raw_ck_part[q];
-                let ncl_raw = if raw_ck > 0 {
-                    w.cl_pid.clear();
-                    w.cl_pid.reserve(raw_ck);
-                    w.cl_flat.clear();
-                    w.cl_flat.reserve(raw_ck);
-                    let cl_pid = w.cl_pid.as_mut_ptr();
-                    let cl_flat = w.cl_flat.as_mut_ptr();
-                    let mut ncl = 0usize;
-                    w.ck_cnt.clear();
-                    w.ck_cnt.resize(np, 0);
-                    for_each_live(&ck_sinks, None, q, |r| {
-                        if let Some(id) = w.short_map.get(r.person) {
-                            unsafe {
-                                cl_pid.add(ncl).write(id);
-                                cl_flat.add(ncl).write(CompactClick {
-                                    ts: r.ts,
-                                    campaign: r.campaign,
-                                    cid: r.cid,
-                                });
-                                *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
-                            }
-                            ncl += 1;
-                        }
-                    });
-                    for_each_live(&reloc_c, None, q, |r| {
-                        if let Some(id) = w.short_map.get(r.person) {
-                            unsafe {
-                                cl_pid.add(ncl).write(id);
-                                cl_flat.add(ncl).write(CompactClick {
-                                    ts: r.ts,
-                                    campaign: r.campaign,
-                                    cid: r.cid,
-                                });
-                                *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
-                            }
-                            ncl += 1;
-                        }
-                    });
-                    finalize_click_csr(w, np, ncl)
-                } else {
-                    0
-                };
-                w.profile.end(GroupPhase::Csr);
-
-                let use_dense = w.dense.enabled();
-                let mut ev_st = 0usize;
-                let mut id_buf = [0u8; 16];
-                for pi in 0..np {
-                    let (key, count) = w.short_map.person(pi);
-                    let ev_cnt = count as usize;
-                    let n = unmix63(key).unpack_buf(&mut id_buf);
-                    aggregate_person(
-                        w,
-                        pi,
-                        ev_st,
-                        ev_cnt,
-                        ncl_raw,
-                        &id_buf[..n],
-                        use_dense,
-                        dense_min,
-                        day0,
-                        ws_rem,
-                        organic,
-                        categories,
-                        wlc_ref,
-                    );
-                    ev_st += ev_cnt;
-                }
+                group_short_part(
+                    w,
+                    q,
+                    raw_n,
+                    raw_ck,
+                    &b_sinks,
+                    &reloc_b,
+                    &ck_sinks,
+                    &reloc_c,
+                    dead.as_ref(),
+                    wp_ref,
+                    wlc_ref,
+                    dense_min,
+                    day0,
+                    ws_rem,
+                    organic,
+                    categories,
+                );
             } else {
-                w.long_map.reset(raw_n / 25 + 16);
-                for_each_live(&b_sinks, dead.as_ref(), q, |r| {
-                    let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
-                    let ev = unpack_ev(r.ts_or_purch, wp_ref);
-                    unsafe {
-                        pid.add(live).write(id);
-                        ev_flat.add(live).write(ev);
-                    }
-                    live += 1;
-                });
-                for_each_live(&reloc_b, None, q, |r| {
-                    let id = w.long_map.count(r.person(), wlu_ref, ls_ref);
-                    let ev = unpack_ev(r.ts_or_purch, wp_ref);
-                    unsafe {
-                        pid.add(live).write(id);
-                        ev_flat.add(live).write(ev);
-                    }
-                    live += 1;
-                });
-                if live == 0 {
-                    return;
-                }
-                w.ne += live;
-                unsafe {
-                    w.pid.set_len(live);
-                    w.ev_flat.set_len(live);
-                }
-                let np = w.long_map.entries.len();
-                w.np += np;
-                w.fill.clear();
-                w.fill.reserve(np);
-                let mut acc = 0u32;
-                for e in &w.long_map.entries {
-                    w.fill.push(acc);
-                    acc += e.count;
-                }
-                w.ev_buf.clear();
-                w.ev_buf.reserve(live);
-                let ev_ptr = w.ev_buf.as_mut_ptr();
-                for (&id, &ev) in w.pid.iter().zip(w.ev_flat.iter()) {
-                    let pos = unsafe { w.fill.get_unchecked_mut(id as usize) };
-                    unsafe { ev_ptr.add(*pos as usize).write(ev) };
-                    *pos += 1;
-                }
-                unsafe { w.ev_buf.set_len(live) };
-
-                let raw_ck = raw_ck_part[q];
-                let ncl_raw = if raw_ck > 0 {
-                    w.cl_pid.clear();
-                    w.cl_pid.reserve(raw_ck);
-                    w.cl_flat.clear();
-                    w.cl_flat.reserve(raw_ck);
-                    let cl_pid = w.cl_pid.as_mut_ptr();
-                    let cl_flat = w.cl_flat.as_mut_ptr();
-                    let mut ncl = 0usize;
-                    w.ck_cnt.clear();
-                    w.ck_cnt.resize(np, 0);
-                    for_each_live(&ck_sinks, None, q, |r| {
-                        if let Some(id) = w.long_map.get(r.person, wlu_ref, ls_ref) {
-                            unsafe {
-                                cl_pid.add(ncl).write(id);
-                                cl_flat.add(ncl).write(CompactClick {
-                                    ts: r.ts,
-                                    campaign: r.campaign,
-                                    cid: r.cid,
-                                });
-                                *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
-                            }
-                            ncl += 1;
-                        }
-                    });
-                    for_each_live(&reloc_c, None, q, |r| {
-                        if let Some(id) = w.long_map.get(r.person, wlu_ref, ls_ref) {
-                            unsafe {
-                                cl_pid.add(ncl).write(id);
-                                cl_flat.add(ncl).write(CompactClick {
-                                    ts: r.ts,
-                                    campaign: r.campaign,
-                                    cid: r.cid,
-                                });
-                                *w.ck_cnt.get_unchecked_mut(id as usize) += 1;
-                            }
-                            ncl += 1;
-                        }
-                    });
-                    finalize_click_csr(w, np, ncl)
-                } else {
-                    0
-                };
-                w.profile.end(GroupPhase::Csr);
-
-                let use_dense = w.dense.enabled();
-                let mut ev_st = 0usize;
-                let mut id_tmp = [0u8; 33];
-                for pi in 0..np {
-                    let entry = unsafe { *w.long_map.entries.get_unchecked(pi) };
-                    let ev_cnt = entry.count as usize;
-                    let id_bytes = unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref, &mut id_tmp) };
-                    aggregate_person(
-                        w,
-                        pi,
-                        ev_st,
-                        ev_cnt,
-                        ncl_raw,
-                        id_bytes,
-                        use_dense,
-                        dense_min,
-                        day0,
-                        ws_rem,
-                        organic,
-                        categories,
-                        wlc_ref,
-                    );
-                    ev_st += ev_cnt;
-                }
+                group_long_part(
+                    w,
+                    q,
+                    raw_n,
+                    raw_ck,
+                    &b_sinks,
+                    &reloc_b,
+                    &ck_sinks,
+                    &reloc_c,
+                    dead.as_ref(),
+                    wp_ref,
+                    wlu_ref,
+                    wlc_ref,
+                    ls_ref,
+                    dense_min,
+                    day0,
+                    ws_rem,
+                    organic,
+                    categories,
+                );
             }
         },
         |w| {
