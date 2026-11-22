@@ -157,16 +157,6 @@ impl CampStore {
         }
     }
 
-    #[inline(always)]
-    pub fn assisted_row(&mut self, camp: u32) -> Option<&mut [u32]> {
-        let width = self.ndays as usize;
-        if width == 0 {
-            return None;
-        }
-        let base = camp as usize * width;
-        Some(unsafe { self.assisted.get_unchecked_mut(base..base + width) })
-    }
-
     /// # Safety
     /// The campaign and relative day must be in the campaign table and window.
     #[inline(always)]

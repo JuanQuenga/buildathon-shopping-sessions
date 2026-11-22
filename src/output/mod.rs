@@ -49,7 +49,7 @@ impl UserCols {
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),
             revenue: Vec::with_capacity(cap),
-            defs: Vec::with_capacity(cap.div_ceil(8) + 1),
+            defs: vec![0u8; cap.div_ceil(8) + 1],
             top: Vec::with_capacity(cap * 4),
         }
     }
@@ -57,13 +57,16 @@ impl UserCols {
         self.n
     }
     pub fn clear(&mut self) {
+        let dbytes = self.n.div_ceil(8);
+        if dbytes > 0 {
+            self.defs[..dbytes].fill(0);
+        }
         self.n = 0;
         self.ids.clear();
         self.day.clear();
         self.sessions.clear();
         self.events.clear();
         self.revenue.clear();
-        self.defs.clear();
         self.top.clear();
     }
     fn sync_lens(&mut self) {
@@ -94,8 +97,8 @@ impl UserCols {
             self.revenue.reserve(target - self.revenue.len());
         }
         let dneed = target.div_ceil(8) + 1;
-        if self.defs.capacity() < dneed {
-            self.defs.reserve(dneed - self.defs.len());
+        if self.defs.len() < dneed {
+            self.defs.resize(dneed, 0);
         }
     }
     #[inline(always)]
@@ -132,13 +135,8 @@ impl UserCols {
             self.events.as_mut_ptr().add(n).write(events);
             self.revenue.as_mut_ptr().add(n).write(revenue);
 
-            let di = n >> 3;
-            if n & 7 == 0 {
-                self.defs.as_mut_ptr().add(di).write(0);
-                self.defs.set_len(di + 1);
-            }
             if let Some(t) = top {
-                *self.defs.get_unchecked_mut(di) |= 1 << (n & 7);
+                *self.defs.get_unchecked_mut(n >> 3) |= 1 << (n & 7);
                 let tlen = t.len();
                 if self.top.capacity() - self.top.len() < 4 + tlen {
                     self.top.reserve(4 + tlen);
@@ -252,7 +250,7 @@ fn encode_user_cols(cols: &mut UserCols, file: &mut FileBuilder) {
     file.col_u32("sessions", &cols.sessions);
     file.col_u32("events", &cols.events);
     file.col_user_revenue(&cols.revenue);
-    file.col_category(&cols.defs, &cols.top);
+    file.col_category(&cols.defs[..cols.n.div_ceil(8)], &cols.top);
 }
 
 fn write_user_cols_to(path: &Path, cols: &mut UserCols, file: &mut FileBuilder) -> io::Result<()> {

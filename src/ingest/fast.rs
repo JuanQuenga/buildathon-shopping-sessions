@@ -1511,8 +1511,10 @@ fn for_each_live<T: Copy, const SWCB: usize>(
                 start += slice.len();
             }
         } else {
-            for r in arena.iter().chain(overflow) {
-                f(r);
+            for slice in [arena, overflow] {
+                for r in slice {
+                    f(r);
+                }
             }
         }
     }
@@ -2314,6 +2316,7 @@ struct PurchNode {
 struct DenseSessions {
     bins: Vec<DenseBin>,
     active_mask: Vec<u64>,
+    word_mask: u64,
     purch_nodes: Vec<PurchNode>,
 }
 
@@ -2323,12 +2326,14 @@ impl DenseSessions {
             return Self {
                 bins: Vec::new(),
                 active_mask: Vec::new(),
+                word_mask: 0,
                 purch_nodes: Vec::new(),
             };
         }
         Self {
             bins: vec![DenseBin::EMPTY; max_bins],
             active_mask: vec![0u64; max_bins.div_ceil(64)],
+            word_mask: 0,
             purch_nodes: Vec::with_capacity(64),
         }
     }
@@ -2341,15 +2346,19 @@ impl DenseSessions {
     #[inline(always)]
     fn reset_purch(&mut self) {
         self.purch_nodes.clear();
+        self.word_mask = 0;
     }
 
     #[inline(always)]
     fn scatter_slice(&mut self, events: &[CompactEv]) {
+        let mut wm = self.word_mask;
         for ev in events {
             let ts = ev.ts();
             let cc = ev.cc();
             let bi = (ts / GAP_MS_U32) as usize;
-            let word = unsafe { self.active_mask.get_unchecked_mut(bi >> 6) };
+            let wi = bi >> 6;
+            wm |= 1u64 << wi;
+            let word = unsafe { self.active_mask.get_unchecked_mut(wi) };
             *word |= 1u64 << (bi & 63);
             let bin = unsafe { self.bins.get_unchecked_mut(bi) };
             bin.min_ts = bin.min_ts.min(ts);
@@ -2361,6 +2370,7 @@ impl DenseSessions {
                 bin.purch_head = idx;
             }
         }
+        self.word_mask = wm;
     }
 
     #[inline]
@@ -2456,8 +2466,8 @@ struct FusedAssists {
     s_run: Vec<u16>,
     /// Contiguous same-day session runs `(rel_day, exclusive_end_sess_idx)`.
     day_runs: Vec<(u16, u16)>,
-    stamp: u16,
-    campaigns: Vec<(u16, u16)>,
+    stamp: u32,
+    campaigns: Vec<(u32, u64)>,
 }
 
 impl FusedAssists {
@@ -2484,7 +2494,7 @@ impl FusedAssists {
         self.s_day.push(rel_day);
     }
 
-    #[inline]
+    #[inline(never)]
     fn count<K: Key>(&mut self, camp: &mut CampStore, clicks: &[CompactClick<K>]) {
         let n_sess = self.s_start.len();
         if n_sess == 0 || clicks.is_empty() {
@@ -2497,10 +2507,16 @@ impl FusedAssists {
             self.stamp = 1;
         }
         let stamp = self.stamp;
+        let width = camp.ndays as usize;
+        if width == 0 {
+            self.count_sparse(camp, clicks, stamp);
+            return;
+        }
+        let assisted_ptr = camp.assisted.as_mut_ptr();
         if n_sess == 1 {
             let s0 = unsafe { *self.s_start.get_unchecked(0) };
             let day0_rel = unsafe { *self.s_day.get_unchecked(0) } as usize;
-            let hi = s0 + WEEK_MS_U32;
+            let hi = s0.saturating_add(WEEK_MS_U32);
             for click in clicks {
                 let cts = click.ts;
                 if cts > hi {
@@ -2511,32 +2527,27 @@ impl FusedAssists {
                     let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
                     if seen.0 != stamp {
                         *seen = (stamp, 1);
-                        if let Some(row) = camp.assisted_row(click.campaign) {
-                            unsafe { *row.get_unchecked_mut(day0_rel) += 1 };
-                        } else {
-                            let day = camp.day0.wrapping_add(day0_rel as i32);
-                            camp.add_assisted(click.campaign, day, 1);
-                        }
+                        unsafe { *assisted_ptr.add(campaign * width + day0_rel) += 1 };
                     }
                 }
             }
             return;
         }
-        // Branchless AVX2 bitmask assist sweep for persons with 2..=16 sessions (~92% of persons!):
+        // Branchless AVX2 bitmask assist sweep for persons with 2..=64 sessions (~99.9% of persons!):
         // evaluates all session windows in parallel with zero inner `while` loops or interval branches.
         let max_cts = unsafe { clicks.get_unchecked(clicks.len() - 1).ts };
         let max_s = unsafe { *self.s_start.get_unchecked(n_sess - 1) };
-        if n_sess <= 16 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
-            let mut sa = [i32::MAX; 16];
-            for i in 0..n_sess {
-                sa[i] = unsafe { *self.s_start.get_unchecked(i) } as i32;
-            }
-            let min_s = sa[0] as u32;
-            let max_hi = (max_s).saturating_add(WEEK_MS_U32);
+        if n_sess <= 64 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
+            let min_s = unsafe { *self.s_start.get_unchecked(0) };
+            let max_hi = max_s.saturating_add(WEEK_MS_U32);
             unsafe {
                 use std::arch::x86_64::*;
-                let v_s0 = _mm256_loadu_si256(sa.as_ptr().cast::<__m256i>());
                 if n_sess <= 8 {
+                    let mut sa = [i32::MAX; 8];
+                    for i in 0..n_sess {
+                        *sa.get_unchecked_mut(i) = *self.s_start.get_unchecked(i) as i32;
+                    }
+                    let v_s0 = _mm256_loadu_si256(sa.as_ptr().cast::<__m256i>());
                     for click in clicks {
                         let cts = click.ts;
                         if cts > max_hi {
@@ -2551,35 +2562,32 @@ impl FusedAssists {
                         let m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
                             _mm256_cmpgt_epi32(v_s0, v_lo),
                             _mm256_cmpgt_epi32(v_hi, v_s0),
-                        ))) as u16;
+                        ))) as u32 as u64;
                         if m == 0 {
                             continue;
                         }
-                        let seen = self.campaigns.get_unchecked_mut(click.campaign as usize);
+                        let campaign = click.campaign as usize;
+                        let seen = self.campaigns.get_unchecked_mut(campaign);
                         let prev = if seen.0 == stamp { seen.1 } else { 0 };
                         let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
                         *seen = (stamp, prev | m);
-                        if let Some(row) = camp.assisted_row(click.campaign) {
-                            while new_bits != 0 {
-                                let si = new_bits.trailing_zeros() as usize;
-                                new_bits &= new_bits - 1;
-                                let d = *self.s_day.get_unchecked(si) as usize;
-                                *row.get_unchecked_mut(d) += 1;
-                            }
-                        } else {
-                            while new_bits != 0 {
-                                let si = new_bits.trailing_zeros() as usize;
-                                new_bits &= new_bits - 1;
-                                let d = *self.s_day.get_unchecked(si);
-                                let day = camp.day0.wrapping_add(i32::from(d));
-                                camp.add_assisted(click.campaign, day, 1);
-                            }
+                        let row = assisted_ptr.add(campaign * width);
+                        while new_bits != 0 {
+                            let si = new_bits.trailing_zeros() as usize;
+                            new_bits &= new_bits - 1;
+                            let d = *self.s_day.get_unchecked(si) as usize;
+                            *row.add(d) += 1;
                         }
                     }
-                } else {
+                } else if n_sess <= 16 {
+                    let mut sa = [i32::MAX; 16];
+                    for i in 0..n_sess {
+                        *sa.get_unchecked_mut(i) = *self.s_start.get_unchecked(i) as i32;
+                    }
+                    let v_s0 = _mm256_loadu_si256(sa.as_ptr().cast::<__m256i>());
                     let v_s1 = _mm256_loadu_si256(sa.as_ptr().add(8).cast::<__m256i>());
                     for click in clicks {
                         let cts = click.ts;
@@ -2595,44 +2603,87 @@ impl FusedAssists {
                         let m0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
                             _mm256_cmpgt_epi32(v_s0, v_lo),
                             _mm256_cmpgt_epi32(v_hi, v_s0),
-                        ))) as u32;
+                        ))) as u32 as u64;
                         let m1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
                             _mm256_cmpgt_epi32(v_s1, v_lo),
                             _mm256_cmpgt_epi32(v_hi, v_s1),
-                        ))) as u32;
-                        let m = (m0 | (m1 << 8)) as u16;
+                        ))) as u32 as u64;
+                        let m = m0 | (m1 << 8);
                         if m == 0 {
                             continue;
                         }
-                        let seen = self.campaigns.get_unchecked_mut(click.campaign as usize);
+                        let campaign = click.campaign as usize;
+                        let seen = self.campaigns.get_unchecked_mut(campaign);
                         let prev = if seen.0 == stamp { seen.1 } else { 0 };
                         let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
                         *seen = (stamp, prev | m);
-                        if let Some(row) = camp.assisted_row(click.campaign) {
-                            while new_bits != 0 {
-                                let si = new_bits.trailing_zeros() as usize;
-                                new_bits &= new_bits - 1;
-                                let d = *self.s_day.get_unchecked(si) as usize;
-                                *row.get_unchecked_mut(d) += 1;
-                            }
-                        } else {
-                            while new_bits != 0 {
-                                let si = new_bits.trailing_zeros() as usize;
-                                new_bits &= new_bits - 1;
-                                let d = *self.s_day.get_unchecked(si);
-                                let day = camp.day0.wrapping_add(i32::from(d));
-                                camp.add_assisted(click.campaign, day, 1);
-                            }
+                        let row = assisted_ptr.add(campaign * width);
+                        while new_bits != 0 {
+                            let si = new_bits.trailing_zeros() as usize;
+                            new_bits &= new_bits - 1;
+                            let d = *self.s_day.get_unchecked(si) as usize;
+                            *row.add(d) += 1;
+                        }
+                    }
+                } else {
+                    let chunks = n_sess.div_ceil(8);
+                    let mut sa = [i32::MAX; 64];
+                    for i in 0..n_sess {
+                        *sa.get_unchecked_mut(i) = *self.s_start.get_unchecked(i) as i32;
+                    }
+                    for click in clicks {
+                        let cts = click.ts;
+                        if cts > max_hi {
+                            break;
+                        }
+                        if cts < min_s {
+                            continue;
+                        }
+                        let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
+                        let v_lo = _mm256_set1_epi32(lo - 1);
+                        let v_hi = _mm256_set1_epi32((cts as i32) + 1);
+                        let mut m = 0u64;
+                        for ci in 0..chunks {
+                            let vs = _mm256_loadu_si256(sa.as_ptr().add(ci * 8).cast::<__m256i>());
+                            let mc = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(
+                                _mm256_cmpgt_epi32(vs, v_lo),
+                                _mm256_cmpgt_epi32(v_hi, vs),
+                            ))) as u32 as u64;
+                            m |= mc << (ci * 8);
+                        }
+                        if m == 0 {
+                            continue;
+                        }
+                        let campaign = click.campaign as usize;
+                        let seen = self.campaigns.get_unchecked_mut(campaign);
+                        let prev = if seen.0 == stamp { seen.1 } else { 0 };
+                        let mut new_bits = m & !prev;
+                        if new_bits == 0 {
+                            continue;
+                        }
+                        *seen = (stamp, prev | m);
+                        let row = assisted_ptr.add(campaign * width);
+                        while new_bits != 0 {
+                            let si = new_bits.trailing_zeros() as usize;
+                            new_bits &= new_bits - 1;
+                            let d = *self.s_day.get_unchecked(si) as usize;
+                            *row.add(d) += 1;
                         }
                     }
                 }
             }
             return;
         }
-        // Lazily build same-day session runs only for high-session persons (`n_sess > 16`).
+        self.count_sparse(camp, clicks, stamp);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_sparse<K: Key>(&mut self, camp: &mut CampStore, clicks: &[CompactClick<K>], stamp: u32) {
+        let n_sess = self.s_start.len();
         self.day_runs.clear();
         self.s_run.clear();
         for (idx, &rel_day) in self.s_day.iter().enumerate() {
@@ -2648,10 +2699,10 @@ impl FusedAssists {
             self.day_runs.push((rel_day, next_idx));
             self.s_run.push(ri);
         }
-        // Sentinel `u32::MAX` is strictly greater than any valid click timestamp (`< u32::MAX`),
-        // eliminating loop bounds checks on `starts[first]` and `starts[end]`.
         self.s_start.push(u32::MAX);
         let starts = self.s_start.as_ptr();
+        let width = camp.ndays as usize;
+        let assisted_ptr = camp.assisted.as_mut_ptr();
         let (mut first, mut end) = (0usize, 0usize);
         for click in clicks {
             let cts = click.ts;
@@ -2669,30 +2720,28 @@ impl FusedAssists {
             if first >= end {
                 continue;
             }
-
-            // Both bounds advance monotonically. For this campaign, only
-            // the tail beyond the previous click's window is new.
             let campaign = click.campaign as usize;
             let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
-            let prev = (usize::from(seen.0 == stamp).wrapping_neg()) & (seen.1 as usize);
+            let prev = if seen.0 == stamp { seen.1 as usize } else { 0 };
             let begin = first.max(prev);
             if begin >= end {
                 continue;
             }
-            *seen = (stamp, end as u16);
+            *seen = (stamp, end as u64);
             let ri0 = unsafe { *self.s_run.get_unchecked(begin) } as usize;
             let ri1 = unsafe { *self.s_run.get_unchecked(end - 1) } as usize;
-            if let Some(row) = camp.assisted_row(click.campaign) {
+            if width != 0 {
+                let row = unsafe { assisted_ptr.add(campaign * width) };
                 if ri0 == ri1 {
                     let day = unsafe { self.day_runs.get_unchecked(ri0).0 } as usize;
-                    unsafe { *row.get_unchecked_mut(day) += (end - begin) as u32 };
+                    unsafe { *row.add(day) += (end - begin) as u32 };
                 } else {
                     let mut cur = begin;
                     let mut ri = ri0;
                     loop {
                         let (day, run_end) = unsafe { *self.day_runs.get_unchecked(ri) };
                         let stop = (run_end as usize).min(end);
-                        unsafe { *row.get_unchecked_mut(day as usize) += (stop - cur) as u32 };
+                        unsafe { *row.add(day as usize) += (stop - cur) as u32 };
                         cur = stop;
                         if cur == end {
                             break;
@@ -2739,7 +2788,7 @@ fn take_top_category<'a>(
     categories.get(top as usize).map(Vec::as_slice)
 }
 
-#[inline(always)]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn flush_user_day<P: GroupProfile>(
     writer: &mut output::UserWriter<'_>,
@@ -2767,6 +2816,78 @@ fn flush_user_day<P: GroupProfile>(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+fn emit_session_c<K: Key, const HAS_CLICKS: bool>(
+    camp: &mut CampStore,
+    assists: &mut FusedAssists,
+    cl_buf: &[CompactClick<K>],
+    organic: u32,
+    cj: &mut usize,
+    grp_first: &mut usize,
+    last_ts: &mut u32,
+    s: u32,
+    rel_day: u32,
+    nev: u32,
+    rev: u64,
+    ud_sessions: &mut u32,
+    ud_events: &mut u32,
+    ud_revenue: &mut i64,
+) {
+    let credit = if HAS_CLICKS {
+        let s_ck = s + WEEK_MS_U32;
+        let mut j = *cj;
+        let mut lts = *last_ts;
+        let mut gf = *grp_first;
+        // Two branchless steps handle 0, 1, or 2 click advances per session with zero mispredicts.
+        let ct0 = unsafe { cl_buf.get_unchecked(j).ts };
+        let take0 = ct0 <= s_ck;
+        let upd0 = take0 & (ct0 != lts);
+        lts = std::hint::select_unpredictable(upd0, ct0, lts);
+        gf = std::hint::select_unpredictable(upd0, j, gf);
+        j += usize::from(take0);
+
+        let ct1 = unsafe { cl_buf.get_unchecked(j).ts };
+        let take1 = ct1 <= s_ck;
+        let upd1 = take1 & (ct1 != lts);
+        lts = std::hint::select_unpredictable(upd1, ct1, lts);
+        gf = std::hint::select_unpredictable(upd1, j, gf);
+        j += usize::from(take1);
+
+        if unsafe { cl_buf.get_unchecked(j).ts } <= s_ck {
+            loop {
+                let ct = unsafe { cl_buf.get_unchecked(j).ts };
+                if ct > s_ck {
+                    break;
+                }
+                if ct != lts {
+                    lts = ct;
+                    gf = j;
+                }
+                j += 1;
+            }
+        }
+        *cj = j;
+        *last_ts = lts;
+        *grp_first = gf;
+        let camp_cand = unsafe { cl_buf.get_unchecked(gf).campaign };
+        std::hint::select_unpredictable(
+            (gf != cl_buf.len() - 1) & (lts >= s),
+            camp_cand,
+            organic,
+        )
+    } else {
+        organic
+    };
+    unsafe { camp.add_credit_in_window(credit, rel_day as usize, rev as i64) };
+    *ud_sessions += 1;
+    *ud_events += nev;
+    *ud_revenue += rev as i64;
+    if HAS_CLICKS {
+        assists.push_session(s, rel_day as u16);
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn emit_session<K: Key>(
     camp: &mut CampStore,
     assists: &mut FusedAssists,
@@ -2784,36 +2905,16 @@ fn emit_session<K: Key>(
     ud_events: &mut u32,
     ud_revenue: &mut i64,
 ) {
-    let credit = if has_clicks {
-        let s_ck = s + WEEK_MS_U32;
-        // Caller placed a `ts == u32::MAX` sentinel at `cl_buf[cl_end]` (`u32::MAX > s_ck`
-        // because `we - ws <= u32::MAX - WEEK_MS`), eliminating the `*cj < cl_end` bounds check.
-        loop {
-            let ct = unsafe { cl_buf.get_unchecked(*cj).ts };
-            if ct > s_ck {
-                break;
-            }
-            if ct != *last_ts {
-                *last_ts = ct;
-                *grp_first = *cj;
-            }
-            *cj += 1;
-        }
-        let camp_cand = unsafe { cl_buf.get_unchecked(*grp_first).campaign };
-        std::hint::select_unpredictable(
-            (*grp_first != cl_buf.len() - 1) & (*last_ts >= s),
-            camp_cand,
-            organic,
-        )
-    } else {
-        organic
-    };
-    unsafe { camp.add_credit_in_window(credit, rel_day as usize, rev as i64) };
-    *ud_sessions += 1;
-    *ud_events += nev;
-    *ud_revenue += rev as i64;
     if has_clicks {
-        assists.push_session(s, rel_day as u16);
+        emit_session_c::<K, true>(
+            camp, assists, cl_buf, organic, cj, grp_first, last_ts, s, rel_day, nev, rev,
+            ud_sessions, ud_events, ud_revenue,
+        );
+    } else {
+        emit_session_c::<K, false>(
+            camp, assists, cl_buf, organic, cj, grp_first, last_ts, s, rel_day, nev, rev,
+            ud_sessions, ud_events, ud_revenue,
+        );
     }
 }
 

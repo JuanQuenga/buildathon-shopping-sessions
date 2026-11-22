@@ -119,22 +119,24 @@ impl DateTable {
 
     #[inline(always)]
     unsafe fn clock_sec(p: *const u8) -> Option<i64> {
-        let c = ld8(p.add(11)); // HH:MM:SS
-        const SC: u64 = 0x0000_FF00_00FF_0000;
-        const VC: u64 = ((b':' as u64) << 40) | ((b':' as u64) << 16);
-        let d = c.wrapping_sub(0x3030_3030_3030_3030);
-        // Simultaneously verifies H0<=2, H1<=9, M0<=5, M1<=9, S0<=5, S1<=9 (no carries on valid digits).
-        let ok_hms = (((d.wrapping_add(0x767A_0076_7A00_767Du64) | d) & 0x8080_0080_8000_8080u64) == 0)
-            & ((c & SC) == VC);
-        let dig = d & 0x0F0F_000F_0F00_0F0Fu64;
-        let pairs = dig.wrapping_mul(10).wrapping_add(dig >> 8);
-        let hour = pairs & 0xFF;
-        if ok_hms & (hour <= 23) {
-            let hm_sec = ((pairs & 0x0000_0000_FF00_00FFu64).wrapping_mul((3600u64 << 40) | (60u64 << 16))) >> 40;
-            let sec = (pairs >> 48) & 0xFF;
-            return Some((hm_sec + sec) as i64);
+        use std::arch::x86_64::*;
+        let raw = _mm_cvtsi64_si128(ld8(p.add(11)) as i64);
+        let min = _mm_cvtsi64_si128(i64::from_le_bytes(*b"00:00:00"));
+        let max = _mm_cvtsi64_si128(i64::from_le_bytes(*b"29:59:59"));
+        let bad = _mm_or_si128(_mm_subs_epu8(min, raw), _mm_subs_epu8(raw, max));
+        let digits = _mm_shuffle_epi8(
+            _mm_sub_epi8(raw, min),
+            _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1),
+        );
+        let times = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let hours_bad = _mm_cmpgt_epi16(times, _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0));
+        let invalid = _mm_or_si128(bad, hours_bad);
+        if _mm_testz_si128(invalid, invalid) == 0 {
+            return None;
         }
-        None
+        let prod = _mm_madd_epi16(times, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+        let sum = _mm_add_epi32(prod, _mm_srli_si128::<4>(prod));
+        Some(_mm_cvtsi128_si32(sum) as i64)
     }
 
     #[inline(always)]
@@ -169,43 +171,41 @@ impl DateTable {
         let ea = self.entries.get_unchecked(Self::slot_at(a));
         let pb = ld8(b);
         let db = b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
-        if (pa == pb) & (da == db) {
-            if (ea.a == pa) & (ea.ddt == da) {
-                let (event, ingest) = Self::clock_pair(a, b)?;
-                let ds = ea.day_sec as i64;
-                return Some((ds + event, ds + ingest));
-            }
-            return Some((civil19_sec_cold(a)?, civil19_sec_cold(b)?));
-        }
         let eb = self.entries.get_unchecked(Self::slot_at(b));
         if (ea.a == pa) & (ea.ddt == da) & (eb.a == pb) & (eb.ddt == db) {
             let (event, ingest) = Self::clock_pair(a, b)?;
             return Some((ea.day_sec as i64 + event, eb.day_sec as i64 + ingest));
         }
-        let a_sec = if (ea.a == pa) & (ea.ddt == da) {
-            ea.day_sec as i64 + Self::clock_sec(a)?
-        } else {
-            civil19_sec_cold(a)?
-        };
-        Some((a_sec, self.civil19_sec(b)?))
+        self.parse_f1_pair_sec_cold(a, b)
     }
 
-    /// Direct 13-digit F3 parser (caller verified exact length 13).
+    #[cold]
+    #[inline(never)]
+    unsafe fn parse_f1_pair_sec_cold(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
+        Some((self.civil19_sec(a)?, self.civil19_sec(b)?))
+    }
+
+    /// Direct 13-digit F3 parser via SSE2 `pmaddubsw`/`pmaddwd` (caller verified exact length 13).
     #[inline(always)]
     pub(super) unsafe fn parse_f3_13(&self, p: *const u8) -> Option<i64> {
-        const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
-        const DIGIT_LIMIT: u64 = 0x7676_7676_7676_7676;
-        const M5: u64 = 0x0000_00FF_FFFF_FFFF;
-        let d_hi = ld8(p).wrapping_sub(ASCII_ZERO);
-        let d_lo = ld8(p.add(5)).wrapping_sub(ASCII_ZERO);
-        let bad_hi = (d_hi.wrapping_add(DIGIT_LIMIT) | d_hi) & 0x0000_0080_8080_8080;
-        let bad_lo = (d_lo.wrapping_add(DIGIT_LIMIT) | d_lo) & 0x8080_8080_8080_8080;
-        if (bad_hi | bad_lo) == 0 {
-            let hi = swar_dec8_digits((d_hi & M5) << 24);
-            let lo = swar_dec8_digits(d_lo);
-            return Some((hi * 100_000_000 + lo) as i64);
+        use std::arch::x86_64::*;
+        let raw = _mm_loadu_si128(p.cast::<__m128i>());
+        let d = _mm_sub_epi8(raw, _mm_set1_epi8(b'0' as i8));
+        let bad = _mm_subs_epu8(d, _mm_set1_epi8(9));
+        let mask13 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0);
+        if _mm_testz_si128(bad, mask13) == 0 {
+            return None;
         }
-        None
+        // Shift digits right by 3 bytes -> [0, 0, 0, d0, d1, ..., d12].
+        let d16 = _mm_slli_si128::<3>(d);
+        let p2 = _mm_maddubs_epi16(d16, _mm_set1_epi16(0x010a));
+        let p4 = _mm_madd_epi16(p2, _mm_set1_epi32(0x0001_0064));
+        let p4_16 = _mm_packus_epi32(p4, p4);
+        let p8 = _mm_madd_epi16(p4_16, _mm_setr_epi16(10000, 1, 10000, 1, 0, 0, 0, 0));
+        let q = _mm_cvtsi128_si64(p8) as u64;
+        let hi = (q as u32) as i64;
+        let lo = (q >> 32) as i64;
+        Some(hi * 100_000_000 + lo)
     }
 
     /// Parse `±HH:MM` timezone suffix of a 25-byte F2 timestamp (`p` points to byte 0 of timestamp,
@@ -265,21 +265,7 @@ impl DateTable {
             return parse_cold(p, len);
         }
         if len == 13 {
-            const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
-            const DIGIT_LIMIT: u64 = 0x7676_7676_7676_7676;
-            const M5: u64 = 0x0000_00FF_FFFF_FFFF;
-            let d_hi = ld8(p).wrapping_sub(ASCII_ZERO);
-            let d_lo = ld8(p.add(5)).wrapping_sub(ASCII_ZERO);
-            // Valid lanes cannot carry or borrow into the next lane. The first
-            // invalid lane therefore sets its high bit in d or d + DIGIT_LIMIT.
-            let bad_hi = (d_hi.wrapping_add(DIGIT_LIMIT) | d_hi) & 0x0000_0080_8080_8080;
-            let bad_lo = (d_lo.wrapping_add(DIGIT_LIMIT) | d_lo) & 0x8080_8080_8080_8080;
-            if (bad_hi | bad_lo) == 0 {
-                let hi = swar_dec8_digits((d_hi & M5) << 24);
-                let lo = swar_dec8_digits(d_lo);
-                return Some((hi * 100_000_000 + lo) as i64);
-            }
-            return None;
+            return self.parse_f3_13(p);
         }
         if len == 25 {
             let s = *p.add(19);
