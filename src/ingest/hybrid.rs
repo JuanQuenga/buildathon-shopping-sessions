@@ -44,8 +44,8 @@ const LINK_LONG_BIT: u64 = 1u64 << 62;
 const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
-const SWCB_TOK: usize = 256; // 576 * 256B = 147 KiB/thr (590 KiB/SMT pair << 1 MiB L2; halves flush Bcm!)
-const SWCB_B: usize = 256;
+const SWCB_TOK: usize = 128; // 576 * 128B = 74 KiB/thr (fits comfortably inside Cascade Lake 1 MiB L2)
+const SWCB_B: usize = 128;
 const SWCB_CK: usize = 192;
 
 const fn inv_odd_63(x: u64) -> u64 {
@@ -4373,10 +4373,9 @@ pub(super) fn run_to_output(
     let p1_long_shift = 64 - p1_long_bits;
     let p2_short_shift = 63 - p2_short_bits;
     let p2_long_shift = 64 - p2_long_bits;
-    // Auto-select zero-copy whole-file mmap: mode 6 (parallel MADV_DONTNEED after parse)
-    // for <= 3.5 GiB inputs, mode 4 (streaming per-file munmap) for huge 60M+ inputs to cap RSS.
-    let default_mmap = if ctx.event_bytes + ctx.click_bytes <= 3_500_000_000 { 6 } else { 4 };
-    let mmap_mode = env_usize("INGEST_MMAP_INPUT").unwrap_or(default_mmap);
+    // Default to reusable thread-local pread buffers (mmap_mode=0): avoids ~520k 4 KiB
+    // minor page faults + MADV_DONTNEED TLB shootdowns inside virtualized cloud VMs.
+    let mmap_mode = env_usize("INGEST_MMAP_INPUT").unwrap_or(0);
     let files = &ctx.files;
     let main_chunks = &ctx.main_chunks;
 
