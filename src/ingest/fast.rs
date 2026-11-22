@@ -2549,6 +2549,14 @@ impl FusedAssists {
         let max_s = unsafe { *self.s_start.get_unchecked(n_sess - 1) };
         if n_sess <= 64 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
             let min_s = unsafe { *self.s_start.get_unchecked(0) };
+            let mut cl_lo = 0usize;
+            while cl_lo < clicks.len() && unsafe { clicks.get_unchecked(cl_lo).ts } < min_s {
+                cl_lo += 1;
+            }
+            if cl_lo == clicks.len() {
+                return;
+            }
+            let clicks = unsafe { clicks.get_unchecked(cl_lo..) };
             let max_hi = max_s.saturating_add(WEEK_MS_U32);
             unsafe {
                 use std::arch::x86_64::*;
@@ -2563,9 +2571,6 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
-                        if cts < min_s {
-                            continue;
-                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2573,9 +2578,6 @@ impl FusedAssists {
                             _mm256_cmpgt_epi32(v_s0, v_lo),
                             _mm256_cmpgt_epi32(v_hi, v_s0),
                         ))) as u32 as u64;
-                        if m == 0 {
-                            continue;
-                        }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
                         let prev_end = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u32);
@@ -2607,9 +2609,6 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
-                        if cts < min_s {
-                            continue;
-                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2622,9 +2621,6 @@ impl FusedAssists {
                             _mm256_cmpgt_epi32(v_hi, v_s1),
                         ))) as u32 as u64;
                         let m = m0 | (m1 << 8);
-                        if m == 0 {
-                            continue;
-                        }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
                         let prev_end = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u32);
@@ -2655,9 +2651,6 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
-                        if cts < min_s {
-                            continue;
-                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2669,9 +2662,6 @@ impl FusedAssists {
                                 _mm256_cmpgt_epi32(v_hi, vs),
                             ))) as u32 as u64;
                             m |= mc << (ci * 8);
-                        }
-                        if m == 0 {
-                            continue;
                         }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);

@@ -190,9 +190,7 @@ impl DateTable {
         let mask11 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0);
         if _mm_testz_si128(diff, mask11) != 0 {
             let (event, ingest) = Self::clock_pair(a, b)?;
-            let da_sec = (_mm_extract_epi32::<3>(eav) as u32) as i64;
-            let db_sec = (_mm_extract_epi32::<3>(ebv) as u32) as i64;
-            return Some((da_sec + event, db_sec + ingest));
+            return Some((ea.day_sec as i64 + event, eb.day_sec as i64 + ingest));
         }
         self.parse_f1_pair_sec_cold(a, b)
     }

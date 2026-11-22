@@ -49,11 +49,11 @@ const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
 // With p1_total = p2_total = 576 (512 short + 64 long), active SWCB during Events is
-// 576 * (256 + 384) = 360 KiB/worker = 720 KiB/SMT pair (fits Cascade Lake 1 MiB L2 cleanly),
-// and during Clicks is 576 * 384 = 216 KiB/worker = 432 KiB/SMT pair, halving RecB12 & RecC flushes!
+// 576 * (256 + 192) = 252 KiB/worker = 504 KiB/SMT pair (fits Cascade Lake 1 MiB L2 cleanly)
+// with 16 records/flush for both `Tok` (16B) and `RecB12` (12B).
 const SWCB_TOK: usize = 256;
-const SWCB_B: usize = 384;
-const SWCB_CK: usize = 384;
+const SWCB_B: usize = 192;
+const SWCB_CK: usize = 192;
 
 /// 12-byte packed surviving event (-25% parse/reloc arena & DRAM bandwidth vs 16B `RecB`):
 /// bit 31 == 0 => non-purchase event with inline `ts = ts_or_purch` (`cc = 0`);
@@ -498,41 +498,25 @@ impl ArenaBytes {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-#[repr(C, align(32))]
-struct PackedCacheSlot {
-    hi: u64,
-    lo: u64,
-    off: u32,
-    tag: u8, // 0 = empty; packed33 tags are always >= 0x30
-}
-
-/// Per-worker L2-resident (128 KiB) inline-value cache deduplicating repeated long `user_id`s
-/// with ZERO random arena chases on hit and exact 17-byte equality in the same cache line!
+/// Per-worker L2-resident (32 KiB) direct-mapped cache deduplicating repeated long `user_id`s.
 struct LongUserCache {
-    slots: Vec<PackedCacheSlot>,
-    verb: Vec<(u32, u32)>, // lazily allocated only for non-hex33 verbatim long user IDs
+    slots: Vec<(u32, u32)>, // (hash_hi32 | 1, arena_off)
 }
 
 impl LongUserCache {
     const CAP: usize = 4096;
     const MASK: usize = Self::CAP - 1;
-    const VERB_CAP: usize = 4096;
-    const VERB_MASK: usize = Self::VERB_CAP - 1;
 
     fn new() -> Self {
-        Self { slots: vec![PackedCacheSlot::default(); Self::CAP], verb: Vec::new() }
+        Self { slots: vec![(0, 0); Self::CAP] }
     }
 
     #[allow(dead_code)]
     #[inline(always)]
     fn intern_vec(&mut self, arena: &mut Vec<u8>, s: &[u8], uh: u64) -> Option<u32> {
-        if self.verb.is_empty() {
-            self.verb.resize(Self::VERB_CAP, (0, 0));
-        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::VERB_MASK;
-        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::MASK;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { get_long_bytes(arena, slot.1) } == s {
             return Some(slot.1);
         }
@@ -550,13 +534,14 @@ impl LongUserCache {
         lo: u64,
         uh: u64,
     ) -> Option<u32> {
+        let fp = ((uh >> 32) as u32) | 1;
         let idx = (uh as usize) & Self::MASK;
         let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-        if (slot.tag == tag) & (slot.hi == hi) & (slot.lo == lo) {
-            return Some(slot.off);
+        if slot.0 == fp && unsafe { eq_arena_packed(arena.as_slice(), slot.1, tag, hi, lo) } {
+            return Some(slot.1);
         }
         let off = arena.push_packed33(tag, hi, lo)?;
-        *slot = PackedCacheSlot { hi, lo, off, tag };
+        *slot = (fp, off);
         Some(off)
     }
 
@@ -567,12 +552,9 @@ impl LongUserCache {
                 return self.intern_arena_packed33(arena, tag, hi, lo, uh);
             }
         }
-        if self.verb.is_empty() {
-            self.verb.resize(Self::VERB_CAP, (0, 0));
-        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::VERB_MASK;
-        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::MASK;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { eq_arena_raw(arena.as_slice(), slot.1, s) } {
             return Some(slot.1);
         }
@@ -877,39 +859,34 @@ unsafe fn encode_eid_short(p: *const u8, len: usize) -> Option<u64> {
     Some((u64::from(b8) << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F))
 }
 
-/// Branchless single-load 8/9-byte ASCII inline encoder reusing `b8 = end4 as u8`
-/// (`pext(bswap(ld8(p)), 0x7F...) << 7 | b8` — zero `cmov`/`movabs`/`ld8(p+1)`!).
+/// Branchless single-load 8/9-byte ASCII inline encoder reusing `b8 = end4 as u8` and a
+/// precomputed `is9` (`0` for 8B, `1` for 9B) so callers avoid re-testing `d8 == 0`.
 #[inline(always)]
-unsafe fn try_encode_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usize)> {
+unsafe fn try_encode_89(p: *const u8, end4: u32, is9: usize) -> Option<u64> {
     let w0 = ld8(p);
-    let is9 = u64::from(!is8);
-    let is9_mask = is9.wrapping_neg();
+    let is9_mask = (is9 as u64).wrapping_neg();
     let b8_raw = end4 as u8;
-    let bad_w0 = (w0.wrapping_sub(0x3030_3030_3030_3030) | w0) & 0x8080_8080_8080_8080;
-    let bad_b8 = u64::from((b8_raw.wrapping_sub(0x30) | b8_raw) & 0x80) & is9_mask;
-    if (bad_w0 | bad_b8) == 0 {
+    let bad_w0 = w0.wrapping_sub(0x3030_3030_3030_3030) | w0;
+    let bad_b8 = (u64::from(b8_raw.wrapping_sub(0x30) | b8_raw)) & is9_mask;
+    if ((bad_w0 | bad_b8) & 0x8080_8080_8080_8080) == 0 {
         let b8 = u64::from(b8_raw) & is9_mask;
-        let key = (_pext_u64(w0.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F) << 7) | b8;
-        Some((key, 8 + is9 as usize))
+        Some((_pext_u64(w0.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F) << 7) | b8)
     } else {
         None
     }
 }
 
-/// Lean order-free 8/9-byte `event_id` encoder reusing `b8 = end4 as u8` (zero `bswap`,
-/// zero `cmov`/`movabs`, zero `ld8(p+1)`).
+/// Lean order-free 8/9-byte `event_id` encoder reusing `b8 = end4 as u8` and `is9` (`0` or `1`).
 #[inline(always)]
-unsafe fn try_encode_eid_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usize)> {
+unsafe fn try_encode_eid_89(p: *const u8, end4: u32, is9: usize) -> Option<u64> {
     let w0 = ld8(p);
-    let is9 = u64::from(!is8);
-    let is9_mask = is9.wrapping_neg();
+    let is9_mask = (is9 as u64).wrapping_neg();
     let b8_raw = end4 as u8;
-    let bad_w0 = (w0.wrapping_sub(0x3030_3030_3030_3030) | w0) & 0x8080_8080_8080_8080;
-    let bad_b8 = u64::from((b8_raw.wrapping_sub(0x30) | b8_raw) & 0x80) & is9_mask;
-    if (bad_w0 | bad_b8) == 0 {
+    let bad_w0 = w0.wrapping_sub(0x3030_3030_3030_3030) | w0;
+    let bad_b8 = (u64::from(b8_raw.wrapping_sub(0x30) | b8_raw)) & is9_mask;
+    if ((bad_w0 | bad_b8) & 0x8080_8080_8080_8080) == 0 {
         let b8 = u64::from(b8_raw) & is9_mask;
-        let key = (b8 << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F);
-        Some((key, 8 + is9 as usize))
+        Some((b8 << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F))
     } else {
         None
     }
@@ -979,8 +956,9 @@ unsafe fn parse_link_ep_delim<const DELIM: u8>(
     let d8 = ((end4 as u16) & mask) ^ expect;
     let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
     if any_zero_u16(d8, d9) {
-        let (key, len) = try_encode_89(p, end4, d8 == 0)?;
-        return Some((mix63(key), p.add(len + 1 + quoted)));
+        let is9 = usize::from(d8 != 0);
+        let key = try_encode_89(p, end4, is9)?;
+        return Some((mix63(key), p.add(9 + is9 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
         let b0 = *p;
@@ -1090,10 +1068,11 @@ unsafe fn parse_eid_delim<const DELIM: u8>(
     let d8 = ((end4 as u16) & mask) ^ expect;
     let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
     if any_zero_u16(d8, d9) {
-        let (key, len) = try_encode_eid_89(p, end4, d8 == 0)?;
+        let is9 = usize::from(d8 != 0);
+        let key = try_encode_eid_89(p, end4, is9)?;
         let eid_mixed = key.h();
         let eid_p = (eid_mixed >> st.p1_short_shift) as usize;
-        return Some((eid_mixed, eid_p, p.add(len + 1 + quoted)));
+        return Some((eid_mixed, eid_p, p.add(9 + is9 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
         let b0 = *p;
@@ -1125,10 +1104,11 @@ unsafe fn parse_user_delim<const DELIM: u8>(
     let d8 = ((end4 as u16) & mask) ^ expect;
     let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
     if any_zero_u16(d8, d9) {
-        let (key, len) = try_encode_89(p, end4, d8 == 0)?;
+        let is9 = usize::from(d8 != 0);
+        let key = try_encode_89(p, end4, is9)?;
         let m = mix63(key);
         let q = (m >> st.p2_short_shift) as usize;
-        return Some((m, q, p.add(len + 1 + quoted)));
+        return Some((m, q, p.add(9 + is9 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
         let b0 = *p;
@@ -1161,8 +1141,9 @@ unsafe fn parse_cid_delim<const DELIM: u8>(
     let d8 = ((end4 as u16) & mask) ^ expect;
     let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
     if any_zero_u16(d8, d9) {
-        let (key, len) = try_encode_89(p, end4, d8 == 0)?;
-        return Some((key, p.add(len + 1 + quoted)));
+        let is9 = usize::from(d8 != 0);
+        let key = try_encode_89(p, end4, is9)?;
+        return Some((key, p.add(9 + is9 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
         let b0 = *p;
@@ -1325,7 +1306,7 @@ impl ShortRelocMap {
             self.mask = 0;
             return;
         }
-        let cap = pairs.len().next_power_of_two().max(4);
+        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, RelocBucket::default());
         self.mask = cap - 1;
@@ -1416,7 +1397,7 @@ impl LongRelocMap {
             self.wide_hash = false;
             return;
         }
-        let cap = pairs.len().next_power_of_two().max(4);
+        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, LongRelocBucket::default());
         self.mask = cap - 1;
@@ -2906,18 +2887,19 @@ unsafe fn click_hybrid(
     let (person_tag, user_q, p) = parse_user_delim::<b','>(p, st, rows.flag)?;
     let (cp, _, _, cq) = open(p);
     let cv = _mm_loadu_si128(cp.cast::<__m128i>());
-    let c_commas = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b',' as i8))) as u32;
-    let c_quotes = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'"' as i8))) as u32;
-    let c_nls = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8))) as u32;
-    let delim_mask = std::hint::select_unpredictable(cq != 0, c_quotes, c_commas);
+    const CAMP_DELIM: [i8; 2] = [b',' as i8, b'"' as i8];
+    let v_delim = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq)));
+    let delim_mask = _mm_movemask_epi8(v_delim) as u32;
     if delim_mask == 0 {
         return None;
     }
     let clen = delim_mask.trailing_zeros() as usize;
     let inside = _bzhi_u32(u32::MAX, clen as u32);
-    if (((c_commas | c_quotes | c_nls) & inside) != 0)
-        | ((cq != 0) & (*cp.add(clen + 1) != b','))
-    {
+    let v_other = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq ^ 1)));
+    let v_nls = _mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8));
+    let all_special =
+        _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(v_delim, v_other), v_nls)) as u32;
+    if ((all_special & inside) != 0) | ((cq != 0) & (*cp.add(clen + 1) != b',')) {
         return None;
     }
     let after_camp = cp.add(clen + 1 + cq);
@@ -3619,10 +3601,9 @@ fn relocate_hybrid(
 const EV_BLOCK_CAP: usize = 31;
 
 /// 256-byte (4-cache-line) linked block of up to 31 `CompactEv`s per person.
-/// Eliminates the 3-pass `pid + ev_flat -> fill -> ev_buf` CSR copy completely:
-/// - `1..=16` events fit in 1 contiguous block -> sorted IN PLACE with zero copy!
-/// - `17..=31` events (`dense_min = 17`) fit in 1 contiguous block -> single-call `dense.scatter`!
-/// - `>= 32` events stream block-by-block into `DenseSessions` (2x fewer block links/chases)!
+/// Eliminates the 3-pass `ev_flat + pid -> fill -> ev_buf` CSR copy completely:
+/// ~92% of persons fit in 1 block (sorted IN PLACE for `<= 16` events, or scattered in 1
+/// `dense.scatter` call for `17..=31` events with ZERO `ev_buf` copy!).
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct EvBlock {
@@ -3734,7 +3715,7 @@ impl ShortGroupMap4 {
     }
 
     fn reset(&mut self, est_keys: usize) {
-        let nb = ((est_keys + 1) / 2).next_power_of_two().max(4);
+        let nb = (est_keys / 2 + 4).next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(nb, ShortGroupBucket::default());
         self.persons.clear();
@@ -4644,43 +4625,58 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
     let cl_slice_end = cl_end + usize::from(HAS_CLICKS);
 
     if dense_person {
-        let mut has_sess = false;
-        let mut sess_start = 0u32;
-        let mut sess_max = 0u32;
-        let mut sess_last_bin = 0usize;
-        let mut sess_nev = 0u32;
-        let mut sess_rev = 0u64;
         let mut wm = w.dense.word_mask;
         w.dense.word_mask = 0;
-        while wm != 0 {
-            let wi = wm.trailing_zeros() as usize;
+        if wm != 0 {
+            let wi0 = wm.trailing_zeros() as usize;
             wm &= wm - 1;
-            let mut word = unsafe { *w.dense.active_mask.get_unchecked(wi) };
-            unsafe { *w.dense.active_mask.get_unchecked_mut(wi) = 0 };
-            let base_bin = wi << 6;
-            while word != 0 {
-                let tz = word.trailing_zeros() as usize;
-                word &= word - 1;
-                let bi = base_bin + tz;
-                let bin = unsafe { *w.dense.bins.get_unchecked(bi) };
-                unsafe { *w.dense.bins.get_unchecked_mut(bi) = DenseBin::EMPTY };
-                if has_sess
-                    && bi == sess_last_bin + 1
-                    && bin.min_ts - sess_max <= GAP_MS_U32
-                {
-                    sess_max = bin.max_ts;
-                    sess_last_bin = bi;
-                    sess_nev += bin.count;
-                    if bin.purch_head != u32::MAX {
-                        sess_rev += add_bin_purchases(
-                            &w.dense.purch_nodes,
-                            bin.purch_head,
-                            &mut w.cat_sum,
-                            &mut w.cat_touched,
-                        );
-                    }
-                } else {
-                    if has_sess {
+            let mut word = unsafe { *w.dense.active_mask.get_unchecked(wi0) };
+            unsafe { *w.dense.active_mask.get_unchecked_mut(wi0) = 0 };
+            let mut base_bin = wi0 << 6;
+            let tz0 = word.trailing_zeros() as usize;
+            word &= word - 1;
+            let bi0 = base_bin + tz0;
+            let bin0 = unsafe { *w.dense.bins.get_unchecked(bi0) };
+            unsafe { *w.dense.bins.get_unchecked_mut(bi0) = DenseBin::EMPTY };
+            let s0 = bin0.min_ts;
+            if s0 >= next_day_s {
+                rel_day = (ws_rem + s0) / DAY_MS_U32;
+                next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
+            }
+            let mut sess_start = s0;
+            let mut sess_max = bin0.max_ts;
+            let mut sess_last_bin = bi0;
+            let mut sess_nev = bin0.count;
+            let mut sess_rev = if bin0.purch_head != u32::MAX {
+                add_bin_purchases(
+                    &w.dense.purch_nodes,
+                    bin0.purch_head,
+                    &mut w.cat_sum,
+                    &mut w.cat_touched,
+                )
+            } else {
+                0
+            };
+            loop {
+                while word != 0 {
+                    let tz = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let bi = base_bin + tz;
+                    let bin = unsafe { *w.dense.bins.get_unchecked(bi) };
+                    unsafe { *w.dense.bins.get_unchecked_mut(bi) = DenseBin::EMPTY };
+                    if bi == sess_last_bin + 1 && bin.min_ts - sess_max <= GAP_MS_U32 {
+                        sess_max = bin.max_ts;
+                        sess_last_bin = bi;
+                        sess_nev += bin.count;
+                        if bin.purch_head != u32::MAX {
+                            sess_rev += add_bin_purchases(
+                                &w.dense.purch_nodes,
+                                bin.purch_head,
+                                &mut w.cat_sum,
+                                &mut w.cat_touched,
+                            );
+                        }
+                    } else {
                         emit_session_c::<u64, HAS_CLICKS>(
                             &mut w.camp,
                             &mut w.assists,
@@ -4697,10 +4693,8 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
                             &mut ud_events,
                             &mut ud_revenue,
                         );
-                    }
-                    let s = bin.min_ts;
-                    if s >= next_day_s {
-                        if ud_sessions != 0 {
+                        let s = bin.min_ts;
+                        if s >= next_day_s {
                             flush_user_day(
                                 &mut w.writer,
                                 &mut w.cat_sum,
@@ -4716,29 +4710,34 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
                             ud_sessions = 0;
                             ud_events = 0;
                             ud_revenue = 0;
+                            rel_day = (ws_rem + s) / DAY_MS_U32;
+                            next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
                         }
-                        rel_day = (ws_rem + s) / DAY_MS_U32;
-                        next_day_s = (rel_day + 1) * DAY_MS_U32 - ws_rem;
+                        sess_start = s;
+                        sess_max = bin.max_ts;
+                        sess_last_bin = bi;
+                        sess_nev = bin.count;
+                        sess_rev = if bin.purch_head != u32::MAX {
+                            add_bin_purchases(
+                                &w.dense.purch_nodes,
+                                bin.purch_head,
+                                &mut w.cat_sum,
+                                &mut w.cat_touched,
+                            )
+                        } else {
+                            0
+                        };
                     }
-                    has_sess = true;
-                    sess_start = s;
-                    sess_max = bin.max_ts;
-                    sess_last_bin = bi;
-                    sess_nev = bin.count;
-                    sess_rev = if bin.purch_head != u32::MAX {
-                        add_bin_purchases(
-                            &w.dense.purch_nodes,
-                            bin.purch_head,
-                            &mut w.cat_sum,
-                            &mut w.cat_touched,
-                        )
-                    } else {
-                        0
-                    };
                 }
+                if wm == 0 {
+                    break;
+                }
+                let wi = wm.trailing_zeros() as usize;
+                wm &= wm - 1;
+                word = unsafe { *w.dense.active_mask.get_unchecked(wi) };
+                unsafe { *w.dense.active_mask.get_unchecked_mut(wi) = 0 };
+                base_bin = wi << 6;
             }
-        }
-        if has_sess {
             emit_session_c::<u64, HAS_CLICKS>(
                 &mut w.camp,
                 &mut w.assists,
@@ -4793,15 +4792,15 @@ fn sessionize_person<P: GroupProfile, const HAS_CLICKS: bool>(
             let mut cc = first.cc();
             let mut rev = 0u64;
             loop {
-                let cents = cc & 0x00FF_FFFF;
-                if cents != 0 {
-                    rev += cents as u64;
+                if cc != 0 {
+                    let cents = (cc & 0x00FF_FFFF) as u64;
+                    rev += cents;
                     let cat = cc >> 24;
                     let slot = unsafe { w.cat_sum.get_unchecked_mut(cat as usize) };
                     if *slot == 0 {
                         w.cat_touched.push(cat);
                     }
-                    *slot += cents as u64;
+                    *slot += cents;
                 }
                 if k == ev_cnt {
                     break;
@@ -5265,7 +5264,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(8);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -5495,32 +5494,32 @@ pub(super) fn run_to_output(
     let short_eid_pct = 100usize.saturating_sub(sample.long_eid_pct);
     let short_user_pct = 100usize.saturating_sub(sample.long_user_pct);
     let cap_tok_s = if short_eid_pct > 0 {
-        (est_ev * short_eid_pct / 100 / p1_short * 107 / 100 / workers).max(16) + 32
+        (est_ev * short_eid_pct / 100 / p1_short * 110 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_tok_l = if sample.long_eid_pct > 0 {
-        (est_ev * sample.long_eid_pct / 100 / p1_long * 112 / 100 / workers).max(16) + 16
+        (est_ev * sample.long_eid_pct / 100 / p1_long * 115 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_b_s = if short_user_pct > 0 {
-        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 107 / 100 / workers).max(16) + 32
+        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 110 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_b_l = if sample.long_user_pct > 0 {
-        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 114 / 100 / workers).max(16) + 16
+        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 118 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_ck_s = if short_user_pct > 0 {
-        (est_ck * short_user_pct / 100 / p2_short * 107 / 100 / workers).max(16) + 32
+        (est_ck * short_user_pct / 100 / p2_short * 110 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_ck_l = if sample.long_user_pct > 0 {
-        (est_ck * sample.long_user_pct / 100 / p2_long * 114 / 100 / workers).max(16) + 16
+        (est_ck * sample.long_user_pct / 100 / p2_long * 118 / 100 / workers).max(16) + 32
     } else {
         16
     };
@@ -5990,15 +5989,13 @@ mod tests {
         let mut b8 = [0u8; 64];
         b8[..9].copy_from_slice(b"u8765432,");
         let e8 = u32::from_le_bytes(b8[8..12].try_into().unwrap());
-        let (k8, l8) = unsafe { try_encode_89(b8.as_ptr(), e8, true).unwrap() };
-        assert_eq!(l8, 8);
+        let k8 = unsafe { try_encode_89(b8.as_ptr(), e8, 0).unwrap() };
         assert_eq!(k8, u64::enc_slice(b"u8765432").unwrap());
 
         let mut b9 = [0u8; 64];
         b9[..10].copy_from_slice(b"e12345678,");
         let e9 = u32::from_le_bytes(b9[8..12].try_into().unwrap());
-        let (k9, l9) = unsafe { try_encode_89(b9.as_ptr(), e9, false).unwrap() };
-        assert_eq!(l9, 9);
+        let k9 = unsafe { try_encode_89(b9.as_ptr(), e9, 1).unwrap() };
         assert_eq!(k9, u64::enc_slice(b"e12345678").unwrap());
 
         let s_tag = mix63(k8);
@@ -6108,8 +6105,7 @@ mod tests {
             assert_ne!(k_slow, 0);
             if s.len() == 8 || s.len() == 9 {
                 let end4 = unsafe { buf.as_ptr().add(8).cast::<u32>().read_unaligned() };
-                let (k_fast, l_fast) = unsafe { try_encode_eid_89(buf.as_ptr(), end4, s.len() == 8).unwrap() };
-                assert_eq!(l_fast, s.len());
+                let k_fast = unsafe { try_encode_eid_89(buf.as_ptr(), end4, usize::from(s.len() == 9)).unwrap() };
                 assert_eq!(k_fast, k_slow);
             }
         }
