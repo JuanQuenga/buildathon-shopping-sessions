@@ -2075,12 +2075,12 @@ fn cswap_click<K: Key>(a: &mut [CompactClick<K>], i: usize, j: usize) {
         let x = *a.get_unchecked(i);
         let y = *a.get_unchecked(j);
         let swap = (x.ts > y.ts) | ((x.ts == y.ts) & (x.cid > y.cid));
-        *a.get_unchecked_mut(i) = if swap { y } else { x };
-        *a.get_unchecked_mut(j) = if swap { x } else { y };
+        *a.get_unchecked_mut(i) = std::hint::select_unpredictable(swap, y, x);
+        *a.get_unchecked_mut(j) = std::hint::select_unpredictable(swap, x, y);
     }
 }
 
-#[inline]
+#[inline(never)]
 fn sort_clicks_only<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) {
     let n = cl.len();
     match n {

@@ -341,7 +341,7 @@ impl FileBuilder {
                 Kind::OptUtf8,
                 dict.len(),
                 Some(defs),
-                Compression::None,
+                Compression::Snappy,
             );
         } else {
             definition_levels(&mut self.page, self.num_rows, defs);

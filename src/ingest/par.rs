@@ -412,44 +412,10 @@ fn thp_enabled() -> &'static str {
     ENABLED.get_or_init(|| thp_mode("/sys/kernel/mm/transparent_hugepage/enabled"))
 }
 
-fn thp_defrag() -> &'static str {
-    static DEFRAG: OnceLock<String> = OnceLock::new();
-    DEFRAG.get_or_init(|| thp_mode("/sys/kernel/mm/transparent_hugepage/defrag"))
-}
-
-/// Probe whether a single 2 MiB `MADV_HUGEPAGE` fault completes cleanly (< 400 us) without
-/// synchronous direct-compaction stalls on a fragmented VM.
-fn probe_thp_fast() -> bool {
-    let Some((ptr, raw, len)) = map_aligned(HUGE_PAGE_BYTES) else {
-        return false;
-    };
-    let t0 = Instant::now();
-    unsafe {
-        madvise(ptr, len, 14); // MADV_HUGEPAGE
-        std::ptr::write_volatile(ptr, 1);
-        std::ptr::write_volatile(ptr.add(4096), 1);
-    }
-    let elapsed_us = t0.elapsed().as_micros();
-    huge_free(raw, len);
-    elapsed_us < 400
-}
-
 fn sink_thp() -> bool {
     static USE_THP: OnceLock<bool> = OnceLock::new();
     *USE_THP.get_or_init(|| {
-        if let Ok(v) = std::env::var("INGEST_SINK_THP") {
-            return v != "0" && thp_enabled() != "never";
-        }
-        match thp_enabled() {
-            // Under `always`, anonymous 2 MiB-aligned allocations get opportunistic huge pages
-            // automatically WITHOUT triggering synchronous `defrag=madvise` compaction stalls!
-            "always" => false,
-            "madvise" => match thp_defrag() {
-                "never" | "defer" => true,
-                _ => probe_thp_fast(),
-            },
-            _ => false,
-        }
+        std::env::var("INGEST_SINK_THP").as_deref() != Ok("0") && thp_enabled() != "never"
     })
 }
 
@@ -890,9 +856,8 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
             base: arena.base.cast(),
             arena,
             cap,
-            // +1 trailing dummy slot at index `parts` enables branchless `push_cond`.
-            swcb: vec![SwcbLine([0u8; SWCB]); parts + 1],
-            len: vec![0; parts + 1],
+            swcb: vec![SwcbLine([0u8; SWCB]); parts],
+            len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
         }
     }
@@ -932,22 +897,6 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         l
     }
 
-    /// Branchless conditional append: when `take == false`, caller MUST pass `p == parts`
-    /// (the dedicated dummy SWCB slot whose `len` stays 0 forever and is never flushed).
-    #[inline(always)]
-    pub fn push_cond(&mut self, p: usize, x: T, take: bool) {
-        let pl = Self::per_line();
-        let l = unsafe { *self.len.get_unchecked(p) } as usize;
-        let slot = l & (pl - 1);
-        let line_ptr = unsafe { self.swcb.as_mut_ptr().add(p) as *mut T };
-        unsafe { line_ptr.add(slot).write(x) };
-        let nl = l + usize::from(take);
-        unsafe { *self.len.get_unchecked_mut(p) = nl as u32 };
-        if ((nl & (pl - 1)) | usize::from(!take)) == 0 {
-            self.flush_full(p, nl, line_ptr);
-        }
-    }
-
     #[inline(always)]
     fn flush_full(&mut self, p: usize, nl: usize, line_ptr: *const T) {
         let pl = Self::per_line();
@@ -974,7 +923,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let slice = unsafe { std::slice::from_raw_parts(line_ptr, Self::per_line()) };
         let ov = unsafe { self.over.get_unchecked_mut(p) };
         if ov.is_empty() {
-            ov.reserve(256);
+            ov.reserve(1024);
         }
         ov.extend_from_slice(slice);
     }

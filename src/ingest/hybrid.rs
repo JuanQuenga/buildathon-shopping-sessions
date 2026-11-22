@@ -9,7 +9,7 @@
 //!   `ArenaBytes` slices (with automatic heap fallback on extreme skew) and referenced via
 //!   tagged `u64` handles (bit 63 == 1) with embedded hash fingerprints.
 //!
-//! Disjoint short/long partition spaces inside unified `Sinks` (SWCB=128/128/192):
+//! Disjoint short/long partition spaces inside unified `Sinks` (SWCB=256/256/192):
 //! - `tok_sinks` holds `p1_short` pure-short partitions (`0..p1_short`) followed by
 //!   `p1_long` pure-long partitions (`p1_short..p1_total`).
 //! - `b_sinks`, `ck_sinks`, `reloc_b`, `reloc_c` hold `p2_short` pure-short partitions
@@ -44,8 +44,11 @@ const LINK_LONG_BIT: u64 = 1u64 << 62;
 const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
-const SWCB_TOK: usize = 128; // 576 * 128B = 74 KiB/thr (fits comfortably inside Cascade Lake 1 MiB L2)
-const SWCB_B: usize = 128;
+// With p1_total = p2_total = 576 (512 short + 64 long), active SWCB during Events is
+// 576 * (256 + 256) = 288 KiB/worker = 576 KiB/SMT pair (comfortably inside Cascade Lake 1 MiB L2)
+// while halving SWCB flush mispredicts (`16` records/flush vs `8`).
+const SWCB_TOK: usize = 256;
+const SWCB_B: usize = 256;
 const SWCB_CK: usize = 192;
 
 const fn inv_odd_63(x: u64) -> u64 {
@@ -1177,50 +1180,26 @@ impl ShortRelocMap {
         }
     }
 
-    /// Branchless fast-path probe: returns `(canon_tagged, is_mapped)`.
-    /// Eliminates the 57%/43% hit-vs-miss branch on ~98% of lookups (`hits != 0 || b.keys[3] == 0`).
-    /// Caller guarantees `!self.buckets.is_empty()`.
     #[inline(always)]
-    fn get_branchless(&self, raw_mixed: u64) -> (u64, bool) {
-        let slot = (raw_mixed as usize) & self.mask;
-        let needle = unsafe { _mm256_set1_epi64x(raw_mixed as i64) };
-        let b = unsafe { self.buckets.get_unchecked(slot) };
-        let keys = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
-        let hits = unsafe {
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
-        } as u32;
-        if (((hits != 0) as u8) | ((b.keys[3] == 0) as u8)) != 0 {
-            let lane = (hits.trailing_zeros() & 3) as usize;
-            return (unsafe { *b.vals.get_unchecked(lane) }, hits != 0);
-        }
-        self.get_overflow(slot, needle)
-    }
-
-    #[cfg(test)]
     fn get(&self, raw_mixed: u64) -> Option<u64> {
         if self.buckets.is_empty() {
             return None;
         }
-        let (v, ok) = self.get_branchless(raw_mixed);
-        if ok { Some(v) } else { None }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn get_overflow(&self, mut slot: usize, needle: __m256i) -> (u64, bool) {
+        let mut slot = (raw_mixed as usize) & self.mask;
+        let needle = unsafe { _mm256_set1_epi64x(raw_mixed as i64) };
         loop {
-            slot = (slot + 1) & self.mask;
             let b = unsafe { self.buckets.get_unchecked(slot) };
             let keys = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
             let hits = unsafe {
                 _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
             } as u32;
             if hits != 0 {
-                return (unsafe { *b.vals.get_unchecked(hits.trailing_zeros() as usize) }, true);
+                return Some(unsafe { *b.vals.get_unchecked(hits.trailing_zeros() as usize) });
             }
             if b.keys[3] == 0 {
-                return (0, false);
+                return None;
             }
+            slot = (slot + 1) & self.mask;
         }
     }
 }
@@ -2510,6 +2489,7 @@ fn click_slow_hybrid(
     lf + 1
 }
 
+#[inline(never)]
 fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
     if lo >= hi {
         return;
@@ -2528,6 +2508,7 @@ fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usi
     }
 }
 
+#[inline(never)]
 fn parse_clicks_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
     if lo >= hi {
         return;
@@ -2945,18 +2926,13 @@ fn relocate_hybrid(
                 for (tid, sink) in b_sinks.iter().enumerate() {
                     unsafe {
                         sink.compact_part_with_dead_disjoint(q, dead.words(tid, q), |r| {
-                            let (canon_tagged, mapped) = sm.get_branchless(r.person);
-                            let cq = std::hint::select_unpredictable(
-                                mapped,
-                                canon_q_of(canon_tagged, p2_short_shift),
-                                p2_total,
-                            );
-                            reloc_b.push_cond(
-                                cq,
-                                RecB { person: canon_tagged, ts: r.ts, cc: r.cc },
-                                mapped,
-                            );
-                            !mapped
+                            if let Some(canon_tagged) = sm.get(r.person) {
+                                let cq = canon_q_of(canon_tagged, p2_short_shift);
+                                reloc_b.push(cq, RecB { person: canon_tagged, ts: r.ts, cc: r.cc });
+                                false
+                            } else {
+                                true
+                            }
                         });
                     }
                 }
@@ -2964,23 +2940,21 @@ fn relocate_hybrid(
                 for sink in ck_sinks.iter() {
                     unsafe {
                         sink.compact_part_disjoint(q, |_, r| {
-                            let (canon_tagged, mapped) = sm.get_branchless(r.person);
-                            let cq = std::hint::select_unpredictable(
-                                mapped,
-                                canon_q_of(canon_tagged, p2_short_shift),
-                                p2_total,
-                            );
-                            reloc_c.push_cond(
-                                cq,
-                                RecC {
-                                    person: canon_tagged,
-                                    cid: r.cid,
-                                    ts: r.ts,
-                                    campaign: r.campaign,
-                                },
-                                mapped,
-                            );
-                            !mapped
+                            if let Some(canon_tagged) = sm.get(r.person) {
+                                let cq = canon_q_of(canon_tagged, p2_short_shift);
+                                reloc_c.push(
+                                    cq,
+                                    RecC {
+                                        person: canon_tagged,
+                                        cid: r.cid,
+                                        ts: r.ts,
+                                        campaign: r.campaign,
+                                    },
+                                );
+                                false
+                            } else {
+                                true
+                            }
                         });
                     }
                 }
@@ -3305,7 +3279,7 @@ fn radix_sort_clicks_var(
     }
 }
 
-#[inline]
+#[inline(never)]
 fn sort_clicks_var_only(
     cl: &mut [CompactClick<u64>],
     tmp: &mut ArenaVec<'_, CompactClick<u64>>,
@@ -3510,7 +3484,7 @@ struct FusedWorkerH<'a, P> {
     profile: P,
 }
 
-#[inline(always)]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn aggregate_person<P: GroupProfile>(
     w: &mut FusedWorkerH<'_, P>,
@@ -3865,7 +3839,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(24);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -4266,16 +4240,17 @@ pub(super) fn run_to_output(
     let est_ev = (ctx.event_bytes / sample.avg_ev_bytes) as usize + 1024;
     let est_ck = (ctx.click_bytes / sample.avg_ck_bytes) as usize + 1024;
 
-    // Match long/short partition ratio to observed long-ID share (`12.5% -> 1/8 = 128/1024` & `64/512`)
-    // so short and long buckets share uniform `cap` with near-100% arena utilization!
+    // Keep p1_total = p2_total = 576 (512 short + 64 long on v5) so SWCB=256/256 fits Cascade
+    // Lake's 1 MiB L2 per core (288 KiB/worker = 576 KiB/SMT pair) while halving flush mispredicts.
+    let base_p1_bits = plan.p1_bits.min(9);
     let (p1_short_bits, p1_long_bits) = if sample.long_eid_pct == 0 {
-        (plan.p1_bits, 4u32)
+        (base_p1_bits, 4u32)
     } else if sample.long_eid_pct <= 22 {
-        (plan.p1_bits, (plan.p1_bits.saturating_sub(3)).max(4))
+        (base_p1_bits, (base_p1_bits.saturating_sub(3)).max(4))
     } else if sample.long_eid_pct <= 55 {
-        (plan.p1_bits, (plan.p1_bits.saturating_sub(1)).max(4))
+        (base_p1_bits, (base_p1_bits.saturating_sub(1)).max(4))
     } else {
-        (4u32, plan.p1_bits)
+        (4u32, base_p1_bits)
     };
     let base_p2_bits = plan.p2_bits.min(9);
     let (p2_short_bits, p2_long_bits) = if sample.long_user_pct == 0 {
@@ -4296,10 +4271,20 @@ pub(super) fn run_to_output(
     let p2_total = p2_short + p2_long;
     debug_assert!(p2_total <= 1024);
 
-    // Tight capacity sizing (`1.06x + 16` slack) minimizes unused populate_write faults.
-    let cap_tok = (est_ev * 106 / 100 / workers / p1_total).max(16) + 16;
-    let cap_b = (est_ev * 95 / 100 * 106 / 100 / workers / p2_total).max(16) + 16;
-    let cap_ck = (est_ck * 106 / 100 / workers / p2_total).max(16) + 16;
+    // Zero-overflow capacity sizing (`1.12x` + `16/32` slack, sized to the denser of short vs
+    // long bucket share so long partitions never spill into non-THP glibc heap Vecs on the VM!).
+    let p1_per = (est_ev * (100usize.saturating_sub(sample.long_eid_pct)) / 100 / p1_short)
+        .max(est_ev * sample.long_eid_pct / 100 / p1_long)
+        .max(est_ev / p1_total);
+    let p2_ev_per = (est_ev * (100usize.saturating_sub(sample.long_user_pct)) / 100 / p2_short)
+        .max(est_ev * sample.long_user_pct / 100 / p2_long)
+        .max(est_ev / p2_total);
+    let p2_ck_per = (est_ck * (100usize.saturating_sub(sample.long_user_pct)) / 100 / p2_short)
+        .max(est_ck * sample.long_user_pct / 100 / p2_long)
+        .max(est_ck / p2_total);
+    let cap_tok = (p1_per * 112 / 100 / workers).max(16) + 16;
+    let cap_b = (p2_ev_per * 96 / 100 * 112 / 100 / workers).max(16) + 32;
+    let cap_ck = (p2_ck_per * 112 / 100 / workers).max(16) + 32;
 
     let tok_bytes = Sinks::<Tok, SWCB_TOK>::arena_bytes(p1_total, cap_tok);
     let b_bytes = Sinks::<RecB<u64>, SWCB_B>::arena_bytes(p2_total, cap_b);
