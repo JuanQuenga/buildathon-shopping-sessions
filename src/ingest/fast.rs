@@ -829,16 +829,6 @@ struct DedupTable {
     t64: Vec<u64>,
 }
 
-#[inline(always)]
-pub(super) fn use_avx512vl() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env_usize("INGEST_AVX512VL").unwrap_or(0) != 0
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-    })
-}
-
 impl DedupTable {
     fn mark_losers<R: Candidate>(
         &mut self, active: &[(&[R], u32, u32)], total: usize, mut lose: impl FnMut(u32, u32, &R),
@@ -2359,14 +2349,6 @@ impl DenseSessions {
         self.word_mask = 0;
     }
 
-    #[cold]
-    #[inline(never)]
-    fn push_purch_node(&mut self, cc: u32, bin_head: &mut u32) {
-        let idx = self.purch_nodes.len() as u32;
-        self.purch_nodes.push(PurchNode { cc, next: *bin_head });
-        *bin_head = idx;
-    }
-
     #[inline(always)]
     fn scatter_slice(&mut self, events: &[CompactEv]) {
         let mut wm = self.word_mask;
@@ -2382,10 +2364,10 @@ impl DenseSessions {
             bin.min_ts = bin.min_ts.min(ts);
             bin.max_ts = bin.max_ts.max(ts);
             bin.count += 1;
-            if cc != 0 {
-                let mut head = bin.purch_head;
-                self.push_purch_node(cc, &mut head);
-                unsafe { self.bins.get_unchecked_mut(bi).purch_head = head };
+            if (cc & 0x00FF_FFFF) != 0 {
+                let idx = self.purch_nodes.len() as u32;
+                self.purch_nodes.push(PurchNode { cc, next: bin.purch_head });
+                bin.purch_head = idx;
             }
         }
         self.word_mask = wm;
@@ -2398,8 +2380,7 @@ impl DenseSessions {
     }
 }
 
-#[cold]
-#[inline(never)]
+#[inline(always)]
 fn add_bin_purchases(
     purch_nodes: &[PurchNode],
     mut head: u32,
@@ -2486,8 +2467,8 @@ struct FusedAssists {
     /// Contiguous same-day session runs `(rel_day, exclusive_end_sess_idx)`.
     day_runs: Vec<(u16, u16)>,
     stamp: u32,
-    /// Compact 8B per-campaign `(stamp, prev_end)` (halves L1d footprint vs 16B `(u32, u64)`!).
-    campaigns: Vec<(u32, u32)>,
+    /// Power-of-two 16B per-campaign `(stamp, mask_64)` (or `prev_end` in `count_sparse`).
+    campaigns: Vec<(u32, u64)>,
 }
 
 impl FusedAssists {
@@ -2559,14 +2540,6 @@ impl FusedAssists {
         let max_s = unsafe { *self.s_start.get_unchecked(n_sess - 1) };
         if n_sess <= 64 && max_cts < (i32::MAX as u32 - 1) && max_s < (i32::MAX as u32 - 1) {
             let min_s = unsafe { *self.s_start.get_unchecked(0) };
-            let mut cl_lo = 0usize;
-            while cl_lo < clicks.len() && unsafe { clicks.get_unchecked(cl_lo).ts } < min_s {
-                cl_lo += 1;
-            }
-            if cl_lo == clicks.len() {
-                return;
-            }
-            let clicks = unsafe { clicks.get_unchecked(cl_lo..) };
             let max_hi = max_s.saturating_add(WEEK_MS_U32);
             unsafe {
                 use std::arch::x86_64::*;
@@ -2581,6 +2554,9 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
+                        if cts < min_s {
+                            continue;
+                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2588,14 +2564,17 @@ impl FusedAssists {
                             _mm256_cmpgt_epi32(v_s0, v_lo),
                             _mm256_cmpgt_epi32(v_hi, v_s0),
                         ))) as u32 as u64;
+                        if m == 0 {
+                            continue;
+                        }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev_end = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u32);
-                        let mut new_bits = m & (u64::MAX << prev_end);
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
+                        let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
-                        *seen = (stamp, 64 - m.leading_zeros());
+                        *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
                         loop {
                             let si = new_bits.trailing_zeros() as usize;
@@ -2619,6 +2598,9 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
+                        if cts < min_s {
+                            continue;
+                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2631,14 +2613,17 @@ impl FusedAssists {
                             _mm256_cmpgt_epi32(v_hi, v_s1),
                         ))) as u32 as u64;
                         let m = m0 | (m1 << 8);
+                        if m == 0 {
+                            continue;
+                        }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev_end = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u32);
-                        let mut new_bits = m & (u64::MAX << prev_end);
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
+                        let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
-                        *seen = (stamp, 64 - m.leading_zeros());
+                        *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
                         loop {
                             let si = new_bits.trailing_zeros() as usize;
@@ -2661,6 +2646,9 @@ impl FusedAssists {
                         if cts > max_hi {
                             break;
                         }
+                        if cts < min_s {
+                            continue;
+                        }
                         let lo = cts.saturating_sub(WEEK_MS_U32) as i32;
                         let v_lo = _mm256_set1_epi32(lo - 1);
                         let v_hi = _mm256_set1_epi32((cts as i32) + 1);
@@ -2673,19 +2661,17 @@ impl FusedAssists {
                             ))) as u32 as u64;
                             m |= mc << (ci * 8);
                         }
+                        if m == 0 {
+                            continue;
+                        }
                         let campaign = click.campaign as usize;
                         let seen = self.campaigns.get_unchecked_mut(campaign);
-                        let prev_end = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u32);
-                        let keep = std::hint::select_unpredictable(
-                            prev_end < 64,
-                            u64::MAX.wrapping_shl(prev_end),
-                            0u64,
-                        );
-                        let mut new_bits = m & keep;
+                        let prev = std::hint::select_unpredictable(seen.0 == stamp, seen.1, 0u64);
+                        let mut new_bits = m & !prev;
                         if new_bits == 0 {
                             continue;
                         }
-                        *seen = (stamp, 64 - m.leading_zeros());
+                        *seen = (stamp, prev | m);
                         let row = assisted_ptr.add(campaign * width);
                         loop {
                             let si = new_bits.trailing_zeros() as usize;
@@ -2751,7 +2737,7 @@ impl FusedAssists {
             if begin >= end {
                 continue;
             }
-            *seen = (stamp, end as u32);
+            *seen = (stamp, end as u64);
             let ri0 = unsafe { *self.s_run.get_unchecked(begin) } as usize;
             let ri1 = unsafe { *self.s_run.get_unchecked(end - 1) } as usize;
             if width != 0 {
@@ -2861,7 +2847,7 @@ fn emit_session_c<K: Key, const HAS_CLICKS: bool>(
         let mut j = *cj;
         let mut lts = *last_ts;
         let mut gf = *grp_first;
-        // Four branchless steps handle 0..=4 click advances per session with zero mispredicts.
+        // Two branchless steps handle 0, 1, or 2 click advances per session with zero mispredicts.
         let ct0 = unsafe { cl_buf.get_unchecked(j).ts };
         let take0 = ct0 <= s_ck;
         let upd0 = take0 & (ct0 != lts);
@@ -2875,20 +2861,6 @@ fn emit_session_c<K: Key, const HAS_CLICKS: bool>(
         lts = std::hint::select_unpredictable(upd1, ct1, lts);
         gf = std::hint::select_unpredictable(upd1, j, gf);
         j += usize::from(take1);
-
-        let ct2 = unsafe { cl_buf.get_unchecked(j).ts };
-        let take2 = ct2 <= s_ck;
-        let upd2 = take2 & (ct2 != lts);
-        lts = std::hint::select_unpredictable(upd2, ct2, lts);
-        gf = std::hint::select_unpredictable(upd2, j, gf);
-        j += usize::from(take2);
-
-        let ct3 = unsafe { cl_buf.get_unchecked(j).ts };
-        let take3 = ct3 <= s_ck;
-        let upd3 = take3 & (ct3 != lts);
-        lts = std::hint::select_unpredictable(upd3, ct3, lts);
-        gf = std::hint::select_unpredictable(upd3, j, gf);
-        j += usize::from(take3);
 
         if unsafe { cl_buf.get_unchecked(j).ts } <= s_ck {
             loop {

@@ -621,11 +621,11 @@ struct SwcbLine<const SWCB: usize>([u8; SWCB]);
 /// full cache lines of non-temporal stores.
 pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     base: *mut T,
-    arena: Option<SinkArena>,
+    arena: SinkArena,
     n_short: usize,
     cap_short: usize,
     cap_long: usize,
-    long_adj: usize, // long_base.wrapping_sub(n_short * cap_long) — zero branch, zero memory load!
+    long_base: usize,
     swcb: Vec<SwcbLine<SWCB>>,
     pub len: Vec<u32>,
     pub over: Vec<Vec<T>>,
@@ -661,6 +661,16 @@ impl SinkArena {
     pub(super) fn new(bytes: usize) -> Self {
         let (base, raw, len) = huge_alloc_ex(bytes, sink_thp());
         Self { base, bytes, mapping: Arc::new(SinkMapping { raw, len }) }
+    }
+
+    #[inline(always)]
+    pub(super) fn as_ptr(&self) -> *const u8 {
+        self.base
+    }
+
+    #[inline(always)]
+    pub(super) fn as_mut_ptr(&self) -> *mut u8 {
+        self.base
     }
 
     pub(super) fn split_at(self, offset: usize) -> (Self, Self) {
@@ -890,10 +900,11 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
 
     #[inline(always)]
     fn part_off_cap(&self, p: usize) -> (usize, usize) {
-        let is_long = p >= self.n_short;
-        let base = std::hint::select_unpredictable(is_long, self.long_adj, 0);
-        let cap = std::hint::select_unpredictable(is_long, self.cap_long, self.cap_short);
-        (base.wrapping_add(p.wrapping_mul(cap)), cap)
+        if p < self.n_short {
+            (p * self.cap_short, self.cap_short)
+        } else {
+            (self.long_base + (p - self.n_short) * self.cap_long, self.cap_long)
+        }
     }
 
     pub(super) fn in_arena_split(
@@ -907,31 +918,16 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let cs = Self::aligned_cap(cap_short);
         let cl = Self::aligned_cap(cap_long);
         let parts = n_short + n_long;
-        let long_base = n_short * cs;
         Sinks {
             base: arena.base.cast(),
-            arena: Some(arena),
+            arena,
             n_short,
             cap_short: cs,
             cap_long: cl,
-            long_adj: long_base.wrapping_sub(n_short.wrapping_mul(cl)),
+            long_base: n_short * cs,
             swcb: vec![SwcbLine([0u8; SWCB]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
-        }
-    }
-
-    pub(super) fn empty() -> Self {
-        Sinks {
-            base: std::ptr::null_mut(),
-            arena: None,
-            n_short: 0,
-            cap_short: 0,
-            cap_long: 0,
-            long_adj: 0,
-            swcb: Vec::new(),
-            len: Vec::new(),
-            over: Vec::new(),
         }
     }
 
@@ -968,7 +964,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     }
 
     pub(super) fn into_arena(self) -> SinkArena {
-        self.arena.expect("Sinks::into_arena on empty Sinks")
+        self.arena
     }
 
     /// Append to partition `p`'s SWCB. When full, stream it to the arena or
