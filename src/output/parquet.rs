@@ -254,8 +254,14 @@ impl FileBuilder {
     }
 
     pub fn col_user_id(&mut self, plain: &[u8]) {
+        static USER_ID_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if self.num_rows == 0 {
             self.write_plain("user_id", Kind::Utf8, plain);
+            return;
+        }
+        if *USER_ID_PLAIN.get_or_init(|| std::env::var("INGEST_USER_ID_PLAIN").as_deref() == Ok("1"))
+        {
+            self.add_data("user_id", Kind::Utf8, Compression::None, None, Some(plain));
             return;
         }
 
@@ -335,7 +341,7 @@ impl FileBuilder {
                 Kind::OptUtf8,
                 dict.len(),
                 Some(defs),
-                Compression::Snappy,
+                Compression::None,
             );
         } else {
             definition_levels(&mut self.page, self.num_rows, defs);

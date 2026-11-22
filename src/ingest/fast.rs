@@ -34,7 +34,7 @@ const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
 const GAP_MS_U32: u32 = 1_800_000;
 const DAY_MS_U32: u32 = ts::DAY_MS as u32;
-const CHUNK: u64 = 256 << 10;
+const CHUNK: u64 = 512 << 10;
 const LP_BITS: u32 = 8;
 const LP: usize = 1 << LP_BITS;
 const INVALID_CAMP: u32 = u32::MAX;
@@ -819,9 +819,13 @@ impl<K: Key> Candidate for RecA<K> {
     fn ingest(&self) -> u32 { self.ingest }
 }
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct DedupBucket32([u32; 4]);
+
 #[derive(Default)]
 struct DedupTable {
-    t32: Vec<u32>,
+    t32: Vec<DedupBucket32>,
     t64: Vec<u64>,
 }
 
@@ -842,49 +846,67 @@ impl DedupTable {
             let (sl, base, tid) = active[i];
             (unsafe { sl.get_unchecked((idx - base) as usize) }, tid)
         };
-        let cap = (total * 2).next_power_of_two();
-        let mask = cap - 1;
 
         if total < (1 << 18) - 1 {
-            if self.t32.len() < cap {
-                self.t32.resize(cap, 0);
+            use std::arch::x86_64::*;
+            // 4-way SSE2 open addressing (<= 70% load -> half L2 footprint, >96% 1-bucket hit/insert).
+            let nb = ((total * 5) / 14 + 1).next_power_of_two().max(4);
+            let bmask = nb - 1;
+            if self.t32.len() < nb {
+                self.t32.resize(nb, DedupBucket32::default());
             }
-            let table = &mut self.t32[..cap];
-            table.fill(0);
+            let table = &mut self.t32[..nb];
+            table.fill(DedupBucket32::default());
+            let fp_mask = unsafe { _mm_set1_epi32(0xFFFC_0000u32 as i32) };
+            let zero = unsafe { _mm_setzero_si128() };
             let mut flat = 0u32;
             for &(sl, _, cur_tid) in active {
                 for r in sl {
                     let h = r.hash32();
-                    let fp = h >> 18; // 14-bit fingerprint
-                    let mut slot = (h as usize) & mask;
-                    loop {
-                        let v = unsafe { *table.get_unchecked(slot) };
-                        if v == 0 {
-                            unsafe { *table.get_unchecked_mut(slot) = (fp << 18) | (flat + 1) };
-                            break;
-                        }
-                        if (v >> 18) == fp {
-                            let prev = (v & ((1 << 18) - 1)) - 1;
+                    let fp_hi = (h & 0x7FFC_0000) | 0x8000_0000;
+                    let fp_vec = unsafe { _mm_set1_epi32(fp_hi as i32) };
+                    let mut bi = (h as usize) & bmask;
+                    'probe: loop {
+                        let b = unsafe { table.get_unchecked_mut(bi) };
+                        let vals = unsafe { _mm_load_si128(b.0.as_ptr().cast()) };
+                        let mut hits = unsafe {
+                            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                                _mm_and_si128(vals, fp_mask),
+                                fp_vec,
+                            )))
+                        } as u32;
+                        while hits != 0 {
+                            let lane = hits.trailing_zeros() as usize;
+                            hits &= hits - 1;
+                            let prev = (unsafe { *b.0.get_unchecked(lane) } & 0x3FFFF) - 1;
                             let (w, prev_tid) = get_flat(prev);
                             if w.id() == r.id() {
                                 if r.ingest() < w.ingest() {
                                     lose(prev, prev_tid, w);
-                                    unsafe {
-                                        *table.get_unchecked_mut(slot) = (fp << 18) | (flat + 1);
-                                    }
+                                    unsafe { *b.0.get_unchecked_mut(lane) = fp_hi | (flat + 1) };
                                 } else {
                                     lose(flat, cur_tid, r);
                                 }
-                                break;
+                                break 'probe;
                             }
                         }
-                        slot = (slot + 1) & mask;
+                        let empties = unsafe {
+                            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(vals, zero)))
+                        } as u32;
+                        if empties != 0 {
+                            let lane = empties.trailing_zeros() as usize;
+                            unsafe { *b.0.get_unchecked_mut(lane) = fp_hi | (flat + 1) };
+                            break 'probe;
+                        }
+                        bi = (bi + 1) & bmask;
                     }
                     flat += 1;
                 }
             }
         } else {
             // Skew fallback: >= 262k records in one partition -> u64 table (fp32 | idx32+1).
+            let cap = (total * 2).next_power_of_two();
+            let mask = cap - 1;
             if self.t64.len() < cap {
                 self.t64.resize(cap, 0);
             }
@@ -2059,13 +2081,13 @@ fn cswap_click<K: Key>(a: &mut [CompactClick<K>], i: usize, j: usize) {
 }
 
 #[inline]
-fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) -> usize {
+fn sort_clicks_only<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) {
     let n = cl.len();
     match n {
-        0 | 1 => return n,
+        0 | 1 => return,
         2 => {
             cswap_click(cl, 0, 1);
-            return if unsafe { cl.get_unchecked(0).cid == cl.get_unchecked(1).cid } { 1 } else { 2 };
+            return;
         }
         3 => {
             cswap_click(cl, 0, 2);
@@ -2161,25 +2183,92 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<
                 cswap_click(cl, i, j);
             }
         }
-        13..=16 => {
-            for i in 1..n {
-                let v = unsafe { *cl.get_unchecked(i) };
-                let mut j = i;
-                while j > 0 {
-                    let prev = unsafe { *cl.get_unchecked(j - 1) };
-                    if prev.ts > v.ts || (prev.ts == v.ts && prev.cid > v.cid) {
-                        unsafe { *cl.get_unchecked_mut(j) = prev };
-                        j -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                unsafe { *cl.get_unchecked_mut(j) = v };
+        13 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (2, 8), (2, 4), (5, 6), (9, 10), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click(cl, i, j);
             }
         }
-        17..=512 => cl.sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid))),
+        14 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        15 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        16 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14), (13, 15),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14), (11, 15),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        17..=256 => {
+            cl.sort_unstable_by_key(|a| a.ts);
+            let mut i = 0usize;
+            while i + 1 < n {
+                let ti = unsafe { cl.get_unchecked(i).ts };
+                if unsafe { cl.get_unchecked(i + 1).ts } == ti {
+                    let mut j = i + 2;
+                    while j < n && unsafe { cl.get_unchecked(j).ts } == ti {
+                        j += 1;
+                    }
+                    cl[i..j].sort_unstable_by_key(|c| c.cid);
+                    i = j;
+                } else {
+                    i += 1;
+                }
+            }
+        }
         _ => radix_sort_clicks(cl, tmp),
     }
+}
+
+#[inline]
+fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) -> usize {
+    let n = cl.len();
+    if n <= 1 {
+        return n;
+    }
+    sort_clicks_only(cl, tmp);
     let mut w = 1usize;
     let mut prev_cid = unsafe { cl.get_unchecked(0).cid };
     for r in 1..n {
@@ -2249,9 +2338,13 @@ impl DenseSessions {
         !self.bins.is_empty()
     }
 
-    #[inline]
-    fn scatter(&mut self, events: &[CompactEv]) {
+    #[inline(always)]
+    fn reset_purch(&mut self) {
         self.purch_nodes.clear();
+    }
+
+    #[inline(always)]
+    fn scatter_slice(&mut self, events: &[CompactEv]) {
         for ev in events {
             let ts = ev.ts();
             let cc = ev.cc();
@@ -2268,6 +2361,12 @@ impl DenseSessions {
                 bin.purch_head = idx;
             }
         }
+    }
+
+    #[inline]
+    fn scatter(&mut self, events: &[CompactEv]) {
+        self.reset_purch();
+        self.scatter_slice(events);
     }
 }
 
@@ -2353,19 +2452,45 @@ impl GroupProfile for GroupTimings {
 
 struct FusedAssists {
     s_start: Vec<u32>,
-    s_day: Vec<u16>,
-    stamp: u32,
-    campaigns: Vec<(u32, u32)>,
+    s_run: Vec<u16>,
+    /// Contiguous same-day session runs `(rel_day, exclusive_end_sess_idx)`.
+    day_runs: Vec<(u16, u16)>,
+    stamp: u16,
+    campaigns: Vec<(u16, u16)>,
 }
 
 impl FusedAssists {
     fn new(ncamp: usize) -> Self {
         Self {
             s_start: Vec::with_capacity(256),
-            s_day: Vec::with_capacity(256),
+            s_run: Vec::with_capacity(256),
+            day_runs: Vec::with_capacity(32),
             stamp: 0,
             campaigns: vec![(0, 0); ncamp],
         }
+    }
+
+    #[inline(always)]
+    fn clear_sessions(&mut self) {
+        self.s_start.clear();
+        self.s_run.clear();
+        self.day_runs.clear();
+    }
+
+    #[inline(always)]
+    fn push_session(&mut self, s: u32, rel_day: u16) {
+        let next_idx = (self.s_start.len() + 1) as u16;
+        self.s_start.push(s);
+        if let Some(last) = self.day_runs.last_mut() {
+            if last.0 == rel_day {
+                last.1 = next_idx;
+                self.s_run.push((self.day_runs.len() - 1) as u16);
+                return;
+            }
+        }
+        let ri = self.day_runs.len() as u16;
+        self.day_runs.push((rel_day, next_idx));
+        self.s_run.push(ri);
     }
 
     #[inline]
@@ -2374,6 +2499,7 @@ impl FusedAssists {
         if n_sess == 0 {
             return;
         }
+        debug_assert!(n_sess <= u16::MAX as usize);
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
             self.campaigns.fill((0, 0));
@@ -2382,7 +2508,7 @@ impl FusedAssists {
         let stamp = self.stamp;
         if n_sess == 1 {
             let s0 = unsafe { *self.s_start.get_unchecked(0) };
-            let day0_rel = unsafe { *self.s_day.get_unchecked(0) } as usize;
+            let day0_rel = unsafe { self.day_runs.get_unchecked(0).0 } as usize;
             let hi = s0 + WEEK_MS_U32;
             for click in clicks {
                 let cts = click.ts;
@@ -2436,16 +2562,40 @@ impl FusedAssists {
             if begin >= end {
                 continue;
             }
-            *seen = (stamp, end as u32);
-            let days = unsafe { self.s_day.get_unchecked(begin..end) };
+            *seen = (stamp, end as u16);
+            let ri0 = unsafe { *self.s_run.get_unchecked(begin) } as usize;
+            let ri1 = unsafe { *self.s_run.get_unchecked(end - 1) } as usize;
             if let Some(row) = camp.assisted_row(click.campaign) {
-                for &day in days {
-                    unsafe { *row.get_unchecked_mut(day as usize) += 1 };
+                if ri0 == ri1 {
+                    let day = unsafe { self.day_runs.get_unchecked(ri0).0 } as usize;
+                    unsafe { *row.get_unchecked_mut(day) += (end - begin) as u32 };
+                } else {
+                    let mut cur = begin;
+                    let mut ri = ri0;
+                    loop {
+                        let (day, run_end) = unsafe { *self.day_runs.get_unchecked(ri) };
+                        let stop = (run_end as usize).min(end);
+                        unsafe { *row.get_unchecked_mut(day as usize) += (stop - cur) as u32 };
+                        cur = stop;
+                        if cur == end {
+                            break;
+                        }
+                        ri += 1;
+                    }
                 }
             } else {
-                for &day in days {
-                    let day = camp.day0.wrapping_add(i32::from(day));
-                    camp.add_assisted(click.campaign, day, 1);
+                let mut cur = begin;
+                let mut ri = ri0;
+                loop {
+                    let (day_rel, run_end) = unsafe { *self.day_runs.get_unchecked(ri) };
+                    let stop = (run_end as usize).min(end);
+                    let day = camp.day0.wrapping_add(i32::from(day_rel));
+                    camp.add_assisted(click.campaign, day, (stop - cur) as u32);
+                    cur = stop;
+                    if cur == end {
+                        break;
+                    }
+                    ri += 1;
                 }
             }
         }
@@ -2545,8 +2695,7 @@ fn emit_session<K: Key>(
     *ud_events += nev;
     *ud_revenue += rev as i64;
     if has_clicks {
-        assists.s_start.push(s);
-        assists.s_day.push(rel_day as u16);
+        assists.push_session(s, rel_day as u16);
     }
 }
 
@@ -2803,8 +2952,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 let id_len = raw_key.unpack_buf(&mut id_buf);
                 let id_bytes = &id_buf[..id_len];
 
-                w.assists.s_start.clear();
-                w.assists.s_day.clear();
+                w.assists.clear_sessions();
                 let mut cj = cl_st;
                 let cl_end = cl_st + cl_len;
                 let saved_cl = if cl_len > 0 {

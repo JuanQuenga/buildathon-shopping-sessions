@@ -176,10 +176,8 @@ impl CampStore {
             let index = camp as usize * self.ndays as usize + rel_day;
             let c = unsafe { self.credit.get_unchecked_mut(index) };
             c.sessions += 1;
-            if rev != 0 {
-                c.purchasing += 1;
-                c.revenue += rev;
-            }
+            c.purchasing += u32::from(rev != 0);
+            c.revenue += rev;
         } else {
             let day = self.day0.wrapping_add(rel_day as i32);
             let c = self.sparse.entry((camp, day)).or_default();

@@ -19,10 +19,11 @@
 
 use super::{
     add_bin_purchases, emit_session, env_usize, field, flen, flush_user_day, for_each_live, fptr,
-    fts, partition_slices, sort_and_dedup_clicks, sort_ev_slice, CompactClick, CompactEv, Ctx,
-    DeadEvents, DedupTable, DenseBin, DenseSessions, Flag, FusedAssists, GroupMap, GroupPhase,
-    GroupProfile, GroupTimings, Need, PartitionPlan, RecB, RecC, Tok, DAY_MS_U32, GAP_MS_U32,
-    INVALID_CAMP, LOC_IDX_BITS, LP, LP_BITS, MAX_LOC_IDX, MAX_THREADS, NO_REC, WEEK_MS,
+    fts, partition_slices, sort_clicks_only, sort_ev_slice, CompactClick, CompactEv, Ctx,
+    DeadEvents, DedupBucket32, DedupTable, DenseBin, DenseSessions, Flag, FusedAssists, GroupMap,
+    GroupPhase, GroupProfile, GroupTimings, Need, PartitionPlan, RecB, RecC, Tok, DAY_MS_U32,
+    GAP_MS_U32, INVALID_CAMP, LOC_IDX_BITS, LP, LP_BITS, MAX_LOC_IDX, MAX_THREADS, NO_REC,
+    WEEK_MS,
 };
 use crate::aggregate::{self, output, CampStore};
 use crate::ingest::keys::Key;
@@ -43,8 +44,8 @@ const LINK_LONG_BIT: u64 = 1u64 << 62;
 const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
-const SWCB_TOK: usize = 128; // L2-optimal for 2-way SMT (avoids 256B L2 thrash!)
-const SWCB_B: usize = 128;
+const SWCB_TOK: usize = 256; // 576 * 256B = 147 KiB/thr (590 KiB/SMT pair << 1 MiB L2; halves flush Bcm!)
+const SWCB_B: usize = 256;
 const SWCB_CK: usize = 192;
 
 const fn inv_odd_63(x: u64) -> u64 {
@@ -87,30 +88,91 @@ unsafe fn ld8(p: *const u8) -> u64 {
     p.cast::<u64>().read_unaligned()
 }
 
-/// Fast 64-bit hash over any opaque byte slice (specialized unrolled path for 33-byte IDs).
+/// Lossless AVX2 packer for verified 33-byte hex IDs (`[ascii_prefix < 128][32 uniform-case hex]`).
+/// Returns `(tag, hi, lo)` where `tag = prefix` for `[0-9a-f]` (including all-digits) and
+/// `tag = prefix | 0x80` for `[0-9A-F]` containing at least one `A-F`.
+/// Returns `None` for any mixed-case, non-hex, or non-ASCII-prefix 33B string (stored verbatim).
 #[inline(always)]
-fn hash_long(s: &[u8]) -> u64 {
+unsafe fn try_pack_hex33(p: *const u8) -> Option<(u8, u64, u64)> {
+    let b0 = *p;
+    if b0.wrapping_sub(1) >= 127 {
+        return None;
+    }
+    let v = _mm256_loadu_si256(p.add(1).cast::<__m256i>());
+    let zero = _mm256_set1_epi8(b'0' as i8);
+    let d = _mm256_sub_epi8(v, zero);
+    let is_dig = _mm256_cmpeq_epi8(_mm256_subs_epu8(d, _mm256_set1_epi8(9)), _mm256_setzero_si256());
+
+    let a_lo = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+    let is_lo =
+        _mm256_cmpeq_epi8(_mm256_subs_epu8(a_lo, _mm256_set1_epi8(5)), _mm256_setzero_si256());
+    let ok_lo = _mm256_or_si256(is_dig, is_lo);
+
+    let (nib, tag) = if _mm256_movemask_epi8(ok_lo) == -1i32 {
+        let lo_val = _mm256_add_epi8(a_lo, _mm256_set1_epi8(10));
+        (_mm256_blendv_epi8(lo_val, d, is_dig), b0)
+    } else {
+        let a_hi = _mm256_sub_epi8(v, _mm256_set1_epi8(b'A' as i8));
+        let is_hi = _mm256_cmpeq_epi8(
+            _mm256_subs_epu8(a_hi, _mm256_set1_epi8(5)),
+            _mm256_setzero_si256(),
+        );
+        let ok_hi = _mm256_or_si256(is_dig, is_hi);
+        if _mm256_movemask_epi8(ok_hi) != -1i32 {
+            return None;
+        }
+        let hi_val = _mm256_add_epi8(a_hi, _mm256_set1_epi8(10));
+        (_mm256_blendv_epi8(hi_val, d, is_dig), b0 | 0x80)
+    };
+    let pairs16 = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    let lo128 = _mm256_castsi256_si128(pairs16);
+    let hi128 = _mm256_extracti128_si256::<1>(pairs16);
+    let packed = _mm_packus_epi16(lo128, hi128);
+    let hi = _mm_cvtsi128_si64(packed) as u64;
+    let lo = _mm_extract_epi64::<1>(packed) as u64;
+    Some((tag, hi, lo))
+}
+
+#[inline(always)]
+fn unpack_hex33(tag: u8, hi: u64, lo: u64, out: &mut [u8; 33]) {
+    const HEX_LO: &[u8; 16] = b"0123456789abcdef";
+    const HEX_HI: &[u8; 16] = b"0123456789ABCDEF";
+    out[0] = tag & 0x7F;
+    let lut = if (tag & 0x80) == 0 { HEX_LO } else { HEX_HI };
+    let h = hi.to_le_bytes();
+    let l = lo.to_le_bytes();
+    for i in 0..8 {
+        let v = h[i] as usize;
+        out[1 + 2 * i] = lut[v >> 4];
+        out[2 + 2 * i] = lut[v & 0xF];
+    }
+    for i in 0..8 {
+        let v = l[i] as usize;
+        out[17 + 2 * i] = lut[v >> 4];
+        out[18 + 2 * i] = lut[v & 0xF];
+    }
+}
+
+#[inline(always)]
+fn hash_packed_33(tag: u8, hi: u64, lo: u64) -> u64 {
     const K0: u64 = 0xA076_1D64_78BD_642F;
     const K1: u64 = 0xE703_7ED1_A0B4_28DB;
-    const K2: u64 = 0x8EBC_6AF0_9C88_C6E3;
-    const K3: u64 = 0x5899_65CC_7537_4CC3;
-    let len = s.len();
-    let p = s.as_ptr();
-    unsafe {
-        if len == 33 {
-            let a = ld8(p);
-            let b = ld8(p.add(8));
-            let c = ld8(p.add(16));
-            let d = ld8(p.add(24));
-            let e = *p.add(32) as u64;
-            let m0 = (a ^ K0 ^ (e << 56)).wrapping_mul(b ^ K1);
-            let m1 = (c ^ K2).wrapping_mul(d ^ K3);
-            let x = m0 ^ m1 ^ (m0 >> 32) ^ (m1 >> 32);
-            let y = (x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            return y ^ (y >> 32);
+    let m = (hi ^ K0 ^ ((tag as u64) << 56)).wrapping_mul(lo ^ K1);
+    let x = m ^ (m >> 32) ^ (tag as u64);
+    let y = (x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    y ^ (y >> 32)
+}
+
+/// Fast 64-bit hash over any opaque byte slice. Uses identical `hash_packed_33` whenever
+/// `try_pack_hex33` matches so packed `ArenaBytes` records and raw slices always agree!
+#[inline(always)]
+fn hash_long(s: &[u8]) -> u64 {
+    if s.len() == 33 {
+        if let Some((tag, hi, lo)) = unsafe { try_pack_hex33(s.as_ptr()) } {
+            return hash_packed_33(tag, hi, lo);
         }
-        hash_long_general(p, len)
     }
+    unsafe { hash_long_general(s.as_ptr(), s.len()) }
 }
 
 #[cold]
@@ -193,9 +255,7 @@ fn push_long_bytes(arena: &mut Vec<u8>, s: &[u8]) -> Option<u32> {
 }
 
 #[inline(always)]
-unsafe fn get_long_bytes(arena: &[u8], off: u32) -> &[u8] {
-    let p = arena.as_ptr().add(off as usize);
-    let b = *p;
+unsafe fn get_verbatim_bytes<'a>(p: *const u8, b: u8) -> &'a [u8] {
     if b < 255 {
         std::slice::from_raw_parts(p.add(1), b as usize)
     } else {
@@ -204,9 +264,79 @@ unsafe fn get_long_bytes(arena: &[u8], off: u32) -> &[u8] {
     }
 }
 
-/// Append-only length-prefixed byte arena backed by our 2 MiB THP `SinkArena`, with
-/// seamless heap spillover if a skewed dataset ever exceeds its pre-sized slice.
-/// Eliminates all `Vec::reserve` doubling `memcpy`s and serial `munmap`s on exit!
+#[inline(always)]
+unsafe fn get_long_bytes(arena: &[u8], off: u32) -> &[u8] {
+    let p = arena.as_ptr().add(off as usize);
+    get_verbatim_bytes(p, *p)
+}
+
+#[inline(always)]
+unsafe fn resolve_arena_bytes<'a>(arena: &'a [u8], off: u32, tmp: &'a mut [u8; 33]) -> &'a [u8] {
+    let p = arena.as_ptr().add(off as usize);
+    let b = *p;
+    if b == 0 {
+        unpack_hex33(*p.add(1), ld8(p.add(2)), ld8(p.add(10)), tmp);
+        &tmp[..]
+    } else {
+        get_verbatim_bytes(p, b)
+    }
+}
+
+#[inline(always)]
+unsafe fn hash_arena_rec(arena: &[u8], off: u32) -> u64 {
+    let p = arena.as_ptr().add(off as usize);
+    let b = *p;
+    if b == 0 {
+        hash_packed_33(*p.add(1), ld8(p.add(2)), ld8(p.add(10)))
+    } else {
+        let s = get_verbatim_bytes(p, b);
+        hash_long_general(s.as_ptr(), s.len())
+    }
+}
+
+#[inline(always)]
+unsafe fn eq_arena_packed(arena: &[u8], off: u32, tag: u8, hi: u64, lo: u64) -> bool {
+    let p = arena.as_ptr().add(off as usize);
+    (*p == 0) & (*p.add(1) == tag) & (ld8(p.add(2)) == hi) & (ld8(p.add(10)) == lo)
+}
+
+#[inline(always)]
+unsafe fn eq_arena_arena(a1: &[u8], off1: u32, a2: &[u8], off2: u32) -> bool {
+    let p1 = a1.as_ptr().add(off1 as usize);
+    let p2 = a2.as_ptr().add(off2 as usize);
+    let b1 = *p1;
+    let b2 = *p2;
+    if (b1 | b2) == 0 {
+        (*p1.add(1) == *p2.add(1))
+            & (ld8(p1.add(2)) == ld8(p2.add(2)))
+            & (ld8(p1.add(10)) == ld8(p2.add(10)))
+    } else if b1 != b2 {
+        false
+    } else {
+        get_verbatim_bytes(p1, b1) == get_verbatim_bytes(p2, b2)
+    }
+}
+
+#[inline(always)]
+unsafe fn eq_arena_raw(arena: &[u8], off: u32, raw: &[u8]) -> bool {
+    let p = arena.as_ptr().add(off as usize);
+    let b = *p;
+    if b == 0 {
+        if raw.len() != 33 {
+            return false;
+        }
+        let mut tmp = [0u8; 33];
+        unpack_hex33(*p.add(1), ld8(p.add(2)), ld8(p.add(10)), &mut tmp);
+        &tmp[..] == raw
+    } else {
+        get_verbatim_bytes(p, b) == raw
+    }
+}
+
+/// Append-only byte arena backed by 2 MiB THP `SinkArena` (with seamless heap spillover).
+/// Stores verified 33-byte uniform-case hex IDs as 18-byte records `[0, tag, hi: u64, lo: u64]`
+/// (-47% bytes, zero `memcpy`/`memcmp`), and every other non-empty byte string verbatim
+/// `[len, raw...]` (`len >= 1`, disjoint from escape marker `0`).
 struct ArenaBytes {
     base: *mut u8,
     cap: usize,
@@ -245,7 +375,55 @@ impl ArenaBytes {
     }
 
     #[inline(always)]
+    fn push_packed33(&mut self, tag: u8, hi: u64, lo: u64) -> Option<u32> {
+        let off = self.len;
+        if off + 18 <= self.cap {
+            unsafe {
+                let dst = self.base.add(off);
+                *dst = 0;
+                *dst.add(1) = tag;
+                dst.add(2).cast::<u64>().write_unaligned(hi);
+                dst.add(10).cast::<u64>().write_unaligned(lo);
+            }
+            self.len = off + 18;
+            return Some(off as u32);
+        }
+        self.push_packed33_slow(tag, hi, lo)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_packed33_slow(&mut self, tag: u8, hi: u64, lo: u64) -> Option<u32> {
+        self.spill_to_heap(18);
+        let off = self.heap.len();
+        if off > u32::MAX as usize {
+            return None;
+        }
+        self.heap.reserve(18);
+        unsafe {
+            let dst = self.heap.as_mut_ptr().add(off);
+            *dst = 0;
+            *dst.add(1) = tag;
+            dst.add(2).cast::<u64>().write_unaligned(hi);
+            dst.add(10).cast::<u64>().write_unaligned(lo);
+            self.heap.set_len(off + 18);
+        }
+        Some(off as u32)
+    }
+
+    #[inline(always)]
     fn push_bytes(&mut self, s: &[u8]) -> Option<u32> {
+        debug_assert!(!s.is_empty());
+        if s.len() == 33 {
+            if let Some((tag, hi, lo)) = unsafe { try_pack_hex33(s.as_ptr()) } {
+                return self.push_packed33(tag, hi, lo);
+            }
+        }
+        self.push_verbatim(s)
+    }
+
+    #[inline(always)]
+    fn push_verbatim(&mut self, s: &[u8]) -> Option<u32> {
         let slen = s.len();
         let off = self.len;
         if slen < 255 && off + 1 + slen <= self.cap {
@@ -262,21 +440,26 @@ impl ArenaBytes {
 
     #[cold]
     #[inline(never)]
-    fn push_slow(&mut self, s: &[u8]) -> Option<u32> {
+    fn spill_to_heap(&mut self, extra: usize) {
         if self.cap != 0 {
-            let need = self.len + s.len() + 5;
+            let need = self.len + extra;
             let new_cap = (self.cap * 2).max(need).max(4096);
             let mut heap = Vec::with_capacity(new_cap);
             unsafe {
                 std::ptr::copy_nonoverlapping(self.base, heap.as_mut_ptr(), self.len);
                 heap.set_len(self.len);
             }
-            // Return interior arena pages to OS immediately so skewed spillover never doubles RSS.
             par::release_pages_par(self.base, self.cap, 1);
             self.heap = heap;
             self.cap = 0;
             self.len = 0;
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_slow(&mut self, s: &[u8]) -> Option<u32> {
+        self.spill_to_heap(s.len() + 5);
         push_long_bytes(&mut self.heap, s)
     }
 
@@ -312,14 +495,39 @@ impl LongUserCache {
     }
 
     #[inline(always)]
-    fn intern_arena(&mut self, arena: &mut ArenaBytes, s: &[u8], uh: u64) -> Option<u32> {
+    fn intern_arena_packed33(
+        &mut self,
+        arena: &mut ArenaBytes,
+        tag: u8,
+        hi: u64,
+        lo: u64,
+        uh: u64,
+    ) -> Option<u32> {
         let fp = ((uh >> 32) as u32) | 1;
         let idx = (uh as usize) & Self::MASK;
         let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-        if slot.0 == fp && unsafe { get_long_bytes(arena.as_slice(), slot.1) } == s {
+        if slot.0 == fp && unsafe { eq_arena_packed(arena.as_slice(), slot.1, tag, hi, lo) } {
             return Some(slot.1);
         }
-        let off = arena.push_bytes(s)?;
+        let off = arena.push_packed33(tag, hi, lo)?;
+        *slot = (fp, off);
+        Some(off)
+    }
+
+    #[inline(always)]
+    fn intern_arena(&mut self, arena: &mut ArenaBytes, s: &[u8], uh: u64) -> Option<u32> {
+        if s.len() == 33 {
+            if let Some((tag, hi, lo)) = unsafe { try_pack_hex33(s.as_ptr()) } {
+                return self.intern_arena_packed33(arena, tag, hi, lo, uh);
+            }
+        }
+        let fp = ((uh >> 32) as u32) | 1;
+        let idx = (uh as usize) & Self::MASK;
+        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        if slot.0 == fp && unsafe { eq_arena_raw(arena.as_slice(), slot.1, s) } {
+            return Some(slot.1);
+        }
+        let off = arena.push_verbatim(s)?;
         *slot = (fp, off);
         Some(off)
     }
@@ -329,7 +537,8 @@ impl LongUserCache {
 #[derive(Default)]
 struct LinkLongStore {
     bytes: Vec<u8>,
-    meta: Vec<(u64, u32)>, // (offset, len)
+    meta: Vec<(u64, u32)>,       // (offset, len)
+    packed: Vec<(u8, u64, u64)>, // (tag != 0 => packed 33B hex; tag == 0 => verbatim)
 }
 
 impl LinkLongStore {
@@ -337,6 +546,11 @@ impl LinkLongStore {
     unsafe fn get(&self, id: u32) -> &[u8] {
         let &(off, len) = self.meta.get_unchecked(id as usize);
         std::slice::from_raw_parts(self.bytes.as_ptr().add(off as usize), len as usize)
+    }
+
+    #[inline(always)]
+    unsafe fn get_packed(&self, id: u32) -> (u8, u64, u64) {
+        *self.packed.get_unchecked(id as usize)
     }
 }
 
@@ -382,21 +596,93 @@ unsafe fn resolve_long_user<'a>(
     tag: u64,
     worker_arenas: &[&'a [u8]],
     link_store: &'a LinkLongStore,
+    tmp: &'a mut [u8; 33],
 ) -> &'a [u8] {
     debug_assert!(!is_short(tag));
     if (tag & LINK_LONG_BIT) != 0 {
         link_store.get(tag as u32)
     } else {
         let tid = ((tag >> 57) & 31) as usize;
-        get_long_bytes(worker_arenas.get_unchecked(tid), tag as u32)
+        resolve_arena_bytes(worker_arenas.get_unchecked(tid), tag as u32, tmp)
     }
 }
 
 #[inline(always)]
-unsafe fn resolve_long_cid<'a>(tag: u64, cid_arenas: &[&'a [u8]]) -> &'a [u8] {
+unsafe fn hash_long_user_tag(
+    tag: u64,
+    worker_arenas: &[&[u8]],
+    link_store: &LinkLongStore,
+) -> u64 {
+    if (tag & LINK_LONG_BIT) != 0 {
+        let lid = tag as u32;
+        let (ptag, hi, lo) = link_store.get_packed(lid);
+        if ptag != 0 {
+            hash_packed_33(ptag, hi, lo)
+        } else {
+            let s = link_store.get(lid);
+            hash_long_general(s.as_ptr(), s.len())
+        }
+    } else {
+        let tid = ((tag >> 57) & 31) as usize;
+        hash_arena_rec(worker_arenas.get_unchecked(tid), tag as u32)
+    }
+}
+
+#[inline(always)]
+unsafe fn eq_long_user_tags(
+    a: u64,
+    b: u64,
+    worker_arenas: &[&[u8]],
+    link_store: &LinkLongStore,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_link = (a & LINK_LONG_BIT) != 0;
+    let b_link = (b & LINK_LONG_BIT) != 0;
+    if !a_link && !b_link {
+        let ta = ((a >> 57) & 31) as usize;
+        let tb = ((b >> 57) & 31) as usize;
+        eq_arena_arena(
+            worker_arenas.get_unchecked(ta),
+            a as u32,
+            worker_arenas.get_unchecked(tb),
+            b as u32,
+        )
+    } else if a_link && b_link {
+        // Unique IDs inside LinkLongStore -> distinct u32 ids are never equal.
+        debug_assert_ne!(link_store.get(a as u32), link_store.get(b as u32));
+        false
+    } else if a_link {
+        let tb = ((b >> 57) & 31) as usize;
+        let lid = a as u32;
+        let (ptag, hi, lo) = link_store.get_packed(lid);
+        if ptag != 0 {
+            eq_arena_packed(worker_arenas.get_unchecked(tb), b as u32, ptag, hi, lo)
+        } else {
+            eq_arena_raw(worker_arenas.get_unchecked(tb), b as u32, link_store.get(lid))
+        }
+    } else {
+        let ta = ((a >> 57) & 31) as usize;
+        let lid = b as u32;
+        let (ptag, hi, lo) = link_store.get_packed(lid);
+        if ptag != 0 {
+            eq_arena_packed(worker_arenas.get_unchecked(ta), a as u32, ptag, hi, lo)
+        } else {
+            eq_arena_raw(worker_arenas.get_unchecked(ta), a as u32, link_store.get(lid))
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn resolve_long_cid<'a>(
+    tag: u64,
+    cid_arenas: &[&'a [u8]],
+    tmp: &'a mut [u8; 33],
+) -> &'a [u8] {
     debug_assert!(!is_short(tag));
     let tid = ((tag >> 58) & 31) as usize;
-    get_long_bytes(cid_arenas.get_unchecked(tid), tag as u32)
+    resolve_arena_bytes(cid_arenas.get_unchecked(tid), tag as u32, tmp)
 }
 
 #[inline(always)]
@@ -409,23 +695,28 @@ fn cmp_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> CmpOrd {
 
 #[cold]
 fn cmp_cid_slow(a: u64, b: u64, cid_arenas: &[&[u8]]) -> CmpOrd {
-    let mut ba = [0u8; 16];
-    let mut bb = [0u8; 16];
+    let mut ba = [0u8; 33];
+    let mut bb = [0u8; 33];
     let sa: &[u8] = if is_short(a) {
-        let n = a.unpack_buf(&mut ba);
+        let mut s16 = [0u8; 16];
+        let n = a.unpack_buf(&mut s16);
+        ba[..n].copy_from_slice(&s16[..n]);
         &ba[..n]
     } else {
-        unsafe { resolve_long_cid(a, cid_arenas) }
+        unsafe { resolve_long_cid(a, cid_arenas, &mut ba) }
     };
     let sb: &[u8] = if is_short(b) {
-        let n = b.unpack_buf(&mut bb);
+        let mut s16 = [0u8; 16];
+        let n = b.unpack_buf(&mut s16);
+        bb[..n].copy_from_slice(&s16[..n]);
         &bb[..n]
     } else {
-        unsafe { resolve_long_cid(b, cid_arenas) }
+        unsafe { resolve_long_cid(b, cid_arenas, &mut bb) }
     };
     sa.cmp(sb)
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn eq_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> bool {
     if a == b {
@@ -437,7 +728,16 @@ fn eq_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> bool {
     if ((a ^ b) & 0x03FF_FFFF_0000_0000) != 0 {
         return false;
     }
-    unsafe { resolve_long_cid(a, cid_arenas) == resolve_long_cid(b, cid_arenas) }
+    let ta = ((a >> 58) & 31) as usize;
+    let tb = ((b >> 58) & 31) as usize;
+    unsafe {
+        eq_arena_arena(
+            cid_arenas.get_unchecked(ta),
+            a as u32,
+            cid_arenas.get_unchecked(tb),
+            b as u32,
+        )
+    }
 }
 
 // ============================================================================
@@ -471,19 +771,58 @@ unsafe fn ends(p: *const u8, len: usize, mask: u16, expect: u16) -> bool {
     ends_delim(p, len, mask, expect)
 }
 
+/// Exact order-free 1..=9 non-NUL ASCII byte encoder for equality-only `event_id`s.
+/// Matches `try_encode_eid_89` bit-for-bit on all 8/9-byte ASCII IDs while avoiding `bswap`
+/// and overlapping `ld8(p+1)` loads on the hot path.
+#[inline(always)]
+unsafe fn encode_eid_short(p: *const u8, len: usize) -> Option<u64> {
+    if !(1..=9).contains(&len) {
+        return None;
+    }
+    let m0 = if len >= 8 { u64::MAX } else { (1u64 << (len * 8)) - 1 };
+    let w0 = ld8(p) & m0;
+    let filled = w0 | !m0;
+    let zero = filled.wrapping_sub(0x0101_0101_0101_0101) & !filled;
+    let b8 = if len == 9 { *p.add(8) } else { 0 };
+    let bad_b8 = (len == 9) & (b8.wrapping_sub(1) >= 127);
+    if bad_b8 | (((w0 | zero) & 0x8080_8080_8080_8080) != 0) {
+        return None;
+    }
+    Some((u64::from(b8) << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F))
+}
+
 /// Branchless register-only 8/9-byte ASCII inline encoder (zero `.rodata` loads, single branch).
 #[inline(always)]
 unsafe fn try_encode_89(p: *const u8, is8: bool) -> Option<(u64, usize)> {
     let first = *p;
-    let is8_u = u64::from(is8);
-    let mask = u64::MAX >> (is8_u << 3);
+    let mask = std::hint::select_unpredictable(is8, 0x00FF_FFFF_FFFF_FFFFu64, u64::MAX);
+    let pad = std::hint::select_unpredictable(is8, 0x3000_0000_0000_0000u64, 0u64);
     let tail = ld8(p.add(1)) & mask;
-    let filled = tail | ((is8_u * 3) << 60);
+    let filled = tail | pad;
     let bad_first = u64::from(first.wrapping_sub(0x30) >= 0x50);
     let bad_tail = (filled.wrapping_sub(0x3030_3030_3030_3030) | filled) & 0x8080_8080_8080_8080;
     if (bad_first | bad_tail) == 0 {
-        let len = 9usize - is8_u as usize;
+        let len = std::hint::select_unpredictable(is8, 8usize, 9usize);
         let key = (u64::from(first) << 56) | _pext_u64(tail.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
+        Some((key, len))
+    } else {
+        None
+    }
+}
+
+/// Lean order-free 8/9-byte `event_id` encoder reusing `b8 = end4 as u8` (zero `bswap`,
+/// zero `ld8(p+1)`, zero `0x00FF...`/`0x3000...` constants).
+#[inline(always)]
+unsafe fn try_encode_eid_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usize)> {
+    let w0 = ld8(p);
+    let b8_raw = end4 as u8;
+    let b8_chk = std::hint::select_unpredictable(is8, 0x30u8, b8_raw);
+    let bad_w0 = (w0.wrapping_sub(0x3030_3030_3030_3030) | w0) & 0x8080_8080_8080_8080;
+    let bad_b8 = u64::from(b8_chk.wrapping_sub(0x30) >= 0x50);
+    if (bad_w0 | bad_b8) == 0 {
+        let b8 = std::hint::select_unpredictable(is8, 0u64, u64::from(b8_raw));
+        let len = std::hint::select_unpredictable(is8, 8usize, 9usize);
+        let key = (b8 << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F);
         Some((key, len))
     } else {
         None
@@ -505,6 +844,25 @@ unsafe fn is_valid_opaque_33(p: *const u8) -> bool {
     (_mm256_movemask_epi8(bad) == 0) & (b0 != b',') & (b0 != b'"') & (b0 != b'\n')
 }
 
+/// Guaranteed single-cmov zero test (`a == 0 || b == 0`) that LLVM cannot split into two
+/// branches (eliminating ~6.5M random 8B-vs-9B branch mispredictions on 20M!).
+#[inline(always)]
+fn any_zero_u16(a: u16, b: u16) -> bool {
+    let mut r = u32::from(b);
+    let z = 0u32;
+    unsafe {
+        std::arch::asm!(
+            "test {a:x}, {a:x}",
+            "cmove {r:e}, {z:e}",
+            a = in(reg) a,
+            z = in(reg) z,
+            r = inout(reg) r,
+            options(pure, nomem, nostack),
+        );
+    }
+    r == 0
+}
+
 #[inline(always)]
 unsafe fn parse_link_ep_delim<const DELIM: u8>(
     p: *const u8,
@@ -515,10 +873,10 @@ unsafe fn parse_link_ep_delim<const DELIM: u8>(
 ) -> Option<(u64, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let end4 = p.add(8).cast::<u32>().read_unaligned();
-    let is8 = ((end4 as u16) & mask) == expect;
-    let is9 = (((end4 >> 8) as u16) & mask) == expect;
-    if (u8::from(is8) | u8::from(is9)) != 0 {
-        let (key, len) = try_encode_89(p, is8)?;
+    let d8 = ((end4 as u16) & mask) ^ expect;
+    let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
+    if any_zero_u16(d8, d9) {
+        let (key, len) = try_encode_89(p, d8 == 0)?;
         return Some((key, p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) && is_valid_opaque_33(p) {
@@ -541,24 +899,49 @@ unsafe fn parse_eid_delim<const DELIM: u8>(
 ) -> Option<(u64, usize, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let end4 = p.add(8).cast::<u32>().read_unaligned();
-    let is8 = ((end4 as u16) & mask) == expect;
-    let is9 = (((end4 >> 8) as u16) & mask) == expect;
-    if (u8::from(is8) | u8::from(is9)) != 0 {
-        let (key, len) = try_encode_89(p, is8)?;
+    let d8 = ((end4 as u16) & mask) ^ expect;
+    let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
+    if any_zero_u16(d8, d9) {
+        let (key, len) = try_encode_eid_89(p, end4, d8 == 0)?;
         let eid_mixed = key.h();
         let eid_p = (eid_mixed >> st.p1_short_shift) as usize;
         return Some((eid_mixed, eid_p, p.add(len + 1 + quoted)));
     }
-    if ends_delim(p, 33, mask, expect) && is_valid_opaque_33(p) {
-        let s = std::slice::from_raw_parts(p, 33);
-        let eh = hash_long(s);
-        let Some(off) = st.long_eids.push_bytes(s) else {
-            flag.set(Need::Slow);
-            return None;
-        };
-        let eid_word = ((eh as u64) << 32) | (off as u64);
-        let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
-        return Some((eid_word, eid_p, p.add(34 + quoted)));
+    if ends_delim(p, 33, mask, expect) {
+        let b0 = *p;
+        if b0.wrapping_sub(0x30) < 0x50 {
+            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+                let eh = hash_packed_33(tag, hi, lo);
+                let Some(off) = st.long_eids.push_packed33(tag, hi, lo) else {
+                    flag.set(Need::Slow);
+                    return None;
+                };
+                let eid_word = ((eh as u64) << 32) | (off as u64);
+                let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
+                return Some((eid_word, eid_p, p.add(34 + quoted)));
+            }
+        }
+        if is_valid_opaque_33(p) {
+            let s = std::slice::from_raw_parts(p, 33);
+            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+                let eh = hash_packed_33(tag, hi, lo);
+                let Some(off) = st.long_eids.push_packed33(tag, hi, lo) else {
+                    flag.set(Need::Slow);
+                    return None;
+                };
+                let eid_word = ((eh as u64) << 32) | (off as u64);
+                let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
+                return Some((eid_word, eid_p, p.add(34 + quoted)));
+            }
+            let eh = hash_long_general(p, 33);
+            let Some(off) = st.long_eids.push_verbatim(s) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            let eid_word = ((eh as u64) << 32) | (off as u64);
+            let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
+            return Some((eid_word, eid_p, p.add(34 + quoted)));
+        }
     }
     None
 }
@@ -571,23 +954,39 @@ unsafe fn parse_user_delim<const DELIM: u8>(
 ) -> Option<(u64, usize, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let end4 = p.add(8).cast::<u32>().read_unaligned();
-    let is8 = ((end4 as u16) & mask) == expect;
-    let is9 = (((end4 >> 8) as u16) & mask) == expect;
-    if (u8::from(is8) | u8::from(is9)) != 0 {
-        let (key, len) = try_encode_89(p, is8)?;
+    let d8 = ((end4 as u16) & mask) ^ expect;
+    let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
+    if any_zero_u16(d8, d9) {
+        let (key, len) = try_encode_89(p, d8 == 0)?;
         let m = mix63(key);
         let q = (m >> st.p2_short_shift) as usize;
         return Some((m, q, p.add(len + 1 + quoted)));
     }
-    if ends_delim(p, 33, mask, expect) && is_valid_opaque_33(p) {
-        let s = std::slice::from_raw_parts(p, 33);
-        let uh = hash_long(s);
-        let Some(off) = st.user_cache.intern_arena(&mut st.long_users, s, uh) else {
-            flag.set(Need::Slow);
-            return None;
-        };
-        let q = st.p2_short + ((uh >> st.p2_long_shift) as usize);
-        return Some((make_parse_long_user(st.tid, uh, off), q, p.add(34 + quoted)));
+    if ends_delim(p, 33, mask, expect) {
+        let b0 = *p;
+        if b0.wrapping_sub(0x30) < 0x50 {
+            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+                let uh = hash_packed_33(tag, hi, lo);
+                let Some(off) =
+                    st.user_cache.intern_arena_packed33(&mut st.long_users, tag, hi, lo, uh)
+                else {
+                    flag.set(Need::Slow);
+                    return None;
+                };
+                let q = st.p2_short + ((uh >> st.p2_long_shift) as usize);
+                return Some((make_parse_long_user(st.tid, uh, off), q, p.add(34 + quoted)));
+            }
+        }
+        if is_valid_opaque_33(p) {
+            let s = std::slice::from_raw_parts(p, 33);
+            let uh = hash_long(s);
+            let Some(off) = st.user_cache.intern_arena(&mut st.long_users, s, uh) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            let q = st.p2_short + ((uh >> st.p2_long_shift) as usize);
+            return Some((make_parse_long_user(st.tid, uh, off), q, p.add(34 + quoted)));
+        }
     }
     None
 }
@@ -600,20 +999,33 @@ unsafe fn parse_cid_delim<const DELIM: u8>(
 ) -> Option<(u64, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let end4 = p.add(8).cast::<u32>().read_unaligned();
-    let is8 = ((end4 as u16) & mask) == expect;
-    let is9 = (((end4 >> 8) as u16) & mask) == expect;
-    if (u8::from(is8) | u8::from(is9)) != 0 {
-        let (key, len) = try_encode_89(p, is8)?;
+    let d8 = ((end4 as u16) & mask) ^ expect;
+    let d9 = (((end4 >> 8) as u16) & mask) ^ expect;
+    if any_zero_u16(d8, d9) {
+        let (key, len) = try_encode_89(p, d8 == 0)?;
         return Some((key, p.add(len + 1 + quoted)));
     }
-    if ends_delim(p, 33, mask, expect) && is_valid_opaque_33(p) {
-        let s = std::slice::from_raw_parts(p, 33);
-        let ch = hash_long(s);
-        let Some(off) = st.long_cids.push_bytes(s) else {
-            flag.set(Need::Slow);
-            return None;
-        };
-        return Some((make_long_cid(st.tid, ch, off), p.add(34 + quoted)));
+    if ends_delim(p, 33, mask, expect) {
+        let b0 = *p;
+        if b0.wrapping_sub(0x30) < 0x50 {
+            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+                let ch = hash_packed_33(tag, hi, lo);
+                let Some(off) = st.long_cids.push_packed33(tag, hi, lo) else {
+                    flag.set(Need::Slow);
+                    return None;
+                };
+                return Some((make_long_cid(st.tid, ch, off), p.add(34 + quoted)));
+            }
+        }
+        if is_valid_opaque_33(p) {
+            let s = std::slice::from_raw_parts(p, 33);
+            let ch = hash_long(s);
+            let Some(off) = st.long_cids.push_bytes(s) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            return Some((make_long_cid(st.tid, ch, off), p.add(34 + quoted)));
+        }
     }
     None
 }
@@ -686,8 +1098,11 @@ unsafe fn open_ingest_f1(raw: *const u8) -> Option<(*const u8, *const u8)> {
 #[derive(Clone, Copy)]
 struct LongLinkPair {
     raw_hash: u64,
-    raw_link_id: u32,
     canon_tagged: u64,
+    raw_hi: u64,
+    raw_lo: u64,
+    raw_link_id: u32,
+    raw_tag: u8,
 }
 
 struct HybridBucketLinks {
@@ -851,8 +1266,7 @@ impl LongRelocMap {
         let tid = ((tag >> 57) & 31) as usize;
         let off = tag as u32;
         let mut slot = if self.wide_hash {
-            let s = unsafe { get_long_bytes(worker_arenas.get_unchecked(tid), off) };
-            (hash_long(s) as usize) & self.mask
+            (unsafe { hash_arena_rec(worker_arenas.get_unchecked(tid), off) } as usize) & self.mask
         } else {
             (h25 as usize) & self.mask
         };
@@ -867,8 +1281,26 @@ impl LongRelocMap {
                 let lane = hits.trailing_zeros() as usize;
                 hits &= hits - 1;
                 let entry = unsafe { *pairs.get_unchecked(*b.idxs.get_unchecked(lane) as usize) };
-                let s = unsafe { get_long_bytes(worker_arenas.get_unchecked(tid), off) };
-                if s == unsafe { link_store.get(entry.raw_link_id) } {
+                let matched = if entry.raw_tag != 0 {
+                    unsafe {
+                        eq_arena_packed(
+                            worker_arenas.get_unchecked(tid),
+                            off,
+                            entry.raw_tag,
+                            entry.raw_hi,
+                            entry.raw_lo,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        eq_arena_raw(
+                            worker_arenas.get_unchecked(tid),
+                            off,
+                            link_store.get(entry.raw_link_id),
+                        )
+                    }
+                };
+                if matched {
                     return Some(entry.canon_tagged);
                 }
             }
@@ -1333,15 +1765,18 @@ fn build_bucket_links_hybrid(
 
     let mut link_bytes: Vec<u8> = Vec::with_capacity(total_long_bytes);
     let mut link_meta = Vec::with_capacity(total_long_ids);
+    let mut link_packed = Vec::with_capacity(total_long_ids);
     let mut link_hashes = Vec::with_capacity(total_long_ids);
     if total_long_ids > 0 {
         unsafe {
             link_bytes.set_len(total_long_bytes);
             link_meta.set_len(total_long_ids);
+            link_packed.set_len(total_long_ids);
             link_hashes.set_len(total_long_ids);
         }
         let lb_ptr = SyncPtr(link_bytes.as_mut_ptr());
         let lm_ptr = SyncPtr(link_meta.as_mut_ptr());
+        let lpk_ptr = SyncPtr(link_packed.as_mut_ptr());
         let lh_ptr = SyncPtr(link_hashes.as_mut_ptr());
         let (parts_ref, lib_ref, lbb_ref) = (&parts, &long_id_base, &long_byte_base);
         par::run(threads, LP, |_| (), move |_, p| {
@@ -1353,14 +1788,21 @@ fn build_bucket_links_hybrid(
             let id_off = lib_ref[p] as usize;
             unsafe {
                 lb_ptr.copy_from(b_off, &ip.long_bytes);
+                let src_base = ip.long_bytes.as_ptr();
                 for (k, &(off, len, h)) in ip.long_meta.iter().enumerate() {
                     lm_ptr.write(id_off + k, (b_off as u64 + off, len));
+                    let pk = if len == 33 {
+                        try_pack_hex33(src_base.add(off as usize)).unwrap_or((0, 0, 0))
+                    } else {
+                        (0, 0, 0)
+                    };
+                    lpk_ptr.write(id_off + k, pk);
                     lh_ptr.write(id_off + k, h);
                 }
             }
         });
     }
-    let link_store = LinkLongStore { bytes: link_bytes, meta: link_meta };
+    let link_store = LinkLongStore { bytes: link_bytes, meta: link_meta, packed: link_packed };
 
     let mut keys = scratch.buffer::<u64>(nn);
     let mut parent = scratch.buffer::<AtomicU32>(nn);
@@ -1422,8 +1864,8 @@ fn build_bucket_links_hybrid(
     let mut long_plen = [0usize; LP];
 
     {
-        let (base_ref, lib_ref, parent_ref, keys_ref, lh_ref) =
-            (&base, &long_id_base, &parent, &keys, &link_hashes);
+        let (base_ref, lib_ref, parent_ref, keys_ref, lh_ref, ls_ref) =
+            (&base, &long_id_base, &parent, &keys, &link_hashes, &link_store);
         let sc_ptr = SyncPtr(short_sub_counts.as_mut_ptr());
         let lc_ptr = SyncPtr(long_sub_counts.as_mut_ptr());
         let sp_ptr = SyncPtr(short_plen.as_mut_ptr());
@@ -1463,6 +1905,7 @@ fn build_bucket_links_hybrid(
                     } else {
                         let kid = k as u32;
                         let rh = unsafe { *lh_ref.get_unchecked(kid as usize) };
+                        let (raw_tag, raw_hi, raw_lo) = unsafe { ls_ref.get_packed(kid) };
                         if long_split {
                             let sub_i = ((rh >> long_shift) as usize) - lbase_q;
                             llocal[sub_i] += 1;
@@ -1470,7 +1913,14 @@ fn build_bucket_links_hybrid(
                         unsafe {
                             ltmp_ptr.write(
                                 lw,
-                                LongLinkPair { raw_hash: rh, raw_link_id: kid, canon_tagged },
+                                LongLinkPair {
+                                    raw_hash: rh,
+                                    canon_tagged,
+                                    raw_hi,
+                                    raw_lo,
+                                    raw_link_id: kid,
+                                    raw_tag,
+                                },
                             );
                         }
                         lw += 1;
@@ -1665,7 +2115,7 @@ struct ParseStateH {
 impl ParseStateH {
     #[inline(always)]
     fn encode_eid_slice(&mut self, s: &[u8], flag: &Flag) -> Option<(u64, usize)> {
-        if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
+        if let Some(k) = unsafe { encode_eid_short(s.as_ptr(), s.len()) } {
             let m = k.h();
             Some((m, (m >> self.p1_short_shift) as usize))
         } else {
@@ -1986,10 +2436,10 @@ unsafe fn click_hybrid(
         return None;
     }
     let (tp, tmask, texpect, tq) = open_delim::<b'\n'>(after_camp);
-    let (t, end) = if (*tp.add(19) == b'Z') & ends_delim(tp, 20, tmask, texpect) {
-        (rows.dt.parse_f1_20_sec(tp)? * 1000, tp.add(21 + tq))
-    } else if ends_delim(tp, 13, tmask, texpect) {
+    let (t, end) = if ends_delim(tp, 13, tmask, texpect) {
         (rows.dt.parse_f3_13(tp)?, tp.add(14 + tq))
+    } else if (*tp.add(19) == b'Z') & ends_delim(tp, 20, tmask, texpect) {
+        (rows.dt.parse_f1_20_sec(tp)? * 1000, tp.add(21 + tq))
     } else if ends_delim(tp, 25, tmask, texpect) {
         (rows.dt.parse_f2_25(tp)?, tp.add(26 + tq))
     } else {
@@ -2143,12 +2593,20 @@ fn sample_input_stats(files: &[FileInfo]) -> InputSample {
                     let s0 = field(&buf, f[0]);
                     if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
                         long_eid += 1;
-                        long_eid_bytes += s0.len();
+                        long_eid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
+                            17
+                        } else {
+                            s0.len()
+                        };
                     }
                     let s1 = field(&buf, f[1]);
                     if !s1.is_empty() && unsafe { u64::enc(s1.as_ptr(), s1.len()) }.is_none() {
                         long_user += 1;
-                        long_user_bytes += s1.len();
+                        long_user_bytes += if s1.len() == 33 && unsafe { try_pack_hex33(s1.as_ptr()) }.is_some() {
+                            17
+                        } else {
+                            s1.len()
+                        };
                     }
                 }
             }
@@ -2182,7 +2640,11 @@ fn sample_input_stats(files: &[FileInfo]) -> InputSample {
                     let s0 = field(&buf, f[0]);
                     if unsafe { u64::enc(s0.as_ptr(), s0.len()) }.is_none() {
                         long_cid += 1;
-                        long_cid_bytes += s0.len();
+                        long_cid_bytes += if s0.len() == 33 && unsafe { try_pack_hex33(s0.as_ptr()) }.is_some() {
+                            17
+                        } else {
+                            s0.len()
+                        };
                     }
                 }
             }
@@ -2233,7 +2695,7 @@ fn dedup_long_part(
     total: usize,
     long_eids: &[&[u8]],
     dead: &DeadEvents,
-    t32: &mut Vec<u32>,
+    t32: &mut Vec<DedupBucket32>,
     t64: &mut Vec<u64>,
 ) {
     if total == 0 {
@@ -2248,54 +2710,73 @@ fn dedup_long_part(
         let (sl, base, tid) = active[i];
         (unsafe { sl.get_unchecked((idx - base) as usize) }, tid)
     };
-    let cap = (total * 2).next_power_of_two();
-    let mask = cap - 1;
 
     if total < (1 << 18) - 1 {
-        if t32.len() < cap {
-            t32.resize(cap, 0);
+        let nb = ((total * 5) / 14 + 1).next_power_of_two().max(4);
+        let bmask = nb - 1;
+        if t32.len() < nb {
+            t32.resize(nb, DedupBucket32::default());
         }
-        let table = &mut t32[..cap];
-        table.fill(0);
+        let table = &mut t32[..nb];
+        table.fill(DedupBucket32::default());
+        let fp_mask = unsafe { _mm_set1_epi32(0xFFFC_0000u32 as i32) };
+        let zero = unsafe { _mm_setzero_si128() };
         let mut flat = 0u32;
         for &(sl, _, cur_tid) in active {
             let cur_arena = unsafe { *long_eids.get_unchecked(cur_tid as usize) };
             for r in sl {
                 let h = (r.eid >> 32) as u32;
                 let r_off = r.eid as u32;
-                let fp = h >> 18;
-                let mut slot = (h as usize) & mask;
-                loop {
-                    let v = unsafe { *table.get_unchecked(slot) };
-                    if v == 0 {
-                        unsafe { *table.get_unchecked_mut(slot) = (fp << 18) | (flat + 1) };
-                        break;
-                    }
-                    if (v >> 18) == fp {
-                        let prev = (v & ((1 << 18) - 1)) - 1;
+                let fp_hi = (h & 0x7FFC_0000) | 0x8000_0000;
+                let fp_vec = unsafe { _mm_set1_epi32(fp_hi as i32) };
+                let mut bi = (h as usize) & bmask;
+                'probe: loop {
+                    let b = unsafe { table.get_unchecked_mut(bi) };
+                    let vals = unsafe { _mm_load_si128(b.0.as_ptr().cast()) };
+                    let mut hits = unsafe {
+                        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
+                            _mm_and_si128(vals, fp_mask),
+                            fp_vec,
+                        )))
+                    } as u32;
+                    while hits != 0 {
+                        let lane = hits.trailing_zeros() as usize;
+                        hits &= hits - 1;
+                        let prev = (unsafe { *b.0.get_unchecked(lane) } & 0x3FFFF) - 1;
                         let (w, prev_tid) = get_flat(prev);
-                        let w_bytes = unsafe {
-                            get_long_bytes(*long_eids.get_unchecked(prev_tid as usize), w.eid as u32)
-                        };
-                        let r_bytes = unsafe { get_long_bytes(cur_arena, r_off) };
-                        if w_bytes == r_bytes {
+                        if unsafe {
+                            eq_arena_arena(
+                                *long_eids.get_unchecked(prev_tid as usize),
+                                w.eid as u32,
+                                cur_arena,
+                                r_off,
+                            )
+                        } {
                             if r.ingest < w.ingest {
                                 dead.mark(prev_tid as usize, w.loc);
-                                unsafe {
-                                    *table.get_unchecked_mut(slot) = (fp << 18) | (flat + 1);
-                                }
+                                unsafe { *b.0.get_unchecked_mut(lane) = fp_hi | (flat + 1) };
                             } else {
                                 dead.mark(cur_tid as usize, r.loc);
                             }
-                            break;
+                            break 'probe;
                         }
                     }
-                    slot = (slot + 1) & mask;
+                    let empties = unsafe {
+                        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(vals, zero)))
+                    } as u32;
+                    if empties != 0 {
+                        let lane = empties.trailing_zeros() as usize;
+                        unsafe { *b.0.get_unchecked_mut(lane) = fp_hi | (flat + 1) };
+                        break 'probe;
+                    }
+                    bi = (bi + 1) & bmask;
                 }
                 flat += 1;
             }
         }
     } else {
+        let cap = (total * 2).next_power_of_two();
+        let mask = cap - 1;
         if t64.len() < cap {
             t64.resize(cap, 0);
         }
@@ -2305,8 +2786,8 @@ fn dedup_long_part(
         for &(sl, _, cur_tid) in active {
             let cur_arena = unsafe { *long_eids.get_unchecked(cur_tid as usize) };
             for r in sl {
-                let r_bytes = unsafe { get_long_bytes(cur_arena, r.eid as u32) };
-                let h = hash_long(r_bytes);
+                let r_off = r.eid as u32;
+                let h = unsafe { hash_arena_rec(cur_arena, r_off) };
                 let fp = (h >> 32) as u32;
                 let mut slot = (h as usize) & mask;
                 loop {
@@ -2320,10 +2801,14 @@ fn dedup_long_part(
                     if (v >> 32) as u32 == fp {
                         let prev = (v as u32).wrapping_sub(1);
                         let (w, prev_tid) = get_flat(prev);
-                        let w_bytes = unsafe {
-                            get_long_bytes(*long_eids.get_unchecked(prev_tid as usize), w.eid as u32)
-                        };
-                        if w_bytes == r_bytes {
+                        if unsafe {
+                            eq_arena_arena(
+                                *long_eids.get_unchecked(prev_tid as usize),
+                                w.eid as u32,
+                                cur_arena,
+                                r_off,
+                            )
+                        } {
                             if r.ingest < w.ingest {
                                 dead.mark(prev_tid as usize, w.loc);
                                 unsafe {
@@ -2577,8 +3062,8 @@ impl LongGroupMap {
         for (pid, e) in self.entries.iter().enumerate() {
             let h20 = long_user_hash20(e.tag);
             let mut slot = if self.wide_hash {
-                let s = unsafe { resolve_long_user(e.tag, worker_arenas, link_store) };
-                (hash_long(s) as usize) & self.mask
+                (unsafe { hash_long_user_tag(e.tag, worker_arenas, link_store) } as usize)
+                    & self.mask
             } else {
                 (h20 as usize) & self.mask
             };
@@ -2593,8 +3078,7 @@ impl LongGroupMap {
     fn count(&mut self, tag: u64, worker_arenas: &[&[u8]], link_store: &LinkLongStore) -> u32 {
         let h20 = long_user_hash20(tag);
         let mut slot = if self.wide_hash {
-            let s = unsafe { resolve_long_user(tag, worker_arenas, link_store) };
-            (hash_long(s) as usize) & self.mask
+            (unsafe { hash_long_user_tag(tag, worker_arenas, link_store) } as usize) & self.mask
         } else {
             (h20 as usize) & self.mask
         };
@@ -2612,12 +3096,7 @@ impl LongGroupMap {
             if (v >> 32) as u32 == h20 {
                 let pid = (v as u32 - 1) as usize;
                 let entry = unsafe { self.entries.get_unchecked_mut(pid) };
-                if entry.tag == tag
-                    || unsafe {
-                        resolve_long_user(entry.tag, worker_arenas, link_store)
-                            == resolve_long_user(tag, worker_arenas, link_store)
-                    }
-                {
+                if unsafe { eq_long_user_tags(entry.tag, tag, worker_arenas, link_store) } {
                     entry.count += 1;
                     return pid as u32;
                 }
@@ -2633,8 +3112,7 @@ impl LongGroupMap {
         }
         let h20 = long_user_hash20(tag);
         let mut slot = if self.wide_hash {
-            let s = unsafe { resolve_long_user(tag, worker_arenas, link_store) };
-            (hash_long(s) as usize) & self.mask
+            (unsafe { hash_long_user_tag(tag, worker_arenas, link_store) } as usize) & self.mask
         } else {
             (h20 as usize) & self.mask
         };
@@ -2646,12 +3124,7 @@ impl LongGroupMap {
             if (v >> 32) as u32 == h20 {
                 let pid = (v as u32 - 1) as usize;
                 let stored = unsafe { self.entries.get_unchecked(pid).tag };
-                if stored == tag
-                    || unsafe {
-                        resolve_long_user(stored, worker_arenas, link_store)
-                            == resolve_long_user(tag, worker_arenas, link_store)
-                    }
-                {
+                if unsafe { eq_long_user_tags(stored, tag, worker_arenas, link_store) } {
                     return Some(pid as u32);
                 }
             }
@@ -2672,6 +3145,25 @@ fn cswap_click_var(a: &mut [CompactClick<u64>], i: usize, j: usize, cid_arenas: 
         };
         *a.get_unchecked_mut(i) = if swap { y } else { x };
         *a.get_unchecked_mut(j) = if swap { x } else { y };
+    }
+}
+
+#[inline(always)]
+fn tiebreak_clicks_var(cl: &mut [CompactClick<u64>], cid_arenas: &[&[u8]]) {
+    let n = cl.len();
+    let mut i = 0usize;
+    while i + 1 < n {
+        let ti = unsafe { cl.get_unchecked(i).ts };
+        if unsafe { cl.get_unchecked(i + 1).ts } == ti {
+            let mut j = i + 2;
+            while j < n && unsafe { cl.get_unchecked(j).ts } == ti {
+                j += 1;
+            }
+            cl[i..j].sort_unstable_by(|a, b| cmp_cid(a.cid, b.cid, cid_arenas));
+            i = j;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -2783,21 +3275,17 @@ fn radix_sort_clicks_var(
 }
 
 #[inline]
-fn sort_and_dedup_clicks_var(
+fn sort_clicks_var_only(
     cl: &mut [CompactClick<u64>],
     tmp: &mut ArenaVec<'_, CompactClick<u64>>,
     cid_arenas: &[&[u8]],
-) -> usize {
+) {
     let n = cl.len();
     match n {
-        0 | 1 => return n,
+        0 | 1 => return,
         2 => {
             cswap_click_var(cl, 0, 1, cid_arenas);
-            return if unsafe { eq_cid(cl.get_unchecked(0).cid, cl.get_unchecked(1).cid, cid_arenas) } {
-                1
-            } else {
-                2
-            };
+            return;
         }
         3 => {
             cswap_click_var(cl, 0, 2, cid_arenas);
@@ -2915,10 +3403,25 @@ fn sort_and_dedup_clicks_var(
             }
         }
         17..=256 => {
-            cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_cid(a.cid, b.cid, cid_arenas)));
+            cl.sort_unstable_by_key(|a| a.ts);
+            tiebreak_clicks_var(cl, cid_arenas);
         }
         _ => radix_sort_clicks_var(cl, tmp, cid_arenas),
     }
+}
+
+#[cfg(test)]
+#[inline]
+fn sort_and_dedup_clicks_var(
+    cl: &mut [CompactClick<u64>],
+    tmp: &mut ArenaVec<'_, CompactClick<u64>>,
+    cid_arenas: &[&[u8]],
+) -> usize {
+    let n = cl.len();
+    if n <= 1 {
+        return n;
+    }
+    sort_clicks_var_only(cl, tmp, cid_arenas);
     let mut w = 1usize;
     let mut prev_cid = unsafe { cl.get_unchecked(0).cid };
     for r in 1..n {
@@ -3002,22 +3505,21 @@ fn aggregate_person<P: GroupProfile>(
         let cs = unsafe { *w.ck_off.get_unchecked(pi) } as usize;
         let ce = unsafe { *w.ck_off.get_unchecked(pi + 1) } as usize;
         let raw_len = ce - cs;
-        let len = if raw_len <= 1 {
-            raw_len
-        } else if unsafe { *w.ck_has_long.get_unchecked(pi) } == 0 {
-            sort_and_dedup_clicks(&mut w.cl_buf[cs..ce], &mut w.cl_tmp)
-        } else {
-            sort_and_dedup_clicks_var(&mut w.cl_buf[cs..ce], &mut w.cl_tmp, wlc_ref)
-        };
-        w.nc += len;
-        (cs, len)
+        if raw_len > 1 {
+            if unsafe { *w.ck_has_long.get_unchecked(pi) } == 0 {
+                sort_clicks_only(&mut w.cl_buf[cs..ce], &mut w.cl_tmp);
+            } else {
+                sort_clicks_var_only(&mut w.cl_buf[cs..ce], &mut w.cl_tmp, wlc_ref);
+            }
+        }
+        w.nc += raw_len;
+        (cs, raw_len)
     } else {
         (0, 0)
     };
     w.profile.end(GroupPhase::Sort);
 
-    w.assists.s_start.clear();
-    w.assists.s_day.clear();
+    w.assists.clear_sessions();
     let mut cj = cl_st;
     let cl_end = cl_st + cl_len;
     let saved_cl = if cl_len > 0 {
@@ -3332,7 +3834,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(24);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -3639,10 +4141,11 @@ fn group_fused_hybrid<P: GroupProfile>(
 
                 let use_dense = w.dense.enabled();
                 let mut ev_st = 0usize;
+                let mut id_tmp = [0u8; 33];
                 for pi in 0..np {
                     let entry = unsafe { *w.long_map.entries.get_unchecked(pi) };
                     let ev_cnt = entry.count as usize;
-                    let id_bytes = unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref) };
+                    let id_bytes = unsafe { resolve_long_user(entry.tag, wlu_ref, ls_ref, &mut id_tmp) };
                     aggregate_person(
                         w,
                         pi,
@@ -3762,11 +4265,11 @@ pub(super) fn run_to_output(
     let p2_total = p2_short + p2_long;
     debug_assert!(p2_total <= 1024);
 
-    // Tight capacity sizing: `est / p_total * 1.12` keeps both short and long buckets near full
-    // without allocating half-empty partitions (~170 MiB smaller than naive max-share sizing).
-    let cap_tok = (est_ev * 112 / 100 / workers / p1_total).max(16) + 16;
-    let cap_b = (est_ev * 96 / 100 * 112 / 100 / workers / p2_total).max(16) + 32;
-    let cap_ck = (est_ck * 112 / 100 / workers / p2_total).max(16) + 32;
+    // Tight capacity sizing (`1.06×` + `16` slack) cuts unused `populate_write` faults
+    // while `Sinks::flush_overflow` (`ov.reserve(128)`) handles any rare tail spill cleanly.
+    let cap_tok = (est_ev * 106 / 100 / workers / p1_total).max(16) + 16;
+    let cap_b = (est_ev * 95 / 100 * 106 / 100 / workers / p2_total).max(16) + 16;
+    let cap_ck = (est_ck * 106 / 100 / workers / p2_total).max(16) + 16;
 
     let tok_bytes = Sinks::<Tok, SWCB_TOK>::arena_bytes(p1_total, cap_tok);
     let b_bytes = Sinks::<RecB<u64>, SWCB_B>::arena_bytes(p2_total, cap_b);
@@ -3805,6 +4308,7 @@ pub(super) fn run_to_output(
     };
     let lc_bytes = if lc_est.saturating_mul(workers) <= MAX_LONG_ARENA_TOTAL { lc_est } else { 0 };
 
+    let do_populate = env_usize("INGEST_POPULATE").unwrap_or(1) != 0;
     let parse_bytes = (tok_bytes + le_bytes + b_bytes + ck_bytes + lu_bytes + lc_bytes) * workers;
 
     let (arena, parse_mapping) = SinkArena::new(parse_bytes).split_at(parse_bytes);
@@ -3869,9 +4373,62 @@ pub(super) fn run_to_output(
     let p1_long_shift = 64 - p1_long_bits;
     let p2_short_shift = 63 - p2_short_bits;
     let p2_long_shift = 64 - p2_long_bits;
-    let do_populate = env_usize("INGEST_POPULATE").unwrap_or(1) != 0;
+    // Auto-select zero-copy whole-file mmap: mode 6 (parallel MADV_DONTNEED after parse)
+    // for <= 3.5 GiB inputs, mode 4 (streaming per-file munmap) for huge 60M+ inputs to cap RSS.
+    let default_mmap = if ctx.event_bytes + ctx.click_bytes <= 3_500_000_000 { 6 } else { 4 };
+    let mmap_mode = env_usize("INGEST_MMAP_INPUT").unwrap_or(default_mmap);
     let files = &ctx.files;
     let main_chunks = &ctx.main_chunks;
+
+    let mut mapped_slots: Vec<Mutex<Option<scan::MappedFile>>> = Vec::new();
+    let mut mapped_files: Vec<Option<scan::MappedFile>> = Vec::new();
+    let mut chunk_rem: Vec<AtomicU32> = Vec::new();
+    if mmap_mode != 0 {
+        let advice = match mmap_mode {
+            2 => 2, // MADV_SEQUENTIAL
+            _ => 0,
+        };
+        if mmap_mode == 4 {
+            let mut counts = vec![0u32; files.len()];
+            for c in main_chunks.iter() {
+                counts[c.file as usize] += 1;
+            }
+            chunk_rem = counts.into_iter().map(AtomicU32::new).collect();
+            mapped_slots = files
+                .iter()
+                .map(|fi| {
+                    let m = if fi.kind != Kind::Links {
+                        scan::MappedFile::open(&fi.handle, fi.len, advice)
+                    } else {
+                        None
+                    };
+                    Mutex::new(m)
+                })
+                .collect();
+        } else {
+            mapped_files = files
+                .iter()
+                .map(|fi| {
+                    if fi.kind != Kind::Links {
+                        scan::MappedFile::open(&fi.handle, fi.len, advice)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if mmap_mode == 3 || mmap_mode == 7 {
+                let mf_ref = &mapped_files;
+                par::run(workers, mf_ref.len(), |_| (), |_, fi| {
+                    if let Some(ref m) = mf_ref[fi] {
+                        m.populate_read();
+                    }
+                });
+            }
+        }
+    }
+    let mf_ref = &mapped_files;
+    let ms_ref = &mapped_slots;
+    let crem_ref = &chunk_rem;
 
     let mut states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
         workers,
@@ -3908,7 +4465,53 @@ pub(super) fn run_to_output(
                 return;
             }
             let c = main_chunks[i];
-            let fi = &files[c.file as usize];
+            let fidx = c.file as usize;
+            let fi = &files[fidx];
+            if mmap_mode == 4 {
+                // SAFETY: slot stays Some until the last chunk decrements crem_ref[fidx] to 1.
+                let used_map = {
+                    let guard = ms_ref[fidx].lock().unwrap();
+                    let ptr_opt = guard.as_ref().map(|m| m as *const scan::MappedFile);
+                    drop(guard);
+                    if let Some(mptr) = ptr_opt {
+                        let m = unsafe { &*mptr };
+                        if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
+                            match fi.kind {
+                                Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
+                                Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
+                                Kind::Links => unreachable!(),
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if !used_map {
+                    let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
+                    match fi.kind {
+                        Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
+                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, buf, lo, hi, st),
+                        Kind::Links => unreachable!(),
+                    }
+                }
+                if crem_ref[fidx].fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let _ = ms_ref[fidx].lock().unwrap().take();
+                }
+                return;
+            }
+            if let Some(Some(m)) = mf_ref.get(fidx) {
+                if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
+                    match fi.kind {
+                        Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
+                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
+                        Kind::Links => unreachable!(),
+                    }
+                    return;
+                }
+            }
             let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
             match fi.kind {
                 Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
@@ -3922,6 +4525,17 @@ pub(super) fn run_to_output(
             st.ck.finish();
         },
     );
+    if mmap_mode == 6 || mmap_mode == 7 {
+        let mf_ref = &mapped_files;
+        par::run(workers, mf_ref.len(), |_| (), |_, fi| {
+            if let Some(ref m) = mf_ref[fi] {
+                m.release_pages();
+            }
+        });
+        drop(mapped_files);
+    } else if mmap_mode == 1 || mmap_mode == 2 || mmap_mode == 3 {
+        drop(mapped_files);
+    }
     ctx.prefetch.stop();
     for (tid, (_, buf)) in states.iter_mut().enumerate() {
         *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
@@ -3957,7 +4571,7 @@ pub(super) fn run_to_output(
         par::run(
             threads,
             p1_total,
-            |_| (DedupTable::default(), Vec::<u32>::new(), Vec::<u64>::new()),
+            |_| (DedupTable::default(), Vec::<DedupBucket32>::new(), Vec::<u64>::new()),
             |(table, t32, t64), p| {
                 let mut slices = [(&[][..], 0, 0); MAX_THREADS * 2];
                 let (active, total) = partition_slices(&tok_sinks, p, &mut slices);
@@ -4085,10 +4699,28 @@ mod tests {
             let s = format!("u{i:032x}");
             offs.push((ab.push_bytes(s.as_bytes()).unwrap(), s));
         }
-        let sl = ab.as_slice();
-        for (off, s) in &offs {
-            assert_eq!(unsafe { get_long_bytes(sl, *off) }, s.as_bytes());
+        // Also test uppercase hex, all-digit hex, mixed-case verbatim, and non-hex verbatim!
+        for raw in [
+            "U0123456789ABCDEF0123456789ABCDEF",
+            "u01234567890123456789012345678901",
+            "u0123456789abcdef0123456789ABCDEf",
+            "u_not_hex_at_all_33_bytes_long___",
+            "arbitrary_utf8_é_long_user_identifier_44B",
+        ] {
+            offs.push((ab.push_bytes(raw.as_bytes()).unwrap(), raw.to_string()));
         }
+        let sl = ab.as_slice();
+        let mut tmp = [0u8; 33];
+        for (off, s) in &offs {
+            let got = unsafe { resolve_arena_bytes(sl, *off, &mut tmp) };
+            assert_eq!(got, s.as_bytes());
+            assert!(unsafe { eq_arena_raw(sl, *off, s.as_bytes()) });
+            assert_eq!(unsafe { hash_arena_rec(sl, *off) }, hash_long(s.as_bytes()));
+        }
+        // Verify all-digits has canonical tag bit7 == 0 and mixed-case is NOT packed.
+        assert!(unsafe { try_pack_hex33(b"u01234567890123456789012345678901".as_ptr()) }.unwrap().0 == b'u');
+        assert!(unsafe { try_pack_hex33(b"u0123456789ABCDEF0123456789ABCDEF".as_ptr()) }.unwrap().0 == (b'u' | 0x80));
+        assert!(unsafe { try_pack_hex33(b"u0123456789abcdef0123456789ABCDEf".as_ptr()) }.is_none());
         assert!(ab.into_arena().is_some());
     }
 
@@ -4140,8 +4772,9 @@ mod tests {
                 canon_q_of(canon, 63 - ps_bits),
                 p2_short + (h1 >> (64 - pl_bits)) as usize
             );
+            let mut tmp = [0u8; 33];
             assert_eq!(
-                unsafe { resolve_long_user(canon, &[], &bl.link_store) },
+                unsafe { resolve_long_user(canon, &[], &bl.link_store, &mut tmp) },
                 b"u00000000000000000000000000000001"
             );
             let lq_t2 = (h2 >> (64 - pl_bits)) as usize;
@@ -4193,6 +4826,43 @@ mod tests {
             for i in 0..k {
                 assert_eq!(a[i].ts, b[i].ts, "ts mismatch at i={i}, n={n}");
                 assert!(eq_cid(a[i].cid, b[i].cid, &arenas), "cid mismatch at i={i}, n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_eid_short_and_short_group_map_exact() {
+        let mut buf = [0u8; 64];
+        for s in [
+            &b"e1234567"[..],
+            &b"e12345678"[..],
+            &b"e0000000"[..],
+            &b"ezzzzzzzz"[..],
+            &b"a"[..],
+            &b"ab"[..],
+            &b"abcdefg"[..],
+        ] {
+            buf.fill(b',');
+            buf[..s.len()].copy_from_slice(s);
+            let k_slow = unsafe { encode_eid_short(buf.as_ptr(), s.len()).unwrap() };
+            assert_ne!(k_slow, 0);
+            if s.len() == 8 || s.len() == 9 {
+                let end4 = unsafe { buf.as_ptr().add(8).cast::<u32>().read_unaligned() };
+                let (k_fast, l_fast) = unsafe { try_encode_eid_89(buf.as_ptr(), end4, s.len() == 8).unwrap() };
+                assert_eq!(l_fast, s.len());
+                assert_eq!(k_fast, k_slow);
+            }
+        }
+        // Injectivity check across distinct 1..=9 byte ASCII strings
+        let mut seen = std::collections::HashSet::new();
+        for len in 1..=9 {
+            for c in [b'0', b'a', b'z', b'A', b'~'] {
+                let mut s = vec![b'e'; len];
+                s[len - 1] = c;
+                buf.fill(0);
+                buf[..len].copy_from_slice(&s);
+                let k = unsafe { encode_eid_short(buf.as_ptr(), len).unwrap() };
+                assert!(seen.insert(k), "collision on {s:?}");
             }
         }
     }

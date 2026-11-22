@@ -675,6 +675,7 @@ impl SinkArena {
         self.base
     }
 
+    #[allow(dead_code)]
     pub(super) fn merge(a: Self, b: Self) -> Self {
         assert!(Arc::ptr_eq(&a.mapping, &b.mapping));
         assert_eq!(unsafe { a.base.add(a.bytes) }, b.base);
@@ -922,7 +923,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let slice = unsafe { std::slice::from_raw_parts(line_ptr, Self::per_line()) };
         let ov = unsafe { self.over.get_unchecked_mut(p) };
         if ov.is_empty() {
-            ov.reserve(1024);
+            ov.reserve(128);
         }
         ov.extend_from_slice(slice);
     }

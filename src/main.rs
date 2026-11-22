@@ -1,5 +1,6 @@
 mod aggregate;
 mod ingest;
+mod pgo_gen;
 mod types;
 
 use std::path::PathBuf;
@@ -17,6 +18,10 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+    if let Ok(p) = std::env::var("INGEST_GEN_PGO") {
+        pgo_gen::generate(std::path::Path::new(&p));
+        return;
+    }
     if let Ok(p) = std::env::var("INGEST_BENCH") {
         ingest::bench(std::path::Path::new(&p));
         return;

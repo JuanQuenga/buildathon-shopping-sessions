@@ -169,6 +169,14 @@ impl DateTable {
         let ea = self.entries.get_unchecked(Self::slot_at(a));
         let pb = ld8(b);
         let db = b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
+        if (pa == pb) & (da == db) {
+            if (ea.a == pa) & (ea.ddt == da) {
+                let (event, ingest) = Self::clock_pair(a, b)?;
+                let ds = ea.day_sec as i64;
+                return Some((ds + event, ds + ingest));
+            }
+            return Some((civil19_sec_cold(a)?, civil19_sec_cold(b)?));
+        }
         let eb = self.entries.get_unchecked(Self::slot_at(b));
         if (ea.a == pa) & (ea.ddt == da) & (eb.a == pb) & (eb.ddt == db) {
             let (event, ingest) = Self::clock_pair(a, b)?;
