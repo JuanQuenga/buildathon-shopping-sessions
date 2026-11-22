@@ -48,12 +48,37 @@ const LINK_LONG_BIT: u64 = 1u64 << 62;
 const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
-// With p1_total = p2_total = 576 (512 short + 64 long), active SWCB during Events is
-// 576 * (256 + 192) = 252 KiB/worker = 504 KiB/SMT pair (fits Cascade Lake 1 MiB L2 cleanly)
-// with 16 records/flush for both `Tok` (16B) and `RecB12` (12B).
+// With split `parse_events -> dedup -> parse_clicks`, active SWCB during Events is ONLY
+// `tok` + `b` = 576 * (256 + 192) = 252 KiB/worker (504 KiB/SMT pair + 128 KiB LongUserCache =
+// 632 KiB/SMT pair, leaving >380 KiB L2 headroom on Cascade Lake!), while during Clicks ONLY
+// `ck` is live = 576 * 384 = 216 KiB/worker (432 KiB/SMT pair, halving click flush mispredicts!).
 const SWCB_TOK: usize = 256;
 const SWCB_B: usize = 192;
-const SWCB_CK: usize = 192;
+const SWCB_CK: usize = 384;
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline]
+unsafe fn vl_cmpeq_epi8_mask16(a: __m128i, b: __m128i) -> u32 {
+    _mm_cmpeq_epi8_mask(a, b) as u32
+}
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline]
+unsafe fn vl_mask_cmpeq_epi8_mask16(k: u16, a: __m128i, b: __m128i) -> u32 {
+    _mm_mask_cmpeq_epi8_mask(k, a, b) as u32
+}
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline]
+unsafe fn vl_cmpeq_epi8_mask32(a: __m256i, b: __m256i) -> u32 {
+    _mm256_cmpeq_epi8_mask(a, b)
+}
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline]
+unsafe fn vl_mask_cmpeq_epi8_mask32(k: u32, a: __m256i, b: __m256i) -> u32 {
+    _mm256_mask_cmpeq_epi8_mask(k, a, b)
+}
 
 /// 12-byte packed surviving event (-25% parse/reloc arena & DRAM bandwidth vs 16B `RecB`):
 /// bit 31 == 0 => non-purchase event with inline `ts = ts_or_purch` (`cc = 0`);
@@ -498,25 +523,41 @@ impl ArenaBytes {
     }
 }
 
-/// Per-worker L2-resident (32 KiB) direct-mapped cache deduplicating repeated long `user_id`s.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct PackedCacheSlot {
+    hi: u64,
+    lo: u64,
+    off: u32,
+    tag: u8, // 0 = empty; packed33 tags are always >= 0x30
+}
+
+/// Per-worker L2-resident (64 KiB) inline-value cache deduplicating repeated long `user_id`s
+/// with ZERO random arena chases on hit while keeping Events SWCB + cache < 1 MiB/SMT pair!
 struct LongUserCache {
-    slots: Vec<(u32, u32)>, // (hash_hi32 | 1, arena_off)
+    slots: Vec<PackedCacheSlot>,
+    verb: Vec<(u32, u32)>,
 }
 
 impl LongUserCache {
-    const CAP: usize = 4096;
+    const CAP: usize = 2048;
     const MASK: usize = Self::CAP - 1;
+    const VERB_CAP: usize = 2048;
+    const VERB_MASK: usize = Self::VERB_CAP - 1;
 
     fn new() -> Self {
-        Self { slots: vec![(0, 0); Self::CAP] }
+        Self { slots: vec![PackedCacheSlot::default(); Self::CAP], verb: Vec::new() }
     }
 
     #[allow(dead_code)]
     #[inline(always)]
     fn intern_vec(&mut self, arena: &mut Vec<u8>, s: &[u8], uh: u64) -> Option<u32> {
+        if self.verb.is_empty() {
+            self.verb.resize(Self::VERB_CAP, (0, 0));
+        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::MASK;
-        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::VERB_MASK;
+        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { get_long_bytes(arena, slot.1) } == s {
             return Some(slot.1);
         }
@@ -534,14 +575,13 @@ impl LongUserCache {
         lo: u64,
         uh: u64,
     ) -> Option<u32> {
-        let fp = ((uh >> 32) as u32) | 1;
         let idx = (uh as usize) & Self::MASK;
         let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-        if slot.0 == fp && unsafe { eq_arena_packed(arena.as_slice(), slot.1, tag, hi, lo) } {
-            return Some(slot.1);
+        if (slot.tag == tag) & (slot.hi == hi) & (slot.lo == lo) {
+            return Some(slot.off);
         }
         let off = arena.push_packed33(tag, hi, lo)?;
-        *slot = (fp, off);
+        *slot = PackedCacheSlot { hi, lo, off, tag };
         Some(off)
     }
 
@@ -552,9 +592,12 @@ impl LongUserCache {
                 return self.intern_arena_packed33(arena, tag, hi, lo, uh);
             }
         }
+        if self.verb.is_empty() {
+            self.verb.resize(Self::VERB_CAP, (0, 0));
+        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::MASK;
-        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::VERB_MASK;
+        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { eq_arena_raw(arena.as_slice(), slot.1, s) } {
             return Some(slot.1);
         }
@@ -1169,23 +1212,70 @@ struct Tail {
 }
 
 #[inline(always)]
-unsafe fn tail(p: *const u8) -> Option<Tail> {
+unsafe fn tail_impl<const VL: bool>(p: *const u8) -> Option<Tail> {
     let bytes = _mm256_loadu_si256(p.cast::<__m256i>());
-    let lf_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8))) as u32;
+    let lf_mask = if VL {
+        vl_cmpeq_epi8_mask32(bytes, _mm256_set1_epi8(b'\n' as i8))
+    } else {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8))) as u32
+    };
     if lf_mask == 0 {
         return None;
     }
     let lf = lf_mask.trailing_zeros();
     let lf_bit = lf_mask & lf_mask.wrapping_neg();
     let mask = lf_bit - 1;
-    let commas =
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8))) as u32 & mask;
+    let commas = if VL {
+        vl_mask_cmpeq_epi8_mask32(mask, bytes, _mm256_set1_epi8(b',' as i8))
+    } else {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8))) as u32 & mask
+    };
     if commas.count_ones() != 1 {
         return None;
     }
-    let quotes =
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))) as u32 & mask;
+    let quotes = if VL {
+        vl_mask_cmpeq_epi8_mask32(mask, bytes, _mm256_set1_epi8(b'"' as i8))
+    } else {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))) as u32 & mask
+    };
     Some(Tail { commas, lf_bit, lf: lf as usize, quotes })
+}
+
+#[inline(always)]
+unsafe fn tail(p: *const u8) -> Option<Tail> {
+    tail_impl::<false>(p)
+}
+
+/// 128-bit fast-path tail scanner for `view`/`cart` (99.0% of tails are <= 16 bytes!),
+/// falling back to 32-byte `tail_impl::<VL>` only for the rare 1% longer tails.
+#[inline(always)]
+unsafe fn tail_vc<const VL: bool>(p: *const u8) -> Option<Tail> {
+    let v16 = _mm_loadu_si128(p.cast::<__m128i>());
+    let lf16 = if VL {
+        vl_cmpeq_epi8_mask16(v16, _mm_set1_epi8(b'\n' as i8))
+    } else {
+        _mm_movemask_epi8(_mm_cmpeq_epi8(v16, _mm_set1_epi8(b'\n' as i8))) as u32
+    };
+    if lf16 != 0 {
+        let lf = lf16.trailing_zeros();
+        let lf_bit = lf16 & lf16.wrapping_neg();
+        let mask = lf_bit - 1;
+        let commas = if VL {
+            vl_mask_cmpeq_epi8_mask16(mask as u16, v16, _mm_set1_epi8(b',' as i8))
+        } else {
+            _mm_movemask_epi8(_mm_cmpeq_epi8(v16, _mm_set1_epi8(b',' as i8))) as u32 & mask
+        };
+        if commas.count_ones() != 1 {
+            return None;
+        }
+        let quotes = if VL {
+            vl_mask_cmpeq_epi8_mask16(mask as u16, v16, _mm_set1_epi8(b'"' as i8))
+        } else {
+            _mm_movemask_epi8(_mm_cmpeq_epi8(v16, _mm_set1_epi8(b'"' as i8))) as u32 & mask
+        };
+        return Some(Tail { commas, lf_bit, lf: lf as usize, quotes });
+    }
+    tail_impl::<VL>(p)
 }
 
 impl Tail {
@@ -1306,7 +1396,7 @@ impl ShortRelocMap {
             self.mask = 0;
             return;
         }
-        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
+        let cap = pairs.len().next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, RelocBucket::default());
         self.mask = cap - 1;
@@ -1336,8 +1426,7 @@ impl ShortRelocMap {
         if hit { Some(v) } else { None }
     }
 
-    /// Branchless bucket-0 lookup (97% of lookups finish without branching; kills ~450k/M
-    /// random 39%/61% relocation mispredicts!).
+    /// Branchless bucket-0 lookup (99%+ of lookups at 25% load finish without branching).
     #[inline(always)]
     fn get_branchless(&self, raw_mixed: u64) -> (bool, u64) {
         let slot = (raw_mixed as usize) & self.mask;
@@ -1397,7 +1486,7 @@ impl LongRelocMap {
             self.wide_hash = false;
             return;
         }
-        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
+        let cap = pairs.len().next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, LongRelocBucket::default());
         self.mask = cap - 1;
@@ -2685,7 +2774,7 @@ unsafe fn parse_purchase_tail(
 }
 
 #[inline(always)]
-unsafe fn event_hybrid<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
+unsafe fn event_hybrid<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool, const VL: bool>(
     rows: &ParseRowsH<'_>,
     p: *const u8,
     st: &mut ParseStateH,
@@ -2742,7 +2831,7 @@ unsafe fn event_hybrid<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
         masked ^ *PARSE_LUTS.vc_cart.get_unchecked(eq),
     ) {
         let p = after_ingest.add(5 + eq + eq);
-        let tail = tail(p)?;
+        let tail = tail_vc::<VL>(p)?;
         let prod_nonempty = tail.wrapping_view_cart()?;
         let valid = valid_time & prod_nonempty;
         let ts_or_purch = if SHORT_WIN || !valid || (ts_rel as i32) >= 0 {
@@ -2878,7 +2967,7 @@ fn event_slow_hybrid(
 }
 
 #[inline(always)]
-unsafe fn click_hybrid(
+unsafe fn click_hybrid<const VL: bool>(
     rows: &ParseRowsH<'_>,
     p: *const u8,
     st: &mut ParseStateH,
@@ -2888,18 +2977,35 @@ unsafe fn click_hybrid(
     let (cp, _, _, cq) = open(p);
     let cv = _mm_loadu_si128(cp.cast::<__m128i>());
     const CAMP_DELIM: [i8; 2] = [b',' as i8, b'"' as i8];
-    let v_delim = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq)));
-    let delim_mask = _mm_movemask_epi8(v_delim) as u32;
-    if delim_mask == 0 {
-        return None;
-    }
-    let clen = delim_mask.trailing_zeros() as usize;
-    let inside = _bzhi_u32(u32::MAX, clen as u32);
-    let v_other = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq ^ 1)));
-    let v_nls = _mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8));
-    let all_special =
-        _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(v_delim, v_other), v_nls)) as u32;
-    if ((all_special & inside) != 0) | ((cq != 0) & (*cp.add(clen + 1) != b',')) {
+    let (clen, bad_inside) = if VL {
+        let delim_mask = vl_cmpeq_epi8_mask16(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq)));
+        if delim_mask == 0 {
+            return None;
+        }
+        let clen = delim_mask.trailing_zeros() as usize;
+        let inside = _bzhi_u32(u32::MAX, clen as u32) as u16;
+        let other_m = vl_mask_cmpeq_epi8_mask16(
+            inside,
+            cv,
+            _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq ^ 1)),
+        );
+        let nl_m = vl_mask_cmpeq_epi8_mask16(inside, cv, _mm_set1_epi8(b'\n' as i8));
+        (clen, (other_m | nl_m) != 0)
+    } else {
+        let v_delim = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq)));
+        let delim_mask = _mm_movemask_epi8(v_delim) as u32;
+        if delim_mask == 0 {
+            return None;
+        }
+        let clen = delim_mask.trailing_zeros() as usize;
+        let inside = _bzhi_u32(u32::MAX, clen as u32);
+        let v_other = _mm_cmpeq_epi8(cv, _mm_set1_epi8(*CAMP_DELIM.get_unchecked(cq ^ 1)));
+        let v_nls = _mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8));
+        let all_special =
+            _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(v_delim, v_other), v_nls)) as u32;
+        (clen, (all_special & inside) != 0)
+    };
+    if bad_inside | ((cq != 0) & (*cp.add(clen + 1) != b',')) {
         return None;
     }
     let after_camp = cp.add(clen + 1 + cq);
@@ -2974,8 +3080,8 @@ fn click_slow_hybrid(
     lf + 1
 }
 
-#[inline(never)]
-fn parse_events_buf_hybrid_impl<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
+#[inline(always)]
+unsafe fn parse_events_loop<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool, const VL: bool>(
     rows: &ParseRowsH<'_>,
     buf: &[u8],
     lo: usize,
@@ -2987,43 +3093,96 @@ fn parse_events_buf_hybrid_impl<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>
     }
     assert!(hi < u32::MAX as usize && buf.len() >= hi + scan::PAD && buf[hi - 1] == b'\n');
     let base = buf.as_ptr();
-    let mut p = unsafe { base.add(lo) };
-    let end = unsafe { base.add(hi) };
+    let mut p = base.add(lo);
+    let end = base.add(hi);
     while p < end {
-        p = unsafe {
-            match event_hybrid::<WS_WHOLE_SEC, SHORT_WIN>(rows, p, st) {
-                Some(next) => next,
-                None => base.add(event_slow_hybrid(rows, buf, p.offset_from(base) as usize, hi, st)),
-            }
+        p = match event_hybrid::<WS_WHOLE_SEC, SHORT_WIN, VL>(rows, p, st) {
+            Some(next) => next,
+            None => base.add(event_slow_hybrid(rows, buf, p.offset_from(base) as usize, hi, st)),
         };
     }
 }
 
+#[inline(never)]
+fn parse_events_buf_hybrid_impl<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
+    rows: &ParseRowsH<'_>,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    st: &mut ParseStateH,
+) {
+    unsafe { parse_events_loop::<WS_WHOLE_SEC, SHORT_WIN, false>(rows, buf, lo, hi, st) };
+}
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline(never)]
+unsafe fn parse_events_buf_hybrid_impl_vl<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
+    rows: &ParseRowsH<'_>,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    st: &mut ParseStateH,
+) {
+    parse_events_loop::<WS_WHOLE_SEC, SHORT_WIN, true>(rows, buf, lo, hi, st);
+}
+
 #[inline(always)]
 fn parse_events_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
-    if rows.ws_whole_sec && rows.win_len_ms <= i32::MAX as u64 {
+    if super::use_avx512vl() {
+        unsafe {
+            if rows.ws_whole_sec && rows.win_len_ms <= i32::MAX as u64 {
+                parse_events_buf_hybrid_impl_vl::<true, true>(rows, buf, lo, hi, st);
+            } else {
+                parse_events_buf_hybrid_impl_vl::<false, false>(rows, buf, lo, hi, st);
+            }
+        }
+    } else if rows.ws_whole_sec && rows.win_len_ms <= i32::MAX as u64 {
         parse_events_buf_hybrid_impl::<true, true>(rows, buf, lo, hi, st);
     } else {
         parse_events_buf_hybrid_impl::<false, false>(rows, buf, lo, hi, st);
     }
 }
 
-#[inline(never)]
-fn parse_clicks_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+#[inline(always)]
+unsafe fn parse_clicks_loop<const VL: bool>(
+    rows: &ParseRowsH<'_>,
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    st: &mut ParseStateH,
+) {
     if lo >= hi {
         return;
     }
     assert!(hi < u32::MAX as usize && buf.len() >= hi + scan::PAD && buf[hi - 1] == b'\n');
     let base = buf.as_ptr();
-    let mut p = unsafe { base.add(lo) };
-    let end = unsafe { base.add(hi) };
+    let mut p = base.add(lo);
+    let end = base.add(hi);
     while p < end {
-        p = unsafe {
-            match click_hybrid(rows, p, st) {
-                Some(next) => next,
-                None => base.add(click_slow_hybrid(rows, buf, p.offset_from(base) as usize, hi, st)),
-            }
+        p = match click_hybrid::<VL>(rows, p, st) {
+            Some(next) => next,
+            None => base.add(click_slow_hybrid(rows, buf, p.offset_from(base) as usize, hi, st)),
         };
+    }
+}
+
+#[inline(never)]
+fn parse_clicks_buf_hybrid_avx2(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+    unsafe { parse_clicks_loop::<false>(rows, buf, lo, hi, st) };
+}
+
+#[target_feature(enable = "avx512bw,avx512vl")]
+#[inline(never)]
+unsafe fn parse_clicks_buf_hybrid_vl(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+    parse_clicks_loop::<true>(rows, buf, lo, hi, st);
+}
+
+#[inline(always)]
+fn parse_clicks_buf_hybrid(rows: &ParseRowsH<'_>, buf: &[u8], lo: usize, hi: usize, st: &mut ParseStateH) {
+    if super::use_avx512vl() {
+        unsafe { parse_clicks_buf_hybrid_vl(rows, buf, lo, hi, st) };
+    } else {
+        parse_clicks_buf_hybrid_avx2(rows, buf, lo, hi, st);
     }
 }
 
@@ -3394,15 +3553,15 @@ fn relocate_hybrid(
         .iter()
         .map(|s| s.len[p2_short..].iter().map(|&x| x as usize).sum::<usize>())
         .sum();
-    let cap_rb_s = (short_ev * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rb_s = (short_ev * 52 / 100 / threads / p2_short).max(16) + 16;
     let cap_rb_l = if long_ev > 0 {
-        (long_ev * 65 / 100 / threads / p2_long).max(16) + 16
+        (long_ev * 58 / 100 / threads / p2_long).max(16) + 16
     } else {
         16
     };
-    let cap_rc_s = (short_ck * 62 / 100 / threads / p2_short).max(16) + 16;
+    let cap_rc_s = (short_ck * 52 / 100 / threads / p2_short).max(16) + 16;
     let cap_rc_l = if long_ck > 0 {
-        (long_ck * 65 / 100 / threads / p2_long).max(16) + 16
+        (long_ck * 58 / 100 / threads / p2_long).max(16) + 16
     } else {
         16
     };
@@ -5264,7 +5423,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(8);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -5494,22 +5653,22 @@ pub(super) fn run_to_output(
     let short_eid_pct = 100usize.saturating_sub(sample.long_eid_pct);
     let short_user_pct = 100usize.saturating_sub(sample.long_user_pct);
     let cap_tok_s = if short_eid_pct > 0 {
-        (est_ev * short_eid_pct / 100 / p1_short * 110 / 100 / workers).max(16) + 16
+        (est_ev * short_eid_pct / 100 / p1_short * 108 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_tok_l = if sample.long_eid_pct > 0 {
-        (est_ev * sample.long_eid_pct / 100 / p1_long * 115 / 100 / workers).max(16) + 16
+        (est_ev * sample.long_eid_pct / 100 / p1_long * 112 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_b_s = if short_user_pct > 0 {
-        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 110 / 100 / workers).max(16) + 32
+        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 108 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_b_l = if sample.long_user_pct > 0 {
-        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 118 / 100 / workers).max(16) + 32
+        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 114 / 100 / workers).max(16) + 32
     } else {
         16
     };
@@ -5562,7 +5721,10 @@ pub(super) fn run_to_output(
     let lc_bytes = if lc_est.saturating_mul(workers) <= MAX_LONG_ARENA_TOTAL { lc_est } else { 0 };
 
     let do_populate = env_usize("INGEST_POPULATE").unwrap_or(1) != 0;
-    let parse_bytes = (tok_bytes + le_bytes + b_bytes + ck_bytes + lu_bytes + lc_bytes) * workers;
+    // Split `parse_events -> dedup -> parse_clicks` so `ck_sinks` + `long_cids` recycle the
+    // already-faulted `tok + long_eids` arena after dedup (cuts peak RSS ~150 MB on 20M / ~450 MB
+    // on 60M, removes ~38k page faults, and eliminates `ck.swcb` L2 pressure during event parsing!).
+    let parse_bytes = (tok_bytes + le_bytes + b_bytes + lu_bytes) * workers;
 
     let (arena, parse_mapping) = SinkArena::new(parse_bytes).split_at(parse_bytes);
     let (mut tokens, mut arena) = arena.split_at((tok_bytes + le_bytes) * workers);
@@ -5594,20 +5756,13 @@ pub(super) fn run_to_output(
         };
         tokens = rest;
         let (b, rest) = arena.split_at(b_bytes);
-        let (ck, rest) = rest.split_at(ck_bytes);
         let (lu, rest) = if lu_bytes > 0 {
             let (a, r) = rest.split_at(lu_bytes);
             (Some(a), r)
         } else {
             (None, rest)
         };
-        let (lc, rest) = if lc_bytes > 0 {
-            let (a, r) = rest.split_at(lc_bytes);
-            (Some(a), r)
-        } else {
-            (None, rest)
-        };
-        slices.push(Mutex::new(Some((tok, le, b, ck, lu, lc))));
+        slices.push(Mutex::new(Some((tok, le, b, lu))));
         arena = rest;
     }
 
@@ -5634,6 +5789,15 @@ pub(super) fn run_to_output(
     let mmap_mode = env_usize("INGEST_MMAP_INPUT").unwrap_or(0);
     let files = &ctx.files;
     let main_chunks = &ctx.main_chunks;
+    let mut ev_chunks = Vec::with_capacity(main_chunks.len());
+    let mut ck_chunks = Vec::new();
+    for &c in main_chunks.iter() {
+        match files[c.file as usize].kind {
+            Kind::Events => ev_chunks.push(c),
+            Kind::Clicks => ck_chunks.push(c),
+            Kind::Links => unreachable!(),
+        }
+    }
 
     let mut mapped_slots: Vec<Mutex<Option<scan::MappedFile>>> = Vec::new();
     let mut mapped_files: Vec<Option<scan::MappedFile>> = Vec::new();
@@ -5686,26 +5850,26 @@ pub(super) fn run_to_output(
     let crem_ref = &chunk_rem;
     let est_purch_cap = (est_ev / 25 / workers).max(1024);
 
-    let mut states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
+    let ev_chunks_ref = &ev_chunks;
+    let states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
         workers,
-        main_chunks.len(),
+        ev_chunks_ref.len(),
         |tid| {
-            let (tok, le, b, ck, lu, lc) = slices[tid].lock().unwrap().take().unwrap();
+            let (tok, le, b, lu) = slices[tid].lock().unwrap().take().unwrap();
             if do_populate {
                 tok.populate_write();
                 b.populate_write();
-                ck.populate_write();
             }
             (
                 ParseStateH {
                     tid,
                     tok: Sinks::in_arena_split(p1_short, p1_long, cap_tok_s, cap_tok_l, tok),
                     b: Sinks::in_arena_split(p2_short, p2_long, cap_b_s, cap_b_l, b),
-                    ck: Sinks::in_arena_split(p2_short, p2_long, cap_ck_s, cap_ck_l, ck),
+                    ck: Sinks::empty(),
                     purch: Vec::with_capacity(est_purch_cap),
                     long_eids: le.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
                     long_users: lu.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
-                    long_cids: lc.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
+                    long_cids: ArenaBytes::new_heap(0),
                     user_cache: LongUserCache::new(),
                     p1_short,
                     p1_short_shift,
@@ -5721,11 +5885,10 @@ pub(super) fn run_to_output(
             if flag.get().is_some() {
                 return;
             }
-            let c = main_chunks[i];
+            let c = ev_chunks_ref[i];
             let fidx = c.file as usize;
             let fi = &files[fidx];
             if mmap_mode == 4 {
-                // SAFETY: slot stays Some until the last chunk decrements crem_ref[fidx] to 1.
                 let used_map = {
                     let guard = ms_ref[fidx].lock().unwrap();
                     let ptr_opt = guard.as_ref().map(|m| m as *const scan::MappedFile);
@@ -5733,11 +5896,7 @@ pub(super) fn run_to_output(
                     if let Some(mptr) = ptr_opt {
                         let m = unsafe { &*mptr };
                         if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
-                            match fi.kind {
-                                Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
-                                Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
-                                Kind::Links => unreachable!(),
-                            }
+                            parse_events_buf_hybrid(&rows, slice, lo, hi, st);
                             true
                         } else {
                             false
@@ -5748,11 +5907,7 @@ pub(super) fn run_to_output(
                 };
                 if !used_map {
                     let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
-                    match fi.kind {
-                        Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
-                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, buf, lo, hi, st),
-                        Kind::Links => unreachable!(),
-                    }
+                    parse_events_buf_hybrid(&rows, buf, lo, hi, st);
                 }
                 if crem_ref[fidx].fetch_sub(1, Ordering::AcqRel) == 1 {
                     let _ = ms_ref[fidx].lock().unwrap().take();
@@ -5761,66 +5916,44 @@ pub(super) fn run_to_output(
             }
             if let Some(Some(m)) = mf_ref.get(fidx) {
                 if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
-                    match fi.kind {
-                        Kind::Events => parse_events_buf_hybrid(&rows, slice, lo, hi, st),
-                        Kind::Clicks => parse_clicks_buf_hybrid(&rows, slice, lo, hi, st),
-                        Kind::Links => unreachable!(),
-                    }
+                    parse_events_buf_hybrid(&rows, slice, lo, hi, st);
                     return;
                 }
             }
             let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
-            match fi.kind {
-                Kind::Events => parse_events_buf_hybrid(&rows, buf, lo, hi, st),
-                Kind::Clicks => parse_clicks_buf_hybrid(&rows, buf, lo, hi, st),
-                Kind::Links => unreachable!(),
-            }
+            parse_events_buf_hybrid(&rows, buf, lo, hi, st);
         },
         |(st, _)| {
             st.tok.finish();
             st.b.finish();
-            st.ck.finish();
         },
     );
-    if mmap_mode == 6 || mmap_mode == 7 {
-        let mf_ref = &mapped_files;
-        par::run(workers, mf_ref.len(), |_| (), |_, fi| {
-            if let Some(ref m) = mf_ref[fi] {
-                m.release_pages();
-            }
-        });
-        drop(mapped_files);
-    } else if mmap_mode == 1 || mmap_mode == 2 || mmap_mode == 3 {
-        drop(mapped_files);
-    }
-    ctx.prefetch.stop();
-    for (tid, (_, buf)) in states.iter_mut().enumerate() {
-        *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
-    }
     if let Some(n) = flag.get() {
+        ctx.prefetch.stop();
+        let mut states = states;
+        for (tid, (_, buf)) in states.iter_mut().enumerate() {
+            *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
+        }
         par::drop_par(workers, states);
         drop(parse_mapping);
         return Err(n);
     }
-    tm.lap("parse");
+    tm.lap("parse-ev");
 
     let mut tok_sinks = Vec::with_capacity(states.len());
     let mut b_sinks = Vec::with_capacity(states.len());
-    let mut ck_sinks = Vec::with_capacity(states.len());
     let mut worker_purch = Vec::with_capacity(states.len());
     let mut long_eids = Vec::with_capacity(states.len());
-    let mut worker_long_users = Vec::with_capacity(states.len());
-    let mut worker_long_cids = Vec::with_capacity(states.len());
+    let mut ck_carry: Vec<Mutex<Option<(ArenaBytes, LongUserCache, Vec<u8>)>>> =
+        Vec::with_capacity(states.len());
     let mut ne_raw = 0usize;
-    for (st, _) in states {
+    for (st, buf) in states {
         ne_raw += st.tok.len.iter().map(|&x| x as usize).sum::<usize>();
         tok_sinks.push(st.tok);
         b_sinks.push(st.b);
-        ck_sinks.push(st.ck);
         worker_purch.push(st.purch);
         long_eids.push(st.long_eids);
-        worker_long_users.push(st.long_users);
-        worker_long_cids.push(st.long_cids);
+        ck_carry.push(Mutex::new(Some((st.long_users, st.user_cache, buf))));
     }
 
     let dead = DeadEvents::new(&b_sinks, p2_total, threads);
@@ -5845,8 +5978,8 @@ pub(super) fn run_to_output(
             },
         );
     }
-    // Rejoin `tok` + `long_eids` back into ONE contiguous huge-page arena per worker!
-    let group_scratch: Vec<SinkArena> = tok_sinks
+    // Rejoin `tok` + `long_eids` back into ONE contiguous already-faulted arena per worker!
+    let free_arenas: Vec<SinkArena> = tok_sinks
         .into_iter()
         .zip(long_eids)
         .map(|(tok_s, le)| {
@@ -5858,6 +5991,162 @@ pub(super) fn run_to_output(
         })
         .collect();
     tm.lap("dedup");
+
+    // Stage 2B: Parse clicks directly into recycled already-faulted `tok + long_eids` pages!
+    let (ck_sinks, worker_long_users, worker_long_cids, group_scratch) = if ck_chunks.is_empty() {
+        let mut wlu = Vec::with_capacity(workers);
+        let mut wlc = Vec::with_capacity(workers);
+        for (tid, slot) in ck_carry.into_iter().enumerate() {
+            let (lu, _uc, buf) = slot.into_inner().unwrap().take().unwrap();
+            *ctx.readers[tid].lock().unwrap() = buf;
+            wlu.push(lu);
+            wlc.push(ArenaBytes::new_heap(0));
+        }
+        (Vec::new(), wlu, wlc, free_arenas)
+    } else {
+        let mut ck_slices = Vec::with_capacity(workers);
+        let mut rem_arenas = Vec::with_capacity(free_arenas.len());
+        let mut fa_iter = free_arenas.into_iter();
+        for _ in 0..workers {
+            let (ck_a, lc_a, needs_pop) = if let Some(orig) = fa_iter.next() {
+                if ck_bytes + lc_bytes <= orig.bytes() {
+                    let (ck_a, rest) = orig.split_at(ck_bytes);
+                    let (lc_a, rem) = if lc_bytes > 0 {
+                        let (a, r) = rest.split_at(lc_bytes);
+                        (Some(a), r)
+                    } else {
+                        (None, rest)
+                    };
+                    rem_arenas.push(rem);
+                    (ck_a, lc_a, false)
+                } else {
+                    rem_arenas.push(orig);
+                    let ck_a = SinkArena::new(ck_bytes);
+                    let lc_a = if lc_bytes > 0 { Some(SinkArena::new(lc_bytes)) } else { None };
+                    (ck_a, lc_a, do_populate)
+                }
+            } else {
+                let ck_a = SinkArena::new(ck_bytes);
+                let lc_a = if lc_bytes > 0 { Some(SinkArena::new(lc_bytes)) } else { None };
+                (ck_a, lc_a, do_populate)
+            };
+            ck_slices.push(Mutex::new(Some((ck_a, lc_a, needs_pop))));
+        }
+        rem_arenas.extend(fa_iter);
+
+        let ck_chunks_ref = &ck_chunks;
+        let ck_carry_ref = &ck_carry;
+        let ck_slices_ref = &ck_slices;
+        let mut ck_states: Vec<(ParseStateH, Vec<u8>)> = par::run_fini(
+            workers,
+            ck_chunks_ref.len(),
+            |tid| {
+                let (ck_a, lc_a, needs_pop) = ck_slices_ref[tid].lock().unwrap().take().unwrap();
+                let (lu, uc, buf) = ck_carry_ref[tid].lock().unwrap().take().unwrap();
+                if needs_pop {
+                    ck_a.populate_write();
+                }
+                (
+                    ParseStateH {
+                        tid,
+                        tok: Sinks::empty(),
+                        b: Sinks::empty(),
+                        ck: Sinks::in_arena_split(p2_short, p2_long, cap_ck_s, cap_ck_l, ck_a),
+                        purch: Vec::new(),
+                        long_eids: ArenaBytes::new_heap(0),
+                        long_users: lu,
+                        long_cids: lc_a.map_or_else(|| ArenaBytes::new_heap(0), ArenaBytes::in_arena),
+                        user_cache: uc,
+                        p1_short,
+                        p1_short_shift,
+                        p1_long_shift,
+                        p2_short,
+                        p2_short_shift,
+                        p2_long_shift,
+                    },
+                    buf,
+                )
+            },
+            |(st, buf), i| {
+                if flag.get().is_some() {
+                    return;
+                }
+                let c = ck_chunks_ref[i];
+                let fidx = c.file as usize;
+                let fi = &files[fidx];
+                if mmap_mode == 4 {
+                    let used_map = {
+                        let guard = ms_ref[fidx].lock().unwrap();
+                        let ptr_opt = guard.as_ref().map(|m| m as *const scan::MappedFile);
+                        drop(guard);
+                        if let Some(mptr) = ptr_opt {
+                            let m = unsafe { &*mptr };
+                            if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
+                                parse_clicks_buf_hybrid(&rows, slice, lo, hi, st);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !used_map {
+                        let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
+                        parse_clicks_buf_hybrid(&rows, buf, lo, hi, st);
+                    }
+                    if crem_ref[fidx].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        let _ = ms_ref[fidx].lock().unwrap().take();
+                    }
+                    return;
+                }
+                if let Some(Some(m)) = mf_ref.get(fidx) {
+                    if let Some((slice, lo, hi)) = scan::chunk_in_mapped(m, c) {
+                        parse_clicks_buf_hybrid(&rows, slice, lo, hi, st);
+                        return;
+                    }
+                }
+                let (lo, hi) = scan::read_chunk(&fi.handle, fi.len, c, buf);
+                parse_clicks_buf_hybrid(&rows, buf, lo, hi, st);
+            },
+            |(st, _)| {
+                st.ck.finish();
+            },
+        );
+        for (tid, (_, buf)) in ck_states.iter_mut().enumerate() {
+            *ctx.readers[tid].lock().unwrap() = std::mem::take(buf);
+        }
+        if let Some(n) = flag.get() {
+            ctx.prefetch.stop();
+            par::drop_par(workers, ck_states);
+            drop(b_sinks);
+            drop(rem_arenas);
+            drop(parse_mapping);
+            return Err(n);
+        }
+        let mut cks = Vec::with_capacity(workers);
+        let mut wlu = Vec::with_capacity(workers);
+        let mut wlc = Vec::with_capacity(workers);
+        for (st, _) in ck_states {
+            cks.push(st.ck);
+            wlu.push(st.long_users);
+            wlc.push(st.long_cids);
+        }
+        (cks, wlu, wlc, rem_arenas)
+    };
+    if mmap_mode == 6 || mmap_mode == 7 {
+        let mf_ref = &mapped_files;
+        par::run(workers, mf_ref.len(), |_| (), |_, fi| {
+            if let Some(ref m) = mf_ref[fi] {
+                m.release_pages();
+            }
+        });
+        drop(mapped_files);
+    } else if mmap_mode == 1 || mmap_mode == 2 || mmap_mode == 3 {
+        drop(mapped_files);
+    }
+    ctx.prefetch.stop();
+    tm.lap("parse-ck");
 
     let (reloc_b, reloc_c, dead, group_scratch) = if links.has_links {
         let wlu_slices: Vec<&[u8]> = worker_long_users.iter().map(ArenaBytes::as_slice).collect();

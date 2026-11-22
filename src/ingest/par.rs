@@ -621,7 +621,7 @@ struct SwcbLine<const SWCB: usize>([u8; SWCB]);
 /// full cache lines of non-temporal stores.
 pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     base: *mut T,
-    arena: SinkArena,
+    arena: Option<SinkArena>,
     n_short: usize,
     cap_short: usize,
     cap_long: usize,
@@ -677,7 +677,7 @@ impl SinkArena {
     /// Falls back silently to demand paging on older kernels (EINVAL).
     pub(super) fn populate_write(&self) {
         const MADV_POPULATE_WRITE: i32 = 23;
-        const CHUNK: usize = 16 << 20;
+        const CHUNK: usize = 4 << 20;
         let lo = (self.base as usize).next_multiple_of(4096);
         let hi = (self.base as usize + self.bytes) & !4095;
         let mut off = lo;
@@ -910,7 +910,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let long_base = n_short * cs;
         Sinks {
             base: arena.base.cast(),
-            arena,
+            arena: Some(arena),
             n_short,
             cap_short: cs,
             cap_long: cl,
@@ -918,6 +918,20 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
             swcb: vec![SwcbLine([0u8; SWCB]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    pub(super) fn empty() -> Self {
+        Sinks {
+            base: std::ptr::null_mut(),
+            arena: None,
+            n_short: 0,
+            cap_short: 0,
+            cap_long: 0,
+            long_adj: 0,
+            swcb: Vec::new(),
+            len: Vec::new(),
+            over: Vec::new(),
         }
     }
 
@@ -954,7 +968,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     }
 
     pub(super) fn into_arena(self) -> SinkArena {
-        self.arena
+        self.arena.expect("Sinks::into_arena on empty Sinks")
     }
 
     /// Append to partition `p`'s SWCB. When full, stream it to the arena or

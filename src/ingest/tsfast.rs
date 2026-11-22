@@ -124,8 +124,7 @@ impl DateTable {
         let pv = _mm_loadu_si128(p.cast::<__m128i>());
         let mask11 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0);
         if _mm_testz_si128(_mm_xor_si128(ev, pv), mask11) != 0 {
-            let day_sec = (_mm_extract_epi32::<3>(ev) as u32) as i64;
-            return Self::clock_sec(p).map(|sec| sec + day_sec);
+            return Self::clock_sec(p).map(|sec| sec + e.day_sec as i64);
         }
         civil19_sec_cold(p)
     }

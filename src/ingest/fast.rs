@@ -829,6 +829,16 @@ struct DedupTable {
     t64: Vec<u64>,
 }
 
+#[inline(always)]
+pub(super) fn use_avx512vl() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_usize("INGEST_AVX512VL").unwrap_or(0) != 0
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
+}
+
 impl DedupTable {
     fn mark_losers<R: Candidate>(
         &mut self, active: &[(&[R], u32, u32)], total: usize, mut lose: impl FnMut(u32, u32, &R),
@@ -2851,7 +2861,7 @@ fn emit_session_c<K: Key, const HAS_CLICKS: bool>(
         let mut j = *cj;
         let mut lts = *last_ts;
         let mut gf = *grp_first;
-        // Two branchless steps handle 0, 1, or 2 click advances per session with zero mispredicts.
+        // Four branchless steps handle 0..=4 click advances per session with zero mispredicts.
         let ct0 = unsafe { cl_buf.get_unchecked(j).ts };
         let take0 = ct0 <= s_ck;
         let upd0 = take0 & (ct0 != lts);
@@ -2865,6 +2875,20 @@ fn emit_session_c<K: Key, const HAS_CLICKS: bool>(
         lts = std::hint::select_unpredictable(upd1, ct1, lts);
         gf = std::hint::select_unpredictable(upd1, j, gf);
         j += usize::from(take1);
+
+        let ct2 = unsafe { cl_buf.get_unchecked(j).ts };
+        let take2 = ct2 <= s_ck;
+        let upd2 = take2 & (ct2 != lts);
+        lts = std::hint::select_unpredictable(upd2, ct2, lts);
+        gf = std::hint::select_unpredictable(upd2, j, gf);
+        j += usize::from(take2);
+
+        let ct3 = unsafe { cl_buf.get_unchecked(j).ts };
+        let take3 = ct3 <= s_ck;
+        let upd3 = take3 & (ct3 != lts);
+        lts = std::hint::select_unpredictable(upd3, ct3, lts);
+        gf = std::hint::select_unpredictable(upd3, j, gf);
+        j += usize::from(take3);
 
         if unsafe { cl_buf.get_unchecked(j).ts } <= s_ck {
             loop {
