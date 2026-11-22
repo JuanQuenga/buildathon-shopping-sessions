@@ -2,7 +2,23 @@
 
 ## Please submit
 
-- **Tag**: `candidate-15a` (branch `exp/c15-engine` from `candidate-12b2` `79d1dce`) — **End-to-end cache, instruction, branch, and teardown overhaul (`-14.4% Ir`, `-30.7% LL(6M)`, `-51.4% LL(1M)`, `-159 ms` Docker warm container wall vs `c12b2`)**.
+- **Tag**: `candidate-15b` (branch `exp/c15-engine`) — **Hybrid inline-64 + side-arena single-pass exact engine for `shopping-sessions-5` opaque variable-width IDs (`2.22×` faster local wall `1.161 -> 0.524 s`, `-52.5%` user CPU `6.31 -> 3.00 s` vs `candidate-15a` on `seed20-20m-v5`)**.
+  - **Why**: `shopping-sessions-5` gives 1/8 distinct `user_id`/`event_id`/`click_id` values a 32-char hex suffix (33 bytes total) and mandates treating IDs as opaque variable-width byte strings. `candidate-15a` (`ba527a9597`, `1.9110 s` official on `shopping-sessions-5`, Rank #13) rejected 33B IDs in `u64`/`u128` and fell back to `generic.rs` (`ev-dedup 417 ms`, `505k` faults, 0% THP).
+  - **What `candidate-15b` adds (`src/ingest/hybrid.rs`, wired in `src/ingest/fast.rs`)**:
+    1. **100% opaque variable-width ID representation (`1..∞` bytes, arbitrary UTF-8/NUL)**: keeps short IDs (`1..=9` non-NUL ASCII, 87.5% on v5) inline in `u64` with bit 63 == 0 (`mix63`/`unmix63` exact bijection on `[0, 2^63)`), and stores long/non-ASCII IDs verbatim in length-prefixed per-worker byte arenas (`long_eids`, `long_users` with 4096-slot direct-mapped dedup cache, `long_cids`) and a read-only `LinkLongStore`, referenced via tagged `u64` handles (bit 63 == 1) with 20/25/26-bit embedded hash fingerprints.
+    2. **Direct variable-width parser (`id_delim_var`)**: branchless 8/9B inline ASCII fast path + 5-instruction AVX2 opaque 33B delimiter validator (checks zero `,`/`"`/`\n`, zero charset assumption) + `scan::row_fields` fallback for any other length `1..∞`.
+    3. **Full single-pass 2 MiB THP `SinkArena` pipeline for mixed short+long IDs**: samples initial event rows (<20 µs) to size short `Tok` vs 16B `LongTok` partitions; mixed short+long union-find (`cmp_node_key` exact byte-wise ordering); hybrid `dedup` (`Tok` + `LongTok`, immediately frees `long_eids`); L2-resident `ShortRelocMap` (4-way AVX2) + `LongRelocMap`; L2-resident `ShortGroupMap` + `LongGroupMap` + `DenseSessions` + sorting networks + `FusedAssists` + `sort_and_dedup_clicks_var`. Toggle `INGEST_NO_HYBRID=1` allows instant fallback.
+  - **Same-glibc Bookworm 2.36 A/B (`seed20-20m-v5`, `CPUSET=0-3,8-11`, `NCPU=8`, `INGEST_SINK_THP=0` for clean host noise, 3 warm runs)**:
+    - `candidate-15a` (falls back to `generic.rs`): med **`1.161 s`** (`user=6.31 s`, `sys=1.67 s`, `minflt=505k`, `peak_rss=1144 MB`; `links 71 ms`, `parse 418 ms`, `dedup 417 ms`, `group+agg 243 ms`)
+    - **`candidate-15b` (`hybrid`)**: **`0.513–0.530 s` (med `0.524 s`, `-637 ms`, `2.22×` faster!)**, **`user=3.00 s` (-52.5%)**, `sys=0.90–0.98 s`, `minflt=329k`, `peak_rss=1249 MB` (`links 36 ms`, `parse 261 ms`, `dedup 20.3 ms` [20.5× faster], `relocate 55 ms`, `group+agg 119 ms` [2.04× faster]).
+  - **Cascade Lake Cachegrind (`dev-v5` 1M, `--branch-sim=yes`, `I1=32K, D1=32K, LL=6M`)**:
+    - `Ir=974.4M`, `D1m=10.30M`, `LL(6M)=2.36M`, `Bcm=6.66M` (`5.5%`).
+  - **Explicit official scorer prediction BEFORE submission**: **`0.80–0.88 s`** on `shopping-sessions-5` (vs `candidate-15a`'s `1.9110 s`, projected ~1.05 s faster -> Top 3–5; production default keeps `sink_thp=1` for clean scorer VM THP).
+  - **Verification**: 38/38 release unit tests (0 warnings), 36/36 official fixtures, 32/32 adversarial suites, `dev-v5` exact `MATCH` vs `starter-v5/dev-answer` (both `hybrid` and `INGEST_GENERIC=1`), `seed20-20m-v5` exact `MATCH` vs `c15a-generic`, all four 60M datasets exact `MATCH` (`seed60-60m` 2.86 GiB, `seed60-5kcat` 2.91 GiB, `seed60-90d` 2.92 GiB, `seed60-longids` 7.79 GiB), and clean `git archive` Docker build verified `MATCH` on `dev-v5` and `seed20-20m-v5`.
+
+### Previous submission (`candidate-15a`)
+
+- **Tag**: `candidate-15a` (branch `exp/c15-engine` from `candidate-12b2` `79d1dce`, re-scored **`1.9110 s`** on `shopping-sessions-5` Rank #13 via `generic.rs` fallback) — **End-to-end cache, instruction, branch, and teardown overhaul (`-14.4% Ir`, `-30.7% LL(6M)`, `-51.4% LL(1M)`, `-159 ms` Docker warm container wall vs `c12b2`)**.
   - **What it changes vs `candidate-12b2` (`79d1dce`, `0.6811 s`)**:
     1. **Parallel exit teardown + gated `/proc/self/smaps_rollup`**: gates `smaps_rollup` behind `INGEST_DIAG=1` (`-6.3 ms` serial) and runs parallel `madvise(MADV_DONTNEED)` across the parse mapping before exit (`post-total` teardown cut `-45 ms`).
     2. **Pre-mixed bijective `u64` keys (`mix`/`unmix`)**: stores `eid.h()` in `Tok` (zero re-hashing in `dedup`), `raw.h()`/`canon.h()` in `RecB`/`RecC`/`BucketLinks` (zero hashing in `RelocationMap` and `GroupMap<u64, true>`; exact `unmix` only once per unique person).
@@ -38,6 +54,7 @@
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
+| `candidate-15a` | `ba527a9` (`33de581`) | **1.9110 s** (`v5`) | **13 (`v5`)** | Re-scored on `shopping-sessions-5` (33B opaque IDs); fell back to `generic.rs` |
 | `candidate-12a` | `bf812eb` (`c34c244`) | **0.7205 s** | **26 (NEW BEST)** | Accepted exact output; **−99.0 ms vs 11b** from 1-variable `group+agg` rework (−35k faults, −120 MB RSS, −106 ms group sys) → proves scorer heavily charges fresh memory / minor faults (~1.1–2.8 µs/fault) |
 | `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | NEW BEST (leader 0.31 s) | Accepted exact output; direct specialized events/clicks parsers + co-partitioned L2 Links + zero-fault `tok→reloc` arena reuse (−55.7 ms vs c8) |
 | `candidate-11a` | `f6d8110` | **0.8678 s** | — | Accepted exact output; co-partitioned L2 Links + quote-bit SIMD scan + BMI2 PEXT keys (matched 0.865–0.890 s out-of-sample model prediction!) |

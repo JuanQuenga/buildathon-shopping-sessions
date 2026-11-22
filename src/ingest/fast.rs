@@ -27,6 +27,8 @@ use std::time::Instant;
 
 #[path = "direct.rs"]
 mod direct;
+#[path = "hybrid.rs"]
+mod hybrid;
 
 const WEEK_MS: i64 = 7 * ts::DAY_MS;
 const WEEK_MS_U32: u32 = WEEK_MS as u32;
@@ -249,6 +251,12 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) -> Resu
         };
 
         let plan = PartitionPlan::new(&ctx, threads);
+        if std::env::var("INGEST_NO_HYBRID").as_deref() != Ok("1") {
+            match hybrid::run_to_output(&mut ctx, threads, &plan, output_dir, &mut tm) {
+                Ok(mapping) => return Ok(mapping),
+                Err(_) => return Err(()),
+            }
+        }
         match ingest_compact(&mut ctx, threads, &plan, &mut tm) {
             Ok(deduped) => {
                 let prehashed = deduped.prehashed;
