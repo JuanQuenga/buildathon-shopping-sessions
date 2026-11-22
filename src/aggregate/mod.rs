@@ -45,6 +45,15 @@ pub struct CampCell {
     pub assisted: i64,
 }
 
+/// Compact 16-byte credited metrics cell (sessions/purchasing fit in u32 per worker).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CreditCell {
+    pub sessions: u32,
+    pub purchasing: u32,
+    pub revenue: i64,
+}
+
 /// One campaign_daily row. `campaign == campaigns.len()` means `organic`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CampRow {
@@ -92,104 +101,139 @@ pub fn day_of(ts: i64) -> i32 {
     ts.div_euclid(DAY_MS) as i32
 }
 
-/// Campaign x day accumulator: dense over the window's days, sparse overflow otherwise.
+/// Campaign x day accumulator: dense split credit (16B) + assisted (4B, L2-hot!),
+/// sparse overflow otherwise.
 pub struct CampStore {
     pub day0: i32,
     pub ndays: u32,
-    pub dense: Vec<CampCell>,
+    pub credit: Vec<CreditCell>,
+    pub assisted: Vec<u32>,
     pub sparse: HashMap<(u32, i32), CampCell>,
 }
 
 impl CampStore {
     pub fn new(ncamp_total: usize, day0: i32, ndays: u32) -> Self {
-        // Cap dense size (~32 MB per worker); beyond that everything goes sparse.
-        let (ndays, dense) = match ncamp_total.checked_mul(ndays as usize) {
-            Some(n) if n <= (1 << 20) => (ndays, vec![CampCell::default(); n]),
-            _ => (0, Vec::new()),
+        // Cap dense size (~20 MB per worker); beyond that everything goes sparse.
+        let (ndays, credit, assisted) = match ncamp_total.checked_mul(ndays as usize) {
+            Some(n) if n <= (1 << 20) => (ndays, vec![CreditCell::default(); n], vec![0u32; n]),
+            _ => (0, Vec::new(), Vec::new()),
         };
         CampStore {
             day0,
             ndays,
-            dense,
+            credit,
+            assisted,
             sparse: HashMap::new(),
         }
     }
     #[inline(always)]
-    pub fn cell(&mut self, camp: u32, day: i32) -> &mut CampCell {
+    pub fn add_credit(&mut self, camp: u32, day: i32, rev: i64) {
         let di = day.wrapping_sub(self.day0) as u32;
         if di < self.ndays {
-            unsafe { self.dense.get_unchecked_mut(camp as usize * self.ndays as usize + di as usize) }
+            let idx = camp as usize * self.ndays as usize + di as usize;
+            let c = unsafe { self.credit.get_unchecked_mut(idx) };
+            c.sessions += 1;
+            if rev != 0 {
+                c.purchasing += 1;
+                c.revenue += rev;
+            }
         } else {
-            self.sparse.entry((camp, day)).or_default()
+            let c = self.sparse.entry((camp, day)).or_default();
+            c.sessions += 1;
+            if rev != 0 {
+                c.purchasing += 1;
+                c.revenue += rev;
+            }
+        }
+    }
+    #[inline(always)]
+    pub fn add_assisted(&mut self, camp: u32, day: i32, count: u32) {
+        let di = day.wrapping_sub(self.day0) as u32;
+        if di < self.ndays {
+            let idx = camp as usize * self.ndays as usize + di as usize;
+            unsafe { *self.assisted.get_unchecked_mut(idx) += count };
+        } else {
+            self.sparse.entry((camp, day)).or_default().assisted += i64::from(count);
         }
     }
 
     #[inline(always)]
-    pub fn dense_row(&mut self, camp: u32) -> Option<&mut [CampCell]> {
+    pub fn assisted_row(&mut self, camp: u32) -> Option<&mut [u32]> {
         let width = self.ndays as usize;
         if width == 0 {
             return None;
         }
         let base = camp as usize * width;
-        Some(&mut self.dense[base..base + width])
+        Some(unsafe { self.assisted.get_unchecked_mut(base..base + width) })
     }
 
     /// # Safety
     /// The campaign and relative day must be in the campaign table and window.
     #[inline(always)]
-    pub unsafe fn cell_in_window(&mut self, camp: u32, rel_day: usize) -> &mut CampCell {
+    pub unsafe fn add_credit_in_window(&mut self, camp: u32, rel_day: usize, rev: i64) {
         if self.ndays != 0 {
             debug_assert!(rel_day < self.ndays as usize);
             let index = camp as usize * self.ndays as usize + rel_day;
-            unsafe { self.dense.get_unchecked_mut(index) }
+            let c = unsafe { self.credit.get_unchecked_mut(index) };
+            c.sessions += 1;
+            if rev != 0 {
+                c.purchasing += 1;
+                c.revenue += rev;
+            }
         } else {
             let day = self.day0.wrapping_add(rel_day as i32);
-            self.sparse.entry((camp, day)).or_default()
+            let c = self.sparse.entry((camp, day)).or_default();
+            c.sessions += 1;
+            if rev != 0 {
+                c.purchasing += 1;
+                c.revenue += rev;
+            }
         }
     }
 }
 
 /// Merge per-worker `CampStore`s into non-empty `CampRow`s.
 pub fn merge_camps(stores: impl IntoIterator<Item = CampStore>) -> Vec<CampRow> {
-    let mut merged: Option<CampStore> = None;
+    let mut day0 = 0i32;
+    let mut ndays = 0u32;
+    let mut dense: Vec<CampCell> = Vec::new();
+    let mut sparse: HashMap<(u32, i32), CampCell> = HashMap::new();
     for camp in stores {
-        match merged.as_mut() {
-            None => merged = Some(camp),
-            Some(m) => {
-                for (d, s) in m.dense.iter_mut().zip(camp.dense.iter()) {
-                    d.sessions += s.sessions;
-                    d.purchasing += s.purchasing;
-                    d.revenue += s.revenue;
-                    d.assisted += s.assisted;
-                }
-                for (k, s) in camp.sparse {
-                    let d = m.sparse.entry(k).or_default();
-                    d.sessions += s.sessions;
-                    d.purchasing += s.purchasing;
-                    d.revenue += s.revenue;
-                    d.assisted += s.assisted;
-                }
-            }
+        if dense.is_empty() && camp.ndays != 0 {
+            day0 = camp.day0;
+            ndays = camp.ndays;
+            dense.resize(camp.credit.len(), CampCell::default());
+        }
+        for (d, (c, &a)) in dense.iter_mut().zip(camp.credit.iter().zip(camp.assisted.iter())) {
+            d.sessions += i64::from(c.sessions);
+            d.purchasing += i64::from(c.purchasing);
+            d.revenue += c.revenue;
+            d.assisted += i64::from(a);
+        }
+        for (k, s) in camp.sparse {
+            let d = sparse.entry(k).or_default();
+            d.sessions += s.sessions;
+            d.purchasing += s.purchasing;
+            d.revenue += s.revenue;
+            d.assisted += s.assisted;
         }
     }
     let mut camp_rows = Vec::new();
-    if let Some(m) = merged {
-        let nd = m.ndays as usize;
-        if nd > 0 {
-            for (i, cell) in m.dense.iter().enumerate() {
-                if cell.sessions != 0 || cell.assisted != 0 {
-                    camp_rows.push(CampRow {
-                        campaign: (i / nd) as u32,
-                        day: m.day0 + (i % nd) as i32,
-                        cell: *cell,
-                    });
-                }
+    let nd = ndays as usize;
+    if nd > 0 {
+        for (i, cell) in dense.iter().enumerate() {
+            if cell.sessions != 0 || cell.assisted != 0 {
+                camp_rows.push(CampRow {
+                    campaign: (i / nd) as u32,
+                    day: day0 + (i % nd) as i32,
+                    cell: *cell,
+                });
             }
         }
-        for ((c, d), cell) in m.sparse {
-            if cell.sessions != 0 || cell.assisted != 0 {
-                camp_rows.push(CampRow { campaign: c, day: d, cell });
-            }
+    }
+    for ((c, d), cell) in sparse {
+        if cell.sessions != 0 || cell.assisted != 0 {
+            camp_rows.push(CampRow { campaign: c, day: d, cell });
         }
     }
     camp_rows
@@ -344,10 +388,7 @@ impl<'a> Worker<'a> {
             } else {
                 self.organic
             };
-            let cell = self.camp.cell(credit, day);
-            cell.sessions += 1;
-            cell.purchasing += (rev != 0) as i64;
-            cell.revenue += rev as i64;
+            self.camp.add_credit(credit, day, rev as i64);
 
             ud_sessions += 1;
             ud_events += nev;
@@ -422,7 +463,7 @@ impl<'a> Worker<'a> {
                 b
             };
             let day = df[di].0;
-            self.camp.cell(camp, day).assisted += (end - idx) as i64;
+            self.camp.add_assisted(camp, day, (end - idx) as u32);
             idx = end;
             di += 1;
         }

@@ -2,7 +2,8 @@
 //! bytes beyond the row, so each accepted field proves where its delimiter is.
 
 use super::{
-    parse_click, parse_event, scan, ts, tsfast, ParseRows, RecC, INVALID_CAMP, INVALID_CC,
+    fkey, flen, key_need, parse_click, parse_event, scan, ts, tsfast, Flag, ParseRows, RecC,
+    INVALID_CAMP, INVALID_CC,
 };
 use std::arch::x86_64::*;
 
@@ -11,26 +12,41 @@ unsafe fn ld8(p: *const u8) -> u64 {
     p.cast::<u64>().read_unaligned()
 }
 
-/// Locate the value and the expected closing delimiter of a comma-ended field.
+/// Locate the value and single-load `u16` closing delimiter mask/expected value.
+/// For unquoted fields: `(w & 0x00FF) == DELIM`.
+/// For quoted fields:   `(w & 0xFFFF) == [b'"', DELIM]`.
 #[inline(always)]
-unsafe fn open(p: *const u8) -> (*const u8, u8, usize) {
+unsafe fn open_delim<const DELIM: u8>(p: *const u8) -> (*const u8, u16, u16, usize) {
     let quoted = (*p == b'"') as usize;
-    (p.add(quoted), if quoted == 0 { b',' } else { b'"' }, quoted)
+    let mask = if quoted == 0 { 0x00FFu16 } else { 0xFFFFu16 };
+    let expect = if quoted == 0 { DELIM as u16 } else { u16::from_le_bytes([b'"', DELIM]) };
+    (p.add(quoted), mask, expect, quoted)
 }
 
 #[inline(always)]
-unsafe fn ends(p: *const u8, len: usize, delim: u8, quoted: usize) -> bool {
-    (*p.add(len) == delim) & ((quoted == 0) | (*p.add(len + 1) == b','))
+unsafe fn ends_delim(p: *const u8, len: usize, mask: u16, expect: u16) -> bool {
+    (p.add(len).cast::<u16>().read_unaligned() & mask) == expect
 }
 
 #[inline(always)]
-unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
-    let (p, delim, quoted) = open(p);
+unsafe fn open(p: *const u8) -> (*const u8, u16, u16, usize) {
+    open_delim::<b','>(p)
+}
+
+#[inline(always)]
+unsafe fn ends(p: *const u8, len: usize, mask: u16, expect: u16) -> bool {
+    ends_delim(p, len, mask, expect)
+}
+
+/// 9-byte-first (90%+ common case) / 8-byte ASCII ID parser terminated by `DELIM` (`,` or `\n`).
+#[inline(always)]
+unsafe fn id_delim<const DELIM: u8>(p: *const u8) -> Option<(u64, *const u8)> {
+    let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let first = *p;
     let mut tail = ld8(p.add(1));
-    let len = if ends(p, 9, delim, quoted) {
+    let len = if ends_delim(p, 9, mask, expect) {
         9
-    } else if ends(p, 8, delim, quoted) {
+    } else if ends_delim(p, 8, mask, expect) {
         tail &= 0x00FF_FFFF_FFFF_FFFF;
         8
     } else {
@@ -38,6 +54,7 @@ unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
     };
     // Accept lanes in 0x30..=0x7f in one test. The first smaller lane
     // sets its high bit on subtraction, even with cross-lane borrows.
+    // This rejects ',', '"', '\n', and NUL inside the field.
     let filled = tail | if len == 8 { 0x3000_0000_0000_0000 } else { 0 };
     if (first.wrapping_sub(0x30) >= 0x50)
         | (((filled.wrapping_sub(0x3030_3030_3030_3030) | filled) & 0x8080_8080_8080_8080) != 0)
@@ -46,6 +63,60 @@ unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
     }
     let key = (u64::from(first) << 56) | _pext_u64(tail.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
     Some((key, p.add(len + 1 + quoted)))
+}
+
+#[inline(always)]
+unsafe fn id(p: *const u8) -> Option<(u64, *const u8)> {
+    id_delim::<b','>(p)
+}
+
+/// Fast direct parser for two-column link CSVs (`user_a,user_b\n`).
+/// Falls back per row to `scan::row_fields::<2>` + `fkey`.
+#[inline]
+pub(super) fn links(
+    buf: &[u8],
+    lo: usize,
+    hi: usize,
+    flag: &Flag,
+    mut emit: impl FnMut(u64, u64),
+) {
+    if lo >= hi {
+        return;
+    }
+    assert!(hi < u32::MAX as usize && buf.len() >= hi + scan::PAD && buf[hi - 1] == b'\n');
+    let base = buf.as_ptr();
+    let mut p = unsafe { base.add(lo) };
+    let end = unsafe { base.add(hi) };
+    while p < end {
+        let fast = unsafe {
+            id_delim::<b','>(p).and_then(|(a, next)| {
+                id_delim::<b'\n'>(next).map(|(b, eol)| (a, b, eol))
+            })
+        };
+        if let Some((a, b, next)) = fast {
+            if a != b {
+                emit(a, b);
+            }
+            p = next;
+        } else {
+            let start = unsafe { p.offset_from(base) as usize };
+            let next = row_fields::<2>(buf, start, hi, |f| {
+                if flen(f[0]) == 0 || flen(f[1]) == 0 {
+                    return;
+                }
+                match (fkey::<u64>(buf, f[0]), fkey::<u64>(buf, f[1])) {
+                    (Some(a), Some(b)) => {
+                        if a != b {
+                            emit(a, b);
+                        }
+                    }
+                    (None, _) => flag.set(key_need(f[0])),
+                    (_, None) => flag.set(key_need(f[1])),
+                }
+            });
+            p = unsafe { base.add(next) };
+        }
+    }
 }
 
 struct Tail {
@@ -111,64 +182,105 @@ unsafe fn event(
 ) -> Option<*const u8> {
     let (eid, p) = id(p)?;
     let (user, p) = id(p)?;
-    let (p, delim, q) = open(p);
-    let len = if *p.add(19) == b'Z' && ends(p, 20, delim, q) {
-        20
-    } else if ends(p, 13, delim, q) {
-        13
-    } else if ends(p, 25, delim, q) {
-        25
+    let (p, mask, expect, q) = open(p);
+    let (ts_rel, ingest, valid_time, after_ingest) = if (*p.add(19) == b'Z') & ends(p, 20, mask, expect) {
+        let (ingest_p, imask, iexpect, iq) = open(p.add(21 + q));
+        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
+            return None;
+        }
+        let (ts_sec, ing) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        if ing as u64 >= u32::MAX as u64 - 1 {
+            return None;
+        }
+        let (ts_rel, ok) = if rows.ws_whole_sec {
+            let ok = (ts_sec >= rows.ws_sec) & (ts_sec < rows.we_sec) & (ing - ts_sec <= 86_400);
+            (((ts_sec - rows.ws_sec) as u32).wrapping_mul(1000), ok)
+        } else {
+            let t = ts_sec * 1000;
+            let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
+            ((t - rows.ws) as u32, ok)
+        };
+        (ts_rel, ing, ok, ingest_p.add(21 + iq))
+    } else if ends(p, 13, mask, expect) {
+        let (ingest_p, imask, iexpect, iq) = open(p.add(14 + q));
+        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
+            return None;
+        }
+        let t = rows.dt.parse_f3_13(p)?;
+        let ing = rows.dt.parse_f1_20_sec(ingest_p)?;
+        if ing as u64 >= u32::MAX as u64 - 1 {
+            return None;
+        }
+        let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
+        ((t - rows.ws) as u32, ing, ok, ingest_p.add(21 + iq))
+    } else if ends(p, 25, mask, expect) {
+        let (ingest_p, imask, iexpect, iq) = open(p.add(26 + q));
+        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
+            return None;
+        }
+        let t = rows.dt.parse_f2_25(p)?;
+        let ing = rows.dt.parse_f1_20_sec(ingest_p)?;
+        if ing as u64 >= u32::MAX as u64 - 1 {
+            return None;
+        }
+        let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
+        ((t - rows.ws) as u32, ing, ok, ingest_p.add(21 + iq))
     } else {
         return None;
     };
-    let (ingest_p, delim, q) = open(p.add(len + 1 + q));
-    if *ingest_p.add(19) != b'Z' || !ends(ingest_p, 20, delim, q) {
-        return None;
-    }
-    let (t, ingest) = if len == 20 {
-        rows.dt.parse_f1_pair(p, ingest_p)?
-    } else {
-        (rows.dt.parse(p, len)?, rows.dt.parse_f1_sec(ingest_p, 20)?)
-    };
-    if (t < rows.ws) | (t >= rows.we) {
-        return None;
-    }
-    if (ingest as u64 >= u32::MAX as u64 - 1) || ingest * 1000 - t > ts::DAY_MS {
-        return None;
-    }
-    let (p, delim, q) = open(ingest_p.add(21 + q));
+    let (p, emask, eexpect, eq) = open(after_ingest);
     let word = p.cast::<u32>().read_unaligned();
-    let (purchase, p) = if ((word == u32::from_le_bytes(*b"view"))
-        | (word == u32::from_le_bytes(*b"cart")))
-        && ends(p, 4, delim, q)
+    if ((word == u32::from_le_bytes(*b"view")) | (word == u32::from_le_bytes(*b"cart")))
+        & ends(p, 4, emask, eexpect)
     {
-        (false, p.add(5 + q))
-    } else if ld8(p) == u64::from_le_bytes(*b"purchase") && ends(p, 8, delim, q) {
-        (true, p.add(9 + q))
-    } else {
-        return None;
-    };
-    let tail = tail(p)?;
-    let (qp, qc) = tail.wrapping()?;
-    let product_len = tail.comma - 2 * qp;
-    if product_len == 0 {
-        return None;
+        let p = p.add(5 + eq);
+        let tail = tail(p)?;
+        let (qp, _) = tail.wrapping()?;
+        if valid_time & (tail.comma != 2 * qp) {
+            emit.valid(eid, (ingest + 1) as u32, user, ts_rel, 0);
+        } else {
+            emit.invalid(eid, (ingest + 1) as u32);
+        }
+        return Some(p.add(tail.lf + 1));
     }
-    let cc = if purchase {
-        let len = tail.lf - tail.comma - 1 - 2 * qc;
-        if !(1..=8).contains(&len) {
-            return None;
+    if (ld8(p) == u64::from_le_bytes(*b"purchase")) & ends(p, 8, emask, eexpect) {
+        let p = p.add(9 + eq);
+        let tail = tail(p)?;
+        let (qp, qc) = tail.wrapping()?;
+        let product_len = tail.comma - 2 * qp;
+        let mut valid = valid_time & (product_len != 0);
+        let cc = if valid {
+            let len = tail.lf - tail.comma - 1 - 2 * qc;
+            if (1..=8).contains(&len) {
+                if let Some(cents) = tsfast::digits8(p.add(tail.comma + 1 + qc), len).map(|v| v as u32) {
+                    if (1..=10_000_000).contains(&cents) {
+                        (rows.lookups.prod.get(p.add(qp), product_len) << 24) | cents
+                    } else {
+                        valid = false;
+                        0
+                    }
+                } else {
+                    valid = false;
+                    0
+                }
+            } else if len == 0 {
+                valid = false;
+                0
+            } else {
+                // > 8 digits could be leading-zero valid price like "000000000001"; let slow path handle it.
+                return None;
+            }
+        } else {
+            0
+        };
+        if valid {
+            emit.valid(eid, (ingest + 1) as u32, user, ts_rel, cc);
+        } else {
+            emit.invalid(eid, (ingest + 1) as u32);
         }
-        let cents = tsfast::digits8(p.add(tail.comma + 1 + qc), len)? as u32;
-        if !(1..=10_000_000).contains(&cents) {
-            return None;
-        }
-        (rows.lookups.prod.get(p.add(qp), product_len) << 24) | cents
-    } else {
-        0
-    };
-    emit.valid(eid, (ingest + 1) as u32, user, (t - rows.ws) as u32, cc);
-    Some(p.add(tail.lf + 1))
+        return Some(p.add(tail.lf + 1));
+    }
+    None
 }
 
 #[inline(always)]
@@ -179,24 +291,59 @@ unsafe fn click(
 ) -> Option<*const u8> {
     let (cid, p) = id(p)?;
     let (person, p) = id(p)?;
-    let tail = tail(p)?;
-    let (qc, qt) = tail.wrapping()?;
-    let end = p.add(tail.lf + 1);
-    let campaign = rows.lookups.camp.get(p.add(qc), tail.comma - 2 * qc);
-    if campaign == INVALID_CAMP {
-        return Some(end);
+    // Parse campaign_id up to ',' within 16 bytes, then parse ts directly up to '\n'.
+    // Avoids overflowing a 32-byte tail window on F2 / quoted F1 timestamps.
+    let (cp, _, _, cq) = open(p);
+    let cv = _mm_loadu_si128(cp.cast::<__m128i>());
+    let c_commas = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b',' as i8))) as u32;
+    let c_quotes = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'"' as i8))) as u32;
+    let c_nls = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8))) as u32;
+    let delim_mask = if cq == 0 { c_commas } else { c_quotes };
+    if delim_mask == 0 {
+        return None;
     }
-    let len = tail.lf - tail.comma - 1 - 2 * qt;
-    let base = rows.clicks_base();
-    if let Some(t) = rows.dt.parse(p.add(tail.comma + 1 + qt), len) {
-        if (t >= base) & (t < rows.we) {
-            emit(RecC {
-                person,
-                cid,
-                ts: (t - base) as u32,
-                campaign,
-            });
+    let clen = delim_mask.trailing_zeros() as usize;
+    let inside = (1u32 << clen) - 1;
+    if (((c_commas | c_quotes | c_nls) & inside) != 0)
+        | ((cq != 0) & (*cp.add(clen + 1) != b','))
+    {
+        return None;
+    }
+    let after_camp = cp.add(clen + 1 + cq);
+    let campaign = rows.lookups.camp.get(cp, clen);
+    if campaign == INVALID_CAMP {
+        let tv = _mm256_loadu_si256(after_camp.cast::<__m256i>());
+        let lf = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(tv, _mm256_set1_epi8(b'\n' as i8))) as u32)
+            .trailing_zeros() as usize;
+        if lf < 32 {
+            // Ensure no extra comma inside the dropped timestamp field (could be malformed quotes).
+            let m = (1u32 << lf) - 1;
+            let qc = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(tv, _mm256_set1_epi8(b'"' as i8))) as u32) & m;
+            let cc = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(tv, _mm256_set1_epi8(b',' as i8))) as u32) & m;
+            if (qc == 0) & (cc == 0) {
+                return Some(after_camp.add(lf + 1));
+            }
         }
+        return None;
+    }
+    let (tp, tmask, texpect, tq) = open_delim::<b'\n'>(after_camp);
+    let (t, end) = if (*tp.add(19) == b'Z') & ends_delim(tp, 20, tmask, texpect) {
+        (rows.dt.parse_f1_20_sec(tp)? * 1000, tp.add(21 + tq))
+    } else if ends_delim(tp, 13, tmask, texpect) {
+        (rows.dt.parse_f3_13(tp)?, tp.add(14 + tq))
+    } else if ends_delim(tp, 25, tmask, texpect) {
+        (rows.dt.parse_f2_25(tp)?, tp.add(26 + tq))
+    } else {
+        return None;
+    };
+    let base = rows.clicks_base();
+    if (t >= base) & (t < rows.we) {
+        emit(RecC {
+            person,
+            cid,
+            ts: (t - base) as u32,
+            campaign,
+        });
     }
     Some(end)
 }
@@ -359,6 +506,9 @@ mod tests {
             dt: &dt,
             ws,
             we,
+            ws_sec: ws / 1000,
+            we_sec: we / 1000,
+            ws_whole_sec: ws % 1000 == 0 && we % 1000 == 0,
             lookups: &lookups,
             plan: &plan,
             flag: &flag,

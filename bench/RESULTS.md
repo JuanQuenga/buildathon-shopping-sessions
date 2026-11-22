@@ -2,6 +2,24 @@
 
 ## Please submit
 
+- **Tag**: `candidate-15a` (branch `exp/c15-engine` from `candidate-12b2` `79d1dce`) — **End-to-end cache, instruction, branch, and teardown overhaul (`-14.4% Ir`, `-30.7% LL(6M)`, `-51.4% LL(1M)`, `-159 ms` Docker warm container wall vs `c12b2`)**.
+  - **What it changes vs `candidate-12b2` (`79d1dce`, `0.6811 s`)**:
+    1. **Parallel exit teardown + gated `/proc/self/smaps_rollup`**: gates `smaps_rollup` behind `INGEST_DIAG=1` (`-6.3 ms` serial) and runs parallel `madvise(MADV_DONTNEED)` across the parse mapping before exit (`post-total` teardown cut `-45 ms`).
+    2. **Pre-mixed bijective `u64` keys (`mix`/`unmix`)**: stores `eid.h()` in `Tok` (zero re-hashing in `dedup`), `raw.h()`/`canon.h()` in `RecB`/`RecC`/`BucketLinks` (zero hashing in `RelocationMap` and `GroupMap<u64, true>`; exact `unmix` only once per unique person).
+    3. **L2-resident `relocate` with in-place compaction & token-arena reuse**: packs `RecC` to 24B (`SWCB=192`), carves `reloc_b`+`reloc_c` out of the already-faulted `tok_sinks` huge-page arena, compacts dead+linked rows in place (eliminating `DeadClicks` and removing `dead` bitset scanning + serial popcount from `group_fused`).
+    4. **Direct parser & `links` speedups**: direct `direct::links` parser, root-min-key `uf_union_min_key` (drops `best[]` + extra `nn`-node CAS pass), single-load `u16` masked delimiter check in `direct::open_delim`/`ends_delim`, merged single-branch `view|cart` vs `purchase` path, whole-second window/late checks with SSE2 `clock_pair`, fixed 32B `tail()` overflow in `direct::click` (eliminating `click_slow` on F2/quoted timestamps), `p1_bits=10`/`p2_bits=9` + `1.08×` arena cap.
+    5. **O(N) zero-sort `DenseSessions` + branchless sorting networks + split `CampStore`**: generation-stamped bitmask 30-min bin sessionizer for dense users (`count >= 32`), Knuth 0-1-verified branchless `cmov` sorting networks for `n <= 8`, sentinel-guarded `FusedAssists` with branchless campaign stamp check, and split 16B `CreditCell` + 4B `assisted` `CampStore` (112 KiB/worker, 8× smaller).
+  - **Cascade Lake Cachegrind (`dev` 1M, `--branch-sim=yes`, `I1=32K, D1=32K`)**:
+    - `c12b2` (`0.6811 s` official): `Ir=976.1M`, `Bcm=6.33M`, `D1m=11.40M`, `LL(6M)=2.83M`, `LL(1M)=5.42M`
+    - **`candidate-15a`**: **`Ir=836.0M` (-14.4%)**, **`Bcm=6.10M` (-3.7%)**, **`D1m=9.60M` (-15.8%)**, **`LL(6M)=1.96M` (-30.7%)**, **`LL(1M)=2.63M` (-51.4%)**
+  - **Same-session interleaved Docker warm A/B (`seed20-20m`, `CPUSET=0-3,8-11`, `NCPU=8`, 3 rounds)**:
+    - `ss-test:c12b2`: container wall `1.032 / 0.781 / 0.747 s` (med **`0.781 s`**, in-proc `0.655 s`, `user=2.55–2.69 s`, `sys=2.26–3.67 s`)
+    - **`ss-test:c15a`**: container wall **`0.649 / 0.622 / 0.602 s`** (med **`0.622 s`**, best **`0.602 s`**, in-proc `0.541 / 0.520 s`, `user=2.25–2.29 s`, `sys=1.79–2.05 s`) — **`-159 ms` (-20.4%) median container wall!**
+    - Stage medians (`c12b2` → `c15a`): `links` `68 → 42 ms`, `parse` `408 → 351 ms`, `dedup` `23.0 → 16.0 ms`, `relocate` `37.6 → 32.8 ms`, `group+agg` `108 → 81.5 ms`, `exit+container` `126 → 81 ms`.
+  - **Explicit official scorer prediction BEFORE submission**: **`0.51–0.56 s`** (vs `c12b2`'s `0.6811 s`, −120 to −170 ms; all 5 Cachegrind metrics and every pipeline stage are strictly faster).
+  - **Verification**: 33/33 release unit tests (0 warnings), 36/36 official fixtures, 32/32 adversarial suites, `dev` + 6 cached 1M seeds + 2 fresh random 1M seeds, `seed20-20m` vs `oracle2`, `INGEST_GENERIC=1`, all four 60M datasets (`seed60-60m` 2.94 GiB, `seed60-5kcat` 2.98 GiB, `seed60-90d` 3.03 GiB, `seed60-longids` 5.98 GiB), and clean `git archive` Docker build verified `MATCH` on `dev` and `seed20-20m`.
+
+### Previous submission (`candidate-12b`)
 - **Tag**: `candidate-12b` (HEAD on `main`, code `4ec2aa3` on glibc bookworm) — **1-variable allocation/THP/arena-reuse/`mallopt` change ONLY on `candidate-12a` (`0.7205 s`) base** (zero algorithm change).
   - **What it changes vs `candidate-12a` (`bf812eb`, `0.7205 s`)**:
     1. **Unified 2 MiB-aligned `MADV_HUGEPAGE` arena reuse across stages**: `links-uf` reuses the `tok` arena before `parse`; `relocate` reuses the `tok` arena after `dedup`; `group+agg` reuses relocation arena tails; no mid-run `munmap` of parse arenas (`sink_thp()` fixed to always apply `MADV_HUGEPAGE` whenever THP is `always` or `madvise`).

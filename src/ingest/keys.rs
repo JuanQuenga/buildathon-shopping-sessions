@@ -25,17 +25,44 @@ pub trait Key: Copy + Eq + Ord + Default + Send + Sync + std::fmt::Debug + 'stat
         unsafe { Self::enc(b.as_ptr(), s.len()) }
     }
     fn h(self) -> u64;
+    fn lo_usize(self) -> usize;
+    fn unmix_key(self) -> Self;
     fn unpack(self, out: &mut Vec<u8>);
     /// Unpack bytes into a 16-byte stack buffer, returning the byte length.
     fn unpack_buf(self, dst: &mut [u8; 16]) -> usize;
     fn is_zero(self) -> bool;
 }
 
+const MIX_M1: u64 = 0x9E37_79B9_7F4A_7C15;
+const MIX_M2: u64 = 0xBF58_476D_1CE4_E5B9;
+
+const fn inv_odd_u64(x: u64) -> u64 {
+    let mut inv = 1u64;
+    let mut i = 0;
+    while i < 6 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(inv)));
+        i += 1;
+    }
+    inv
+}
+
+const MIX_INV1: u64 = inv_odd_u64(MIX_M1);
+const MIX_INV2: u64 = inv_odd_u64(MIX_M2);
+
 #[inline(always)]
-fn mix(x: u64) -> u64 {
-    let x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+pub fn mix(x: u64) -> u64 {
+    let x = x.wrapping_mul(MIX_M1);
+    let x = (x ^ (x >> 29)).wrapping_mul(MIX_M2);
     x ^ (x >> 32)
+}
+
+/// Exact inverse of `mix`: `unmix(mix(x)) == x` for all `u64`.
+#[inline(always)]
+pub fn unmix(x: u64) -> u64 {
+    let x = x ^ (x >> 32);
+    let x = x.wrapping_mul(MIX_INV2);
+    let x = x ^ (x >> 29) ^ (x >> 58);
+    x.wrapping_mul(MIX_INV1)
 }
 
 impl Key for u128 {
@@ -49,6 +76,14 @@ impl Key for u128 {
     #[inline(always)]
     fn h(self) -> u64 {
         mix((self as u64) ^ ((self >> 64) as u64).rotate_left(23).wrapping_mul(0xD6E8_FEB8_6659_FD93))
+    }
+    #[inline(always)]
+    fn lo_usize(self) -> usize {
+        self as usize
+    }
+    #[inline(always)]
+    fn unmix_key(self) -> Self {
+        self
     }
     fn unpack(self, out: &mut Vec<u8>) {
         wide::unpack(self, out)
@@ -93,6 +128,14 @@ impl Key for u64 {
     #[inline(always)]
     fn h(self) -> u64 {
         mix(self)
+    }
+    #[inline(always)]
+    fn lo_usize(self) -> usize {
+        self as usize
+    }
+    #[inline(always)]
+    fn unmix_key(self) -> Self {
+        unmix(self)
     }
     fn unpack(self, out: &mut Vec<u8>) {
         let mut buf = [0u8; 16];
@@ -212,6 +255,19 @@ mod tests {
             let id = vec![b'a'; len];
             assert_eq!(u64::enc_slice(&id), None);
             assert!(u128::enc_slice(&id).is_some());
+        }
+    }
+
+    #[test]
+    fn mix_unmix_bijection() {
+        let mut x = 0x1234_5678_9ABC_DEF0u64;
+        for &v in &[0u64, 1, 2, u64::MAX, 1 << 63, (1 << 63) - 1, 0x5555_5555_5555_5555] {
+            assert_eq!(unmix(mix(v)), v);
+            assert_eq!(mix(unmix(v)), v);
+        }
+        for _ in 0..1_000_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            assert_eq!(unmix(mix(x)), x);
         }
     }
 }

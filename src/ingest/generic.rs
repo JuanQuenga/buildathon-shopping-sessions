@@ -1221,7 +1221,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
             if st.len() == 1 {
                 let s0 = unsafe { *st.get_unchecked(0) };
                 if lo <= s0 && s0 <= hi {
-                    self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += 1;
+                    self.camp.add_assisted(camp, unsafe { df.get_unchecked(0).0 }, 1);
                 }
                 return;
             }
@@ -1231,7 +1231,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
                 return;
             }
             if df.len() == 1 {
-                self.camp.cell(camp, unsafe { df.get_unchecked(0).0 }).assisted += (b - a) as i64;
+                self.camp.add_assisted(camp, unsafe { df.get_unchecked(0).0 }, (b - a) as u32);
                 return;
             }
             let mut di = df.partition_point(|d| (d.1 as usize) <= a) - 1;
@@ -1243,7 +1243,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
                     b
                 };
                 let day = df[di].0;
-                self.camp.cell(camp, day).assisted += (end - idx) as i64;
+                self.camp.add_assisted(camp, day, (end - idx) as u32);
                 idx = end;
                 di += 1;
             }
@@ -1704,10 +1704,7 @@ pub fn run_to_output(data_dir: &Path, output_dir: &Path, threads: usize) {
                     } else {
                         organic
                     };
-                    let cell = w.camp.cell(credit, day);
-                    cell.sessions += 1;
-                    cell.purchasing += (rev != 0) as i64;
-                    cell.revenue += rev as i64;
+                    w.camp.add_credit(credit, day, rev as i64);
 
                     ud_sessions += 1;
                     ud_events += nev;

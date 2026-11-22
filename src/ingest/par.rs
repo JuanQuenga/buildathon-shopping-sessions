@@ -552,25 +552,48 @@ pub fn huge_free(raw: *mut u8, len: usize) {
     unsafe { munmap(raw, len) };
 }
 
-/// Two cache lines amortize each flush at the compact path's partition counts.
-const SWCB_BYTES: usize = 128;
+/// Concurrently release physical backing pages of an anonymous mapping using
+/// `MADV_DONTNEED` (which only acquires Linux's `mmap_lock` in read mode).
+pub fn release_pages_par(base: *mut u8, bytes: usize, threads: usize) {
+    const MADV_DONTNEED: i32 = 4;
+    let lo = (base as usize).next_multiple_of(4096);
+    let hi = (base as usize + bytes) & !4095;
+    if hi <= lo {
+        return;
+    }
+    let total = hi - lo;
+    if total < (16 << 20) || threads <= 1 {
+        unsafe { madvise(lo as *mut u8, total, MADV_DONTNEED) };
+        return;
+    }
+    let n = threads.min(16);
+    let stride = (total / n).next_multiple_of(4096);
+    run(n, n, |_| (), |_, i| {
+        let start = lo + i * stride;
+        if start < hi {
+            let len = (hi - start).min(stride);
+            unsafe { madvise(start as *mut u8, len, MADV_DONTNEED) };
+        }
+    });
+}
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct SwcbLine([u8; SWCB_BYTES]);
+struct SwcbLine<const SWCB: usize>([u8; SWCB]);
 
 /// Fixed-capacity per-partition append regions inside one huge-page arena,
 /// fronted by L2-resident software write-combining buffers (SWCBs) that emit
 /// full cache lines of non-temporal stores.
-pub struct Sinks<T: Copy> {
+pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     base: *mut T,
     arena: SinkArena,
     cap: usize,
-    swcb: Vec<SwcbLine>,
+    swcb: Vec<SwcbLine<SWCB>>,
     pub len: Vec<usize>,
     pub over: Vec<Vec<T>>,
 }
-unsafe impl<T: Copy + Send> Send for Sinks<T> {}
-unsafe impl<T: Copy + Sync> Sync for Sinks<T> {}
+unsafe impl<T: Copy + Send, const SWCB: usize> Send for Sinks<T, SWCB> {}
+unsafe impl<T: Copy + Sync, const SWCB: usize> Sync for Sinks<T, SWCB> {}
 
 struct SinkMapping {
     raw: *mut u8,
@@ -626,6 +649,18 @@ impl SinkArena {
                 break;
             }
             off += len;
+        }
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn release_par(&self, threads: usize) {
+        if Arc::strong_count(&self.mapping) == 1 {
+            release_pages_par(self.mapping.raw, self.mapping.len, threads);
+        } else {
+            release_pages_par(self.base, self.bytes, threads);
         }
     }
 }
@@ -774,13 +809,14 @@ impl<T> std::ops::DerefMut for ArenaVec<'_, T> {
     }
 }
 
-impl<T: Copy> Sinks<T> {
+impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     #[inline(always)]
     const fn per_line() -> usize {
         let sz = std::mem::size_of::<T>();
-        assert!(sz == 16 || sz == 32 || sz == 64);
-        assert!(std::mem::align_of::<T>() >= 16);
-        SWCB_BYTES / sz
+        assert!(SWCB % 64 == 0 && SWCB % sz == 0);
+        assert!((SWCB / sz).is_power_of_two());
+        assert!(std::mem::align_of::<T>() >= 8);
+        SWCB / sz
     }
 
     fn aligned_cap(cap: usize) -> usize {
@@ -794,7 +830,7 @@ impl<T: Copy> Sinks<T> {
             base: arena.base.cast(),
             arena,
             cap,
-            swcb: vec![SwcbLine([0u8; SWCB_BYTES]); parts],
+            swcb: vec![SwcbLine([0u8; SWCB]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
         }
@@ -810,22 +846,6 @@ impl<T: Copy> Sinks<T> {
 
     pub(super) fn into_arena(self) -> SinkArena {
         self.arena
-    }
-
-    pub(super) fn reuse_pair<U: Copy>(
-        parts: usize, cap: usize, other_cap: usize, arena: Option<SinkArena>,
-    ) -> (Self, Sinks<U>, Option<SinkArena>) {
-        let bytes = Self::arena_bytes(parts, cap);
-        let other_bytes = Sinks::<U>::arena_bytes(parts, other_cap);
-        if let Some(arena) = arena {
-            if bytes + other_bytes <= arena.bytes {
-                let (first, rest) = arena.split_at(bytes);
-                let (second, tail) = rest.split_at(other_bytes);
-                return (Self::in_arena(parts, cap, first), Sinks::in_arena(parts, other_cap, second), Some(tail));
-            }
-            return (Self::new(parts, cap), Sinks::new(parts, other_cap), Some(arena));
-        }
-        (Self::new(parts, cap), Sinks::new(parts, other_cap), None)
     }
 
     /// Append to partition `p`'s SWCB. When full, stream it to the arena or
@@ -862,7 +882,7 @@ impl<T: Copy> Sinks<T> {
                 let src = line_ptr as *const __m256i;
                 debug_assert_eq!(dst as usize & 63, 0);
                 debug_assert_eq!(src as usize & 63, 0);
-                for i in 0..(SWCB_BYTES / 32) {
+                for i in 0..(SWCB / 32) {
                     _mm256_stream_si256(dst.add(i), _mm256_load_si256(src.add(i)));
                 }
             }
@@ -875,7 +895,11 @@ impl<T: Copy> Sinks<T> {
     #[inline(never)]
     fn flush_overflow(&mut self, p: usize, line_ptr: *const T) {
         let slice = unsafe { std::slice::from_raw_parts(line_ptr, Self::per_line()) };
-        self.over[p].extend_from_slice(slice);
+        let ov = unsafe { self.over.get_unchecked_mut(p) };
+        if ov.is_empty() {
+            ov.reserve(1024);
+        }
+        ov.extend_from_slice(slice);
     }
 
     /// Flush all partially-filled SWCB lines into the arena/overflow and issue sfence.
@@ -908,6 +932,120 @@ impl<T: Copy> Sinks<T> {
 
     pub fn count(&self, p: usize) -> usize {
         self.len[p].min(self.cap) + self.over[p].len()
+    }
+
+    /// Raw disjoint mutable access to partition `p` for parallel per-partition
+    /// in-place compaction. Caller MUST ensure no two threads access the same `p`.
+    #[inline]
+    pub unsafe fn compact_part_disjoint(
+        &self,
+        p: usize,
+        mut keep: impl FnMut(usize, T) -> bool,
+    ) {
+        let arena_ptr = self.base.add(p * self.cap);
+        let len_ptr = (self.len.as_ptr() as *mut usize).add(p);
+        let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
+        let orig_len = *len_ptr;
+        let arena_len = orig_len.min(self.cap);
+        let over = &mut *over_ptr;
+        let mut w = 0usize;
+        for i in 0..arena_len {
+            let v = *arena_ptr.add(i);
+            if keep(i, v) {
+                *arena_ptr.add(w) = v;
+                w += 1;
+            }
+        }
+        let mut ow = 0usize;
+        let over_len = over.len();
+        let over_data = over.as_mut_ptr();
+        for j in 0..over_len {
+            let v = *over_data.add(j);
+            if keep(arena_len + j, v) {
+                if w < self.cap {
+                    *arena_ptr.add(w) = v;
+                    w += 1;
+                } else {
+                    *over_data.add(ow) = v;
+                    ow += 1;
+                }
+            }
+        }
+        over.truncate(ow);
+        *len_ptr = w + ow;
+    }
+
+    /// Raw disjoint mutable access to partition `p` with a 64-bit dead bitmask
+    /// (skipping dead indices without even calling `keep`). Caller MUST ensure
+    /// no two threads access the same `p`.
+    #[inline]
+    pub unsafe fn compact_part_with_dead_disjoint(
+        &self,
+        p: usize,
+        dead_words: &[std::sync::atomic::AtomicU64],
+        mut keep: impl FnMut(T) -> bool,
+    ) {
+        let arena_ptr = self.base.add(p * self.cap);
+        let len_ptr = (self.len.as_ptr() as *mut usize).add(p);
+        let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
+        let orig_len = *len_ptr;
+        let arena_len = orig_len.min(self.cap);
+        let over = &mut *over_ptr;
+        let mut w = 0usize;
+        let mut done = 0usize;
+        while done < arena_len {
+            let n = 64.min(arena_len - done);
+            let mask = dead_words.get_unchecked(done >> 6).load(Ordering::Relaxed);
+            if mask == 0 {
+                for j in 0..n {
+                    let v = *arena_ptr.add(done + j);
+                    if keep(v) {
+                        *arena_ptr.add(w) = v;
+                        w += 1;
+                    }
+                }
+            } else {
+                let mut live = !mask & (u64::MAX >> (64 - n));
+                while live != 0 {
+                    let tz = live.trailing_zeros() as usize;
+                    live &= live - 1;
+                    let v = *arena_ptr.add(done + tz);
+                    if keep(v) {
+                        *arena_ptr.add(w) = v;
+                        w += 1;
+                    }
+                }
+            }
+            done += n;
+        }
+        let mut ow = 0usize;
+        let over_len = over.len();
+        let over_data = over.as_mut_ptr();
+        let mut odone = 0usize;
+        while odone < over_len {
+            let idx = arena_len + odone;
+            let bit = idx & 63;
+            let n = (64 - bit).min(over_len - odone);
+            let mask = dead_words.get_unchecked(idx >> 6).load(Ordering::Relaxed) >> bit;
+            let mut live = !mask & (u64::MAX >> (64 - n));
+            while live != 0 {
+                let tz = live.trailing_zeros() as usize;
+                live &= live - 1;
+                let v = *over_data.add(odone + tz);
+                if keep(v) {
+                    if w < self.cap {
+                        *arena_ptr.add(w) = v;
+                        w += 1;
+                    } else {
+                        *over_data.add(ow) = v;
+                        ow += 1;
+                    }
+                }
+            }
+            odone += n;
+        }
+        over.truncate(ow);
+        *len_ptr = w + ow;
     }
 }
 

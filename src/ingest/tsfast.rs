@@ -162,8 +162,9 @@ impl DateTable {
     }
 
     /// Both fields have an independently checked F1 terminator and delimiter.
+    /// Returns `(event_epoch_sec, ingest_epoch_sec)` without multiplying by 1000.
     #[inline(always)]
-    pub(super) unsafe fn parse_f1_pair(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
+    pub(super) unsafe fn parse_f1_pair_sec(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
         let prefix = ld8(a);
         let ddt = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
         let date = self.entries.get_unchecked(Self::slot(prefix, ddt));
@@ -171,12 +172,59 @@ impl DateTable {
             if (ld8(b) == prefix) & (b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF == ddt) {
                 let (event, ingest) = Self::clock_pair(a, b)?;
                 let day = date.day_sec as i64;
-                return Some(((day + event) * 1000, day + ingest));
+                return Some((day + event, day + ingest));
             }
             let event = date.day_sec as i64 + Self::clock_sec(a)?;
-            return Some((event * 1000, self.civil19_sec(b)?));
+            return Some((event, self.civil19_sec(b)?));
         }
-        Some((civil19_sec_cold(a)? * 1000, self.civil19_sec(b)?))
+        Some((civil19_sec_cold(a)?, self.civil19_sec(b)?))
+    }
+
+    /// Direct 13-digit F3 parser (caller verified exact length 13).
+    #[inline(always)]
+    pub(super) unsafe fn parse_f3_13(&self, p: *const u8) -> Option<i64> {
+        const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
+        const DIGIT_LIMIT: u64 = 0x7676_7676_7676_7676;
+        const M5: u64 = 0x0000_00FF_FFFF_FFFF;
+        let d_hi = ld8(p).wrapping_sub(ASCII_ZERO);
+        let d_lo = ld8(p.add(5)).wrapping_sub(ASCII_ZERO);
+        let bad_hi = (d_hi.wrapping_add(DIGIT_LIMIT) | d_hi) & 0x0000_0080_8080_8080;
+        let bad_lo = (d_lo.wrapping_add(DIGIT_LIMIT) | d_lo) & 0x8080_8080_8080_8080;
+        if (bad_hi | bad_lo) == 0 {
+            let hi = swar_dec8_digits((d_hi & M5) << 24);
+            let lo = swar_dec8_digits(d_lo);
+            return Some((hi * 100_000_000 + lo) as i64);
+        }
+        None
+    }
+
+    /// Direct 25-byte F2 parser (caller verified exact length 25).
+    #[inline(always)]
+    pub(super) unsafe fn parse_f2_25(&self, p: *const u8) -> Option<i64> {
+        let s = *p.add(19);
+        if (s == b'+') | (s == b'-') {
+            let base_sec = self.civil19_sec(p)?;
+            let o = ld8(p.add(17)); // "SS+HH:MM"
+            const MO: u64 = 0xFFFF_00FF_FF00_0000;
+            if !digits_ok(o, MO) | (((o >> 40) & 0xFF) != b':' as u64) {
+                return None;
+            }
+            let oh = dig(o, 3) * 10 + dig(o, 4);
+            let om = dig(o, 6) * 10 + dig(o, 7);
+            if (oh > 23) | (om > 59) {
+                return None;
+            }
+            let off = oh * 3600 + om * 60;
+            let delta = if s == b'+' { -off } else { off };
+            return Some((base_sec + delta) * 1000);
+        }
+        parse_cold(p, 25)
+    }
+
+    /// Direct 20-byte F1 parser (caller verified exact length 20 and `*p.add(19) == b'Z'`).
+    #[inline(always)]
+    pub(super) unsafe fn parse_f1_20_sec(&self, p: *const u8) -> Option<i64> {
+        self.civil19_sec(p)
     }
 
     /// Fast path for `ingest_ts` (guaranteed valid F1): returns `Some(epoch_seconds)` if whole
