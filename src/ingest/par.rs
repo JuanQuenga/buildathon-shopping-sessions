@@ -434,8 +434,13 @@ fn thp_enabled() -> &'static str {
 
 fn sink_thp() -> bool {
     static USE_THP: OnceLock<bool> = OnceLock::new();
-    *USE_THP.get_or_init(|| {
-        std::env::var("INGEST_SINK_THP").as_deref() != Ok("0") && thp_enabled() != "never"
+    *USE_THP.get_or_init(|| match std::env::var("INGEST_SINK_THP").as_deref() {
+        Ok("0") => false,
+        Ok("1") => thp_enabled() != "never",
+        // When `thp=always`, Linux already allocates opportunistic 2 MiB THP without `MADV_HUGEPAGE`;
+        // adding `MADV_HUGEPAGE` under `defrag=madvise` forces synchronous compaction stalls (+200-470 ms!).
+        // Only issue `MADV_HUGEPAGE` when `thp=madvise` (or unreadable `/sys`).
+        _ => matches!(thp_enabled(), "madvise" | "unknown"),
     })
 }
 

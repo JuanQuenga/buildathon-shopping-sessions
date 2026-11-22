@@ -908,6 +908,38 @@ fn any_zero_u64(a: u64, b: u64) -> bool {
     r == 0
 }
 
+#[inline(never)]
+unsafe fn parse_link_ep_33(
+    p: *const u8,
+    quoted: usize,
+    tid: usize,
+    long_bytes: &mut ArenaBytes,
+    cache: &mut LongUserCache,
+    flag: &Flag,
+) -> Option<(u64, *const u8)> {
+    let b0 = *p;
+    if b0.wrapping_sub(0x30) < 0x50 {
+        if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+            let h = hash_packed_33(tag, hi, lo);
+            let Some(off) = cache.intern_arena_packed33(long_bytes, tag, hi, lo, h) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
+        }
+    }
+    if is_valid_opaque_33(p) {
+        let s = std::slice::from_raw_parts(p, 33);
+        let h = hash_long(s);
+        let Some(off) = cache.intern_arena(long_bytes, s, h) else {
+            flag.set(Need::Slow);
+            return None;
+        };
+        return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
+    }
+    None
+}
+
 #[inline(always)]
 unsafe fn parse_link_ep_delim<const DELIM: u8>(
     p: *const u8,
@@ -925,38 +957,31 @@ unsafe fn parse_link_ep_delim<const DELIM: u8>(
         return Some((mix63(key), p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
-        let b0 = *p;
-        if b0.wrapping_sub(0x30) < 0x50 {
-            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
-                let h = hash_packed_33(tag, hi, lo);
-                let Some(off) = cache.intern_arena_packed33(long_bytes, tag, hi, lo, h) else {
-                    flag.set(Need::Slow);
-                    return None;
-                };
-                return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
-            }
-        }
-        if is_valid_opaque_33(p) {
-            let s = std::slice::from_raw_parts(p, 33);
-            let h = hash_long(s);
-            let Some(off) = cache.intern_arena(long_bytes, s, h) else {
-                flag.set(Need::Slow);
-                return None;
-            };
-            return Some((make_parse_long_user(tid, h, off), p.add(34 + quoted)));
-        }
+        return parse_link_ep_33(p, quoted, tid, long_bytes, cache, flag);
     }
     None
 }
 
-#[cold]
 #[inline(never)]
-unsafe fn parse_eid_33_cold(
+unsafe fn parse_eid_33(
     p: *const u8,
     quoted: usize,
     st: &mut ParseStateH,
     flag: &Flag,
 ) -> Option<(u64, usize, *const u8)> {
+    let b0 = *p;
+    if b0.wrapping_sub(0x30) < 0x50 {
+        if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+            let eh = hash_packed_33(tag, hi, lo);
+            let Some(off) = st.long_eids.push_packed33(tag, hi, lo) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            let eid_word = ((eh as u64) << 32) | (off as u64);
+            let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
+            return Some((eid_word, eid_p, p.add(34 + quoted)));
+        }
+    }
     if !is_valid_opaque_33(p) {
         return None;
     }
@@ -981,9 +1006,8 @@ unsafe fn parse_eid_33_cold(
     Some((eid_word, eid_p, p.add(34 + quoted)))
 }
 
-#[cold]
 #[inline(never)]
-unsafe fn parse_user_33_cold_raw(
+unsafe fn parse_user_33_raw(
     p: *const u8,
     quoted: usize,
     tid: usize,
@@ -993,6 +1017,18 @@ unsafe fn parse_user_33_cold_raw(
     p2_long_shift: u32,
     flag: &Flag,
 ) -> Option<(u64, usize, *const u8)> {
+    let b0 = *p;
+    if b0.wrapping_sub(0x30) < 0x50 {
+        if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+            let uh = hash_packed_33(tag, hi, lo);
+            let Some(off) = user_cache.intern_arena_packed33(long_users, tag, hi, lo, uh) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            let q = p2_short + ((uh >> p2_long_shift) as usize);
+            return Some((make_parse_long_user(tid, uh, off), q, p.add(34 + quoted)));
+        }
+    }
     if !is_valid_opaque_33(p) {
         return None;
     }
@@ -1006,14 +1042,23 @@ unsafe fn parse_user_33_cold_raw(
     Some((make_parse_long_user(tid, uh, off), q, p.add(34 + quoted)))
 }
 
-#[cold]
 #[inline(never)]
-unsafe fn parse_cid_33_cold(
+unsafe fn parse_cid_33(
     p: *const u8,
     quoted: usize,
     st: &mut ParseClickStateH,
     flag: &Flag,
 ) -> Option<(u64, *const u8)> {
+    let b0 = *p;
+    if b0.wrapping_sub(0x30) < 0x50 {
+        if let Some((tag, hi, lo)) = try_pack_hex33(p) {
+            let Some(off) = st.long_cids.push_packed33(tag, hi, lo) else {
+                flag.set(Need::Slow);
+                return None;
+            };
+            return Some((make_long_cid(st.tid, off), p.add(34 + quoted)));
+        }
+    }
     if !is_valid_opaque_33(p) {
         return None;
     }
@@ -1042,20 +1087,7 @@ unsafe fn parse_eid_delim<const DELIM: u8>(
         return Some((eid_mixed, eid_p, p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
-        let b0 = *p;
-        if b0.wrapping_sub(0x30) < 0x50 {
-            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
-                let eh = hash_packed_33(tag, hi, lo);
-                let Some(off) = st.long_eids.push_packed33(tag, hi, lo) else {
-                    flag.set(Need::Slow);
-                    return None;
-                };
-                let eid_word = ((eh as u64) << 32) | (off as u64);
-                let eid_p = st.p1_short + ((eh >> st.p1_long_shift) as usize);
-                return Some((eid_word, eid_p, p.add(34 + quoted)));
-            }
-        }
-        return parse_eid_33_cold(p, quoted, st, flag);
+        return parse_eid_33(p, quoted, st, flag);
     }
     None
 }
@@ -1082,19 +1114,7 @@ unsafe fn parse_user_delim_raw<const DELIM: u8>(
         return Some((m, q, p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
-        let b0 = *p;
-        if b0.wrapping_sub(0x30) < 0x50 {
-            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
-                let uh = hash_packed_33(tag, hi, lo);
-                let Some(off) = user_cache.intern_arena_packed33(long_users, tag, hi, lo, uh) else {
-                    flag.set(Need::Slow);
-                    return None;
-                };
-                let q = p2_short + ((uh >> p2_long_shift) as usize);
-                return Some((make_parse_long_user(tid, uh, off), q, p.add(34 + quoted)));
-            }
-        }
-        return parse_user_33_cold_raw(
+        return parse_user_33_raw(
             p,
             quoted,
             tid,
@@ -1141,17 +1161,7 @@ unsafe fn parse_cid_delim<const DELIM: u8>(
         return Some((key, p.add(len + 1 + quoted)));
     }
     if ends_delim(p, 33, mask, expect) {
-        let b0 = *p;
-        if b0.wrapping_sub(0x30) < 0x50 {
-            if let Some((tag, hi, lo)) = try_pack_hex33(p) {
-                let Some(off) = st.long_cids.push_packed33(tag, hi, lo) else {
-                    flag.set(Need::Slow);
-                    return None;
-                };
-                return Some((make_long_cid(st.tid, off), p.add(34 + quoted)));
-            }
-        }
-        return parse_cid_33_cold(p, quoted, st, flag);
+        return parse_cid_33(p, quoted, st, flag);
     }
     None
 }
