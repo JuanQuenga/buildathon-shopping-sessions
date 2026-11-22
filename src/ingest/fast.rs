@@ -318,17 +318,18 @@ struct Deduped<K: Key> {
 
 type CanonicalPart<'a, K> = (usize, ArenaVec<'a, (K, K)>);
 
-fn read_links_u64<'a, L>(
-    ctx: &Ctx<'_>, threads: usize, tm: &mut Timer, scratch: &mut Scratch<'a>,
-    build: impl FnOnce(Vec<CanonicalPart<'a, u64>>) -> L,
-) -> Result<L, Need> {
+fn read_links_u64(
+    ctx: &Ctx<'_>, threads: usize, p2_bits: u32, tm: &mut Timer, scratch: &mut Scratch<'_>,
+) -> Result<BucketLinks, Need> {
     let flag = Flag(AtomicU8::new(0));
     let files = &ctx.files;
     let link_chunks = &ctx.link_chunks;
+    let link_bytes: u64 = files.iter().filter(|f| f.kind == Kind::Links).map(|f| f.len).sum();
+    let est_per_thr = ((link_bytes / 20) as usize / threads.max(1)).max(1024);
     let link_pairs: Vec<Vec<(u64, u64)>> = par::run(
         threads,
         link_chunks.len(),
-        |tid| (Vec::<(u64, u64)>::new(), std::mem::take(&mut *ctx.readers[tid].lock().unwrap())),
+        |tid| (Vec::<(u64, u64)>::with_capacity(est_per_thr), std::mem::take(&mut *ctx.readers[tid].lock().unwrap())),
         |(pairs, buf), i| {
             if flag.get().is_some() {
                 return;
@@ -352,9 +353,8 @@ fn read_links_u64<'a, L>(
         return Err(n);
     }
     tm.lap("links-parse");
-    let canonical = Links::canonical_pairs(&link_pairs, threads, scratch);
+    let links = Links::into_bucket_links(&link_pairs, p2_bits, threads, scratch);
     drop(link_pairs);
-    let links = build(canonical);
     tm.lap("links-uf");
     Ok(links)
 }
@@ -424,19 +424,19 @@ struct PartitionPlan {
 impl PartitionPlan {
     fn new(ctx: &Ctx<'_>, threads: usize) -> Self {
         let est_ev = (ctx.event_bytes / 75) as usize + 1024;
-        let est_ck = (ctx.click_bytes / 40) as usize + 1024;
+        let est_ck = (ctx.click_bytes / 45) as usize + 1024;
         let parse_threads = if ctx.parse_threads > 0 { ctx.parse_threads.clamp(1, MAX_THREADS) } else { threads };
         // Keep the write buffers small enough for sibling threads sharing L2,
         // and P1/P2 partitions small enough for L2-resident dedup and grouping.
-        let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 10 } else { 11 });
+        let p1_bits = ctx.p1_bits_override.unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 10 });
         let p2_bits = env_usize("INGEST_P2_BITS").map(|b| b.clamp(8, 10) as u32)
             .unwrap_or(if est_ev <= 4_000_000 { 8 } else if est_ev <= 30_000_000 { 9 } else { 10 });
         let p1 = 1 << p1_bits;
         let p2 = 1 << p2_bits;
         Self {
             parse_threads, p1_bits, p2_bits, p1, p2,
-            cap_ev: est_ev * 108 / 100 / parse_threads / p1 + 24,
-            cap_ck: est_ck * 108 / 100 / parse_threads / p2 + 24,
+            cap_ev: est_ev * 109 / 100 / parse_threads / p1 + 32,
+            cap_ck: est_ck * 109 / 100 / parse_threads / p2 + 32,
         }
     }
 }
@@ -674,15 +674,15 @@ fn ingest_to_sinks<const ALL_CAT: bool, K: Key>(
     struct DedupState<K: Key> {
         table: DedupTable,
         dead: Vec<u64>,
-        out: Sinks<RecB<K>>,
+        out: Sinks<RecB<K>, 128>,
     }
-    let b_sinks: Vec<Sinks<RecB<K>>> = par::run_fini(
+    let b_sinks: Vec<Sinks<RecB<K>, 128>> = par::run_fini(
         threads,
         p1,
         |_| DedupState {
             table: DedupTable::default(),
             dead: Vec::new(),
-            out: Sinks::<RecB<K>>::new(p2, cap_b),
+            out: Sinks::<RecB<K>, 128>::new(p2, cap_b),
         },
         |st, p| {
             let mut slices = [(&[][..], 0, 0); MAX_THREADS * 2];
@@ -954,6 +954,7 @@ struct BucketLinks {
 }
 
 impl BucketLinks {
+    #[cfg(test)]
     fn from_pairs(canon_parts: &[CanonicalPart<'_, u64>], p2_bits: u32, threads: usize) -> Self {
         let p2 = 1usize << p2_bits;
         let total: usize = canon_parts.iter().map(|x| x.1.len()).sum();
@@ -1026,39 +1027,62 @@ impl BucketLinks {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(64))]
+struct RelocBucket {
+    keys: [u64; 4],
+    vals: [u64; 4],
+}
+
+/// 4-way AVX2 open-addressed relocation table (~64 KiB L2-resident per P2 partition).
+/// Checks 4 pre-mixed keys in one AVX2 load, eliminating ~65% of branch mispredicts vs scalar probing.
 #[derive(Default)]
 struct RelocationMap {
-    entries: Vec<(u64, u64)>,
+    buckets: Vec<RelocBucket>,
     mask: usize,
 }
 
 impl RelocationMap {
     fn build(&mut self, pairs: &[(u64, u64)]) {
-        let cap = (pairs.len() * 2).next_power_of_two().max(16);
-        self.entries.clear();
-        self.entries.resize(cap, (0, 0));
+        // <= 50% slot load (>99.5% single-bucket hit/miss).
+        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
+        self.buckets.clear();
+        self.buckets.resize(cap, RelocBucket::default());
         self.mask = cap - 1;
         for &(raw_mixed, canon_mixed) in pairs {
-            let mut i = (raw_mixed as usize) & self.mask;
-            while unsafe { self.entries.get_unchecked(i).0 } != 0 {
-                i = (i + 1) & self.mask;
+            let mut slot = (raw_mixed as usize) & self.mask;
+            'ins: loop {
+                let b = unsafe { self.buckets.get_unchecked_mut(slot) };
+                for lane in 0..4 {
+                    if b.keys[lane] == 0 {
+                        b.keys[lane] = raw_mixed;
+                        b.vals[lane] = canon_mixed;
+                        break 'ins;
+                    }
+                }
+                slot = (slot + 1) & self.mask;
             }
-            unsafe { *self.entries.get_unchecked_mut(i) = (raw_mixed, canon_mixed) };
         }
     }
 
     #[inline(always)]
     fn get(&self, raw_mixed: u64) -> Option<u64> {
-        let mut i = (raw_mixed as usize) & self.mask;
+        use std::arch::x86_64::*;
+        let mut slot = (raw_mixed as usize) & self.mask;
+        let needle = unsafe { _mm256_set1_epi64x(raw_mixed as i64) };
         loop {
-            let (k, v) = unsafe { *self.entries.get_unchecked(i) };
-            if k == raw_mixed {
-                return Some(v);
+            let b = unsafe { self.buckets.get_unchecked(slot) };
+            let keys = unsafe { _mm256_load_si256(b.keys.as_ptr().cast()) };
+            let hits = unsafe {
+                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, needle)))
+            } as u32;
+            if hits != 0 {
+                return Some(unsafe { *b.vals.get_unchecked(hits.trailing_zeros() as usize) });
             }
-            if k == 0 {
+            if b.keys[3] == 0 {
                 return None;
             }
-            i = (i + 1) & self.mask;
+            slot = (slot + 1) & self.mask;
         }
     }
 }
@@ -1215,8 +1239,8 @@ fn relocate_linked(
     p2_bits: u32,
     threads: usize,
 ) -> (Vec<Sinks<RecB<u64>, 128>>, Vec<Sinks<RecC<u64>, 192>>, Vec<SinkArena>) {
-    let total_ev: usize = b_sinks.iter().map(|s| s.len.iter().sum::<usize>()).sum();
-    let total_ck: usize = ck_sinks.iter().map(|s| s.len.iter().sum::<usize>()).sum();
+    let total_ev: usize = b_sinks.iter().map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>()).sum();
+    let total_ck: usize = ck_sinks.iter().map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>()).sum();
     let cap_rb = (total_ev * 58 / 100 / threads / p2).max(16) + 16;
     let cap_rc = (total_ck * 58 / 100 / threads / p2).max(16) + 16;
     let rb_bytes = Sinks::<RecB<u64>, 128>::arena_bytes(p2, cap_rb);
@@ -1326,7 +1350,7 @@ fn ingest_single_pass(
 fn ingest_single_pass_with_limit(
     ctx: &mut Ctx<'_>, threads: usize, plan: &PartitionPlan, max_loc_idx: usize, tm: &mut Timer,
 ) -> Result<Deduped<u64>, Need> {
-    let cap_b = (plan.cap_ev - 24) * plan.p1 / plan.p2 + 32;
+    let cap_b = plan.cap_ev.saturating_sub(32) * plan.p1 / plan.p2 + 32;
     let tok_bytes = Sinks::<Tok, 128>::arena_bytes(plan.p1, plan.cap_ev);
     let event_bytes = Sinks::<RecB<u64>, 128>::arena_bytes(plan.p2, cap_b);
     let click_bytes = Sinks::<RecC<u64>, 192>::arena_bytes(plan.p2, plan.cap_ck);
@@ -1334,9 +1358,7 @@ fn ingest_single_pass_with_limit(
     let parse_bytes = (tok_bytes + event_bytes + click_bytes) * workers;
     let (arena, parse_mapping) = SinkArena::new(parse_bytes).split_at(parse_bytes);
     let (mut tokens, mut arena) = arena.split_at(tok_bytes * workers);
-    let links = read_links_u64(ctx, threads, tm, &mut tokens.scratch(), |pairs| {
-        BucketLinks::from_pairs(&pairs, plan.p2_bits, threads)
-    })?;
+    let links = read_links_u64(ctx, threads, plan.p2_bits, tm, &mut tokens.scratch())?;
     let mut slices = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tok, rest) = tokens.split_at(tok_bytes);
@@ -1348,11 +1370,14 @@ fn ingest_single_pass_with_limit(
     }
     let p1_shift = 64 - plan.p1_bits;
     let p2_shift = 64 - plan.p2_bits;
+    let do_populate = env_usize("INGEST_POPULATE").unwrap_or(1) != 0;
     let states = parse_sinks::<false, u64, SinglePass>(ctx, plan, None, |tid| {
         let (tok, events, clicks) = slices[tid].lock().unwrap().take().unwrap();
-        tok.populate_write();
-        events.populate_write();
-        clicks.populate_write();
+        if do_populate {
+            tok.populate_write();
+            events.populate_write();
+            clicks.populate_write();
+        }
         let events = SinglePass {
             tok: Sinks::in_arena(plan.p1, plan.cap_ev, tok),
             b: Sinks::in_arena(plan.p2, cap_b, events),
@@ -1372,7 +1397,7 @@ fn ingest_single_pass_with_limit(
     let mut ck_sinks = Vec::with_capacity(states.len());
     let mut ne_raw = 0;
     for (ev, ck) in states {
-        ne_raw += ev.tok.len.iter().sum::<usize>();
+        ne_raw += ev.tok.len.iter().map(|&x| x as usize).sum::<usize>();
         tok_sinks.push(ev.tok);
         b_sinks.push(ev.b);
         ck_sinks.push(ck);
@@ -1784,46 +1809,368 @@ fn sort_ev_slice(slice: &mut [CompactEv], tmp: &mut ArenaVec<'_, CompactEv>) {
             cswap(slice, 3, 4);
             cswap(slice, 5, 6);
         }
-        9..=20 => insertion_sort_ev(slice),
+        9 => {
+            // 25-comparator optimal sorting network (Floyd 1964).
+            for &(i, j) in &[
+                (0, 3), (1, 7), (2, 5), (4, 8),
+                (0, 7), (2, 4), (3, 8), (5, 6),
+                (0, 2), (1, 3), (4, 5), (7, 8),
+                (1, 4), (3, 6), (5, 7),
+                (0, 1), (2, 4), (3, 5), (6, 8),
+                (2, 3), (4, 5), (6, 7),
+                (1, 2), (3, 4), (5, 6),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        10 => {
+            // 29-comparator optimal sorting network (Waksman 1969).
+            for &(i, j) in &[
+                (0, 8), (1, 9), (2, 7), (3, 5), (4, 6),
+                (0, 2), (1, 4), (5, 8), (7, 9),
+                (0, 3), (2, 4), (5, 7), (6, 9),
+                (0, 1), (3, 6), (8, 9),
+                (1, 5), (2, 3), (4, 8), (6, 7),
+                (1, 2), (3, 5), (4, 6), (7, 8),
+                (2, 3), (4, 5), (6, 7),
+                (3, 4), (5, 6),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        11 => {
+            // 37-comparator Batcher odd-even sorting network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (0, 2), (1, 3), (1, 2),
+                (4, 5), (6, 7), (4, 6), (5, 7), (5, 6),
+                (0, 4), (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+                (8, 9), (8, 10), (9, 10),
+                (0, 8), (4, 8), (2, 10), (6, 10), (2, 4), (6, 8),
+                (1, 9), (5, 9), (3, 5), (7, 9), (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        12 => {
+            // 41-comparator Batcher odd-even sorting network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (0, 2), (1, 3), (1, 2),
+                (4, 5), (6, 7), (4, 6), (5, 7), (5, 6),
+                (0, 4), (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+                (8, 9), (10, 11), (8, 10), (9, 11), (9, 10),
+                (0, 8), (4, 8), (2, 10), (6, 10), (2, 4), (6, 8),
+                (1, 9), (5, 9), (3, 11), (7, 11), (3, 5), (7, 9),
+                (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        13 => {
+            // 46-comparator pruned Green network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (2, 8), (2, 4), (5, 6), (9, 10), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        14 => {
+            // 51-comparator pruned Green network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13),
+                (5, 10), (6, 9), (3, 12), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        15 => {
+            // 56-comparator pruned Green network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        16 => {
+            // 60-comparator Green (1969) optimal sorting network (Knuth 0-1 verified).
+            for &(i, j) in &[
+                (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15),
+                (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14), (13, 15),
+                (0, 4), (1, 5), (2, 6), (3, 7), (8, 12), (9, 13), (10, 14), (11, 15),
+                (0, 8), (1, 9), (2, 10), (3, 11), (4, 12), (5, 13), (6, 14), (7, 15),
+                (5, 10), (6, 9), (3, 12), (13, 14), (7, 11), (1, 2), (4, 8),
+                (1, 4), (7, 13), (2, 8), (11, 14),
+                (2, 4), (5, 6), (9, 10), (11, 13), (3, 8), (7, 12),
+                (6, 8), (10, 12), (3, 5), (7, 9),
+                (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (6, 7), (8, 9),
+            ] {
+                cswap(slice, i, j);
+            }
+        }
+        17..=20 => insertion_sort_ev(slice),
         21..=256 => slice.sort_unstable(),
         _ => radix_sort_ev(slice, tmp),
     }
 }
 
-#[inline]
-fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
+/// 3-pass (11+11+10 bit) LSB radix sort on `CompactClick::ts`, followed by
+/// tie-break sort on `cid` within any equal-`ts` runs.
+fn radix_sort_clicks<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) {
     let n = cl.len();
-    if n <= 1 {
-        return n;
+    if tmp.len() < n {
+        tmp.resize(n, CompactClick { ts: 0, campaign: 0, cid: K::default() });
     }
-    if n == 2 {
-        let a = unsafe { *cl.get_unchecked(0) };
-        let b = unsafe { *cl.get_unchecked(1) };
-        if a.ts > b.ts || (a.ts == b.ts && a.cid > b.cid) {
-            unsafe {
-                *cl.get_unchecked_mut(0) = b;
-                *cl.get_unchecked_mut(1) = a;
+    let buf = &mut tmp[..n];
+    let mut c0 = [0u32; 2048];
+    let mut c1 = [0u32; 2048];
+    let mut c2 = [0u32; 1024];
+    for c in cl.iter() {
+        let t = c.ts;
+        c0[(t & 2047) as usize] += 1;
+        c1[((t >> 11) & 2047) as usize] += 1;
+        c2[(t >> 22) as usize] += 1;
+    }
+    let t0 = cl[0].ts;
+    let skip0 = c0[(t0 & 2047) as usize] == n as u32;
+    let skip1 = c1[((t0 >> 11) & 2047) as usize] == n as u32;
+    let skip2 = c2[(t0 >> 22) as usize] == n as u32;
+    let mut in_tmp = false;
+
+    if !skip0 {
+        let mut acc = 0u32;
+        for c in c0.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        for &c in cl.iter() {
+            let b = (c.ts & 2047) as usize;
+            let dst = unsafe { c0.get_unchecked_mut(b) };
+            unsafe { *buf.get_unchecked_mut(*dst as usize) = c };
+            *dst += 1;
+        }
+        in_tmp = true;
+    }
+    if !skip1 {
+        let mut acc = 0u32;
+        for c in c1.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &c in buf.iter() {
+                let b = ((c.ts >> 11) & 2047) as usize;
+                let dst = unsafe { c1.get_unchecked_mut(b) };
+                unsafe { *cl.get_unchecked_mut(*dst as usize) = c };
+                *dst += 1;
+            }
+        } else {
+            for &c in cl.iter() {
+                let b = ((c.ts >> 11) & 2047) as usize;
+                let dst = unsafe { c1.get_unchecked_mut(b) };
+                unsafe { *buf.get_unchecked_mut(*dst as usize) = c };
+                *dst += 1;
             }
         }
-        return if a.cid == b.cid { 1 } else { 2 };
+        in_tmp = !in_tmp;
     }
-    if n <= 16 {
-        for i in 1..n {
-            let v = unsafe { *cl.get_unchecked(i) };
-            let mut j = i;
-            while j > 0 {
-                let prev = unsafe { *cl.get_unchecked(j - 1) };
-                if prev.ts > v.ts || (prev.ts == v.ts && prev.cid > v.cid) {
-                    unsafe { *cl.get_unchecked_mut(j) = prev };
-                    j -= 1;
-                } else {
-                    break;
+    if !skip2 {
+        let mut acc = 0u32;
+        for c in c2.iter_mut() {
+            let v = *c;
+            *c = acc;
+            acc += v;
+        }
+        if in_tmp {
+            for &c in buf.iter() {
+                let b = (c.ts >> 22) as usize;
+                let dst = unsafe { c2.get_unchecked_mut(b) };
+                unsafe { *cl.get_unchecked_mut(*dst as usize) = c };
+                *dst += 1;
+            }
+        } else {
+            for &c in cl.iter() {
+                let b = (c.ts >> 22) as usize;
+                let dst = unsafe { c2.get_unchecked_mut(b) };
+                unsafe { *buf.get_unchecked_mut(*dst as usize) = c };
+                *dst += 1;
+            }
+        }
+        in_tmp = !in_tmp;
+    }
+    if in_tmp {
+        cl.copy_from_slice(buf);
+    }
+    // Fix any equal-ts runs by sorting by `cid` ascending.
+    let mut i = 0usize;
+    while i + 1 < n {
+        let ti = unsafe { cl.get_unchecked(i).ts };
+        if unsafe { cl.get_unchecked(i + 1).ts } == ti {
+            let mut j = i + 2;
+            while j < n && unsafe { cl.get_unchecked(j).ts } == ti {
+                j += 1;
+            }
+            cl[i..j].sort_unstable_by_key(|c| c.cid);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+#[inline(always)]
+fn cswap_click<K: Key>(a: &mut [CompactClick<K>], i: usize, j: usize) {
+    unsafe {
+        let x = *a.get_unchecked(i);
+        let y = *a.get_unchecked(j);
+        let swap = (x.ts > y.ts) | ((x.ts == y.ts) & (x.cid > y.cid));
+        *a.get_unchecked_mut(i) = if swap { y } else { x };
+        *a.get_unchecked_mut(j) = if swap { x } else { y };
+    }
+}
+
+#[inline]
+fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>], tmp: &mut ArenaVec<'_, CompactClick<K>>) -> usize {
+    let n = cl.len();
+    match n {
+        0 | 1 => return n,
+        2 => {
+            cswap_click(cl, 0, 1);
+            return if unsafe { cl.get_unchecked(0).cid == cl.get_unchecked(1).cid } { 1 } else { 2 };
+        }
+        3 => {
+            cswap_click(cl, 0, 2);
+            cswap_click(cl, 0, 1);
+            cswap_click(cl, 1, 2);
+        }
+        4 => {
+            cswap_click(cl, 0, 2);
+            cswap_click(cl, 1, 3);
+            cswap_click(cl, 0, 1);
+            cswap_click(cl, 2, 3);
+            cswap_click(cl, 1, 2);
+        }
+        5 => {
+            for &(i, j) in &[(0, 1), (3, 4), (2, 4), (2, 3), (0, 3), (0, 2), (1, 4), (1, 3), (1, 2)] {
+                cswap_click(cl, i, j);
+            }
+        }
+        6 => {
+            for &(i, j) in &[
+                (0, 5), (1, 3), (2, 4), (1, 2), (3, 4), (0, 3),
+                (2, 5), (0, 1), (2, 3), (4, 5), (1, 2), (3, 4),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        7 => {
+            for &(i, j) in &[
+                (0, 6), (2, 3), (4, 5), (0, 2), (1, 4), (3, 6), (0, 1), (2, 5),
+                (3, 4), (1, 2), (4, 6), (2, 3), (4, 5), (1, 2), (3, 4), (5, 6),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        8 => {
+            for &(i, j) in &[
+                (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7),
+                (0, 1), (2, 3), (4, 5), (6, 7), (2, 4), (3, 5), (1, 4), (3, 6),
+                (1, 2), (3, 4), (5, 6),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        9 => {
+            for &(i, j) in &[
+                (0, 3), (1, 7), (2, 5), (4, 8),
+                (0, 7), (2, 4), (3, 8), (5, 6),
+                (0, 2), (1, 3), (4, 5), (7, 8),
+                (1, 4), (3, 6), (5, 7),
+                (0, 1), (2, 4), (3, 5), (6, 8),
+                (2, 3), (4, 5), (6, 7),
+                (1, 2), (3, 4), (5, 6),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        10 => {
+            for &(i, j) in &[
+                (0, 8), (1, 9), (2, 7), (3, 5), (4, 6),
+                (0, 2), (1, 4), (5, 8), (7, 9),
+                (0, 3), (2, 4), (5, 7), (6, 9),
+                (0, 1), (3, 6), (8, 9),
+                (1, 5), (2, 3), (4, 8), (6, 7),
+                (1, 2), (3, 5), (4, 6), (7, 8),
+                (2, 3), (4, 5), (6, 7),
+                (3, 4), (5, 6),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        11 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (0, 2), (1, 3), (1, 2),
+                (4, 5), (6, 7), (4, 6), (5, 7), (5, 6),
+                (0, 4), (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+                (8, 9), (8, 10), (9, 10),
+                (0, 8), (4, 8), (2, 10), (6, 10), (2, 4), (6, 8),
+                (1, 9), (5, 9), (3, 5), (7, 9), (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        12 => {
+            for &(i, j) in &[
+                (0, 1), (2, 3), (0, 2), (1, 3), (1, 2),
+                (4, 5), (6, 7), (4, 6), (5, 7), (5, 6),
+                (0, 4), (2, 6), (2, 4), (1, 5), (3, 7), (3, 5), (1, 2), (3, 4), (5, 6),
+                (8, 9), (10, 11), (8, 10), (9, 11), (9, 10),
+                (0, 8), (4, 8), (2, 10), (6, 10), (2, 4), (6, 8),
+                (1, 9), (5, 9), (3, 11), (7, 11), (3, 5), (7, 9),
+                (1, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+            ] {
+                cswap_click(cl, i, j);
+            }
+        }
+        13..=16 => {
+            for i in 1..n {
+                let v = unsafe { *cl.get_unchecked(i) };
+                let mut j = i;
+                while j > 0 {
+                    let prev = unsafe { *cl.get_unchecked(j - 1) };
+                    if prev.ts > v.ts || (prev.ts == v.ts && prev.cid > v.cid) {
+                        unsafe { *cl.get_unchecked_mut(j) = prev };
+                        j -= 1;
+                    } else {
+                        break;
+                    }
                 }
+                unsafe { *cl.get_unchecked_mut(j) = v };
             }
-            unsafe { *cl.get_unchecked_mut(j) = v };
         }
-    } else {
-        cl.sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid)));
+        17..=512 => cl.sort_unstable_by(|a, b| (a.ts, a.cid).cmp(&(b.ts, b.cid))),
+        _ => radix_sort_clicks(cl, tmp),
     }
     let mut w = 1usize;
     let mut prev_cid = unsafe { cl.get_unchecked(0).cid };
@@ -1839,20 +2186,21 @@ fn sort_and_dedup_clicks<K: Key>(cl: &mut [CompactClick<K>]) -> usize {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
+#[repr(C, align(16))]
 struct DenseBin {
-    stamp: u32,
     min_ts: u32,
     max_ts: u32,
     count: u32,
-    rev: u64,
     purch_head: u32,
-    _pad: u32,
+}
+
+impl DenseBin {
+    const EMPTY: Self = Self { min_ts: u32::MAX, max_ts: 0, count: 0, purch_head: u32::MAX };
 }
 
 impl Default for DenseBin {
     fn default() -> Self {
-        Self { stamp: 0, min_ts: 0, max_ts: 0, count: 0, rev: 0, purch_head: u32::MAX, _pad: 0 }
+        Self::EMPTY
     }
 }
 
@@ -1863,16 +2211,13 @@ struct PurchNode {
 }
 
 /// O(N) zero-sort sessionizer for dense users (`person.count >= dense_min`):
-/// partitions timestamps into 30-minute (`GAP_MS_U32`) bins. Events in the same
-/// bin are always in the same session, and adjacent bins bridge iff
-/// `bin[b+1].min_ts - bin[b].max_ts <= GAP_MS_U32`. Uses generation stamps +
-/// a `u64` active bitmask (88 B for 14 days) so clearing is O(active words) with
-/// zero `memset`.
+/// partitions timestamps into 30-minute (`GAP_MS_U32`) 16-byte bins (10.7 KiB for 14 days ->
+/// L1d-hot!). Bins are kept pre-reset to `DenseBin::EMPTY` on drain so `scatter` updates
+/// `min_ts`/`max_ts`/`count` 100% branchlessly (eliminating ~116k/M first-touch mispredicts).
 struct DenseSessions {
     bins: Vec<DenseBin>,
     active_mask: Vec<u64>,
     purch_nodes: Vec<PurchNode>,
-    gen: u32,
 }
 
 impl DenseSessions {
@@ -1882,14 +2227,12 @@ impl DenseSessions {
                 bins: Vec::new(),
                 active_mask: Vec::new(),
                 purch_nodes: Vec::new(),
-                gen: 0,
             };
         }
         Self {
-            bins: vec![DenseBin::default(); max_bins],
+            bins: vec![DenseBin::EMPTY; max_bins],
             active_mask: vec![0u64; max_bins.div_ceil(64)],
             purch_nodes: Vec::with_capacity(64),
-            gen: 0,
         }
     }
 
@@ -1900,36 +2243,18 @@ impl DenseSessions {
 
     #[inline]
     fn scatter(&mut self, events: &[CompactEv]) {
-        self.gen = self.gen.wrapping_add(1);
-        if self.gen == 0 {
-            for b in &mut self.bins {
-                b.stamp = 0;
-            }
-            self.gen = 1;
-        }
-        let gen = self.gen;
         self.purch_nodes.clear();
         for ev in events {
             let ts = ev.ts();
             let cc = ev.cc();
             let bi = (ts / GAP_MS_U32) as usize;
+            let word = unsafe { self.active_mask.get_unchecked_mut(bi >> 6) };
+            *word |= 1u64 << (bi & 63);
             let bin = unsafe { self.bins.get_unchecked_mut(bi) };
-            if bin.stamp != gen {
-                bin.stamp = gen;
-                bin.min_ts = ts;
-                bin.max_ts = ts;
-                bin.count = 1;
-                bin.rev = 0;
-                bin.purch_head = u32::MAX;
-                unsafe { *self.active_mask.get_unchecked_mut(bi >> 6) |= 1u64 << (bi & 63) };
-            } else {
-                bin.min_ts = bin.min_ts.min(ts);
-                bin.max_ts = bin.max_ts.max(ts);
-                bin.count += 1;
-            }
-            let cents = cc & 0x00FF_FFFF;
-            if cents != 0 {
-                bin.rev += cents as u64;
+            bin.min_ts = bin.min_ts.min(ts);
+            bin.max_ts = bin.max_ts.max(ts);
+            bin.count += 1;
+            if (cc & 0x00FF_FFFF) != 0 {
                 let idx = self.purch_nodes.len() as u32;
                 self.purch_nodes.push(PurchNode { cc, next: bin.purch_head });
                 bin.purch_head = idx;
@@ -1944,10 +2269,12 @@ fn add_bin_purchases(
     mut head: u32,
     cat_sum: &mut [u64],
     cat_touched: &mut Vec<u32>,
-) {
+) -> u64 {
+    let mut rev = 0u64;
     while head != u32::MAX {
         let node = unsafe { *purch_nodes.get_unchecked(head as usize) };
         let cents = node.cc & 0x00FF_FFFF;
+        rev += cents as u64;
         let cat = node.cc >> 24;
         let slot = unsafe { cat_sum.get_unchecked_mut(cat as usize) };
         if *slot == 0 {
@@ -1956,6 +2283,7 @@ fn add_bin_purchases(
         *slot += cents as u64;
         head = node.next;
     }
+    rev
 }
 
 /// Fused group + sessionize + attribute + assists + direct user_daily Parquet output.
@@ -2070,7 +2398,7 @@ impl FusedAssists {
             // the tail beyond the previous click's window is new.
             let campaign = click.campaign as usize;
             let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
-            let prev = if seen.0 == stamp { seen.1 as usize } else { 0 };
+            let prev = (usize::from(seen.0 == stamp).wrapping_neg()) & (seen.1 as usize);
             let begin = first.max(prev);
             if begin >= end {
                 continue;
@@ -2156,21 +2484,26 @@ fn emit_session<K: Key>(
     ud_events: &mut u32,
     ud_revenue: &mut i64,
 ) {
-    let cl_end = cl_buf.len();
-    let s_ck = s + WEEK_MS_U32;
-    while *cj < cl_end {
-        let ct = unsafe { cl_buf.get_unchecked(*cj).ts };
-        if ct > s_ck {
-            break;
+    let credit = if has_clicks {
+        let s_ck = s + WEEK_MS_U32;
+        // Caller placed a `ts == u32::MAX` sentinel at `cl_buf[cl_end]` (`u32::MAX > s_ck`
+        // because `we - ws <= u32::MAX - WEEK_MS`), eliminating the `*cj < cl_end` bounds check.
+        loop {
+            let ct = unsafe { cl_buf.get_unchecked(*cj).ts };
+            if ct > s_ck {
+                break;
+            }
+            if ct != *last_ts {
+                *last_ts = ct;
+                *grp_first = *cj;
+            }
+            *cj += 1;
         }
-        if ct != *last_ts {
-            *last_ts = ct;
-            *grp_first = *cj;
+        if *grp_first != cl_buf.len() - 1 && *last_ts >= s {
+            unsafe { cl_buf.get_unchecked(*grp_first).campaign }
+        } else {
+            organic
         }
-        *cj += 1;
-    }
-    let credit = if *grp_first != cl_end && *last_ts >= s {
-        unsafe { cl_buf.get_unchecked(*grp_first).campaign }
     } else {
         organic
     };
@@ -2238,6 +2571,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
         ck_cnt: Vec<u32>,
         ck_off: Vec<u32>,
         cl_buf: ArenaVec<'a, CompactClick<K>>,
+        cl_tmp: ArenaVec<'a, CompactClick<K>>,
         dense: DenseSessions,
         // Aggregate state
         camp: CampStore,
@@ -2265,8 +2599,8 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
         65536
     };
     let click_cap = if group_scratch_available {
-        let raw_clicks: usize = ck_sinks.iter().map(|s| s.len.iter().sum::<usize>()).sum::<usize>()
-            + reloc_c.iter().map(|s| s.len.iter().sum::<usize>()).sum::<usize>();
+        let raw_clicks: usize = ck_sinks.iter().map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>()).sum::<usize>()
+            + reloc_c.iter().map(|s| s.len.iter().map(|&x| x as usize).sum::<usize>()).sum::<usize>();
         (raw_clicks / p2 * 2).max(16384)
     } else {
         16384
@@ -2289,6 +2623,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 ck_cnt: Vec::with_capacity(2048),
                 ck_off: Vec::with_capacity(2048),
                 cl_buf: scratch.buffer(click_cap),
+                cl_tmp: if group_scratch_available { scratch.buffer(2048) } else { ArenaVec::default() },
                 dense: DenseSessions::new(max_bins),
                 camp: CampStore::new(ncamp + 1, day0, ndays),
                 writer: output::UserWriter::new(ud_ref, tid, est_user_rows),
@@ -2391,7 +2726,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 w.fill.clear();
                 w.fill.extend_from_slice(&w.ck_off[..np]);
                 w.cl_buf.clear();
-                w.cl_buf.reserve(ncl_raw);
+                w.cl_buf.reserve(ncl_raw + 1);
                 let cl_ptr = w.cl_buf.as_mut_ptr();
                 for &(id, ck) in w.cl_raw.iter() {
                     let pos = unsafe { *w.fill.get_unchecked(id as usize) } as usize;
@@ -2400,8 +2735,11 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                         *w.fill.get_unchecked_mut(id as usize) = (pos + 1) as u32;
                     }
                 }
-                // Each of the ncl_raw clicks initialized one distinct offset.
-                unsafe { w.cl_buf.set_len(ncl_raw) };
+                // Trailing sentinel slot so `cl_buf[cl_end]` is always in bounds for every person.
+                unsafe {
+                    cl_ptr.add(ncl_raw).write(CompactClick { ts: u32::MAX, campaign: 0, cid: K::default() });
+                    w.cl_buf.set_len(ncl_raw + 1);
+                }
             }
 
             w.profile.end(GroupPhase::Csr);
@@ -2421,7 +2759,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 let (cl_st, cl_len) = if ncl_raw > 0 {
                     let cs = unsafe { *w.ck_off.get_unchecked(pi) } as usize;
                     let ce = unsafe { *w.ck_off.get_unchecked(pi + 1) } as usize;
-                    let len = sort_and_dedup_clicks(&mut w.cl_buf[cs..ce]);
+                    let len = sort_and_dedup_clicks(&mut w.cl_buf[cs..ce], &mut w.cl_tmp);
                     w.nc += len;
                     (cs, len)
                 } else {
@@ -2436,6 +2774,13 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 w.assists.s_day.clear();
                 let mut cj = cl_st;
                 let cl_end = cl_st + cl_len;
+                let saved_cl = if cl_len > 0 {
+                    let prev = unsafe { *w.cl_buf.get_unchecked(cl_end) };
+                    unsafe { w.cl_buf.get_unchecked_mut(cl_end).ts = u32::MAX };
+                    prev
+                } else {
+                    CompactClick { ts: u32::MAX, campaign: 0, cid: K::default() }
+                };
                 let mut grp_first = cl_end;
                 // The exclusive window end reserves u32::MAX as a sentinel.
                 let mut last_ts = u32::MAX;
@@ -2464,13 +2809,13 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                             word &= word - 1;
                             let bi = base_bin + tz;
                             let bin = unsafe { *w.dense.bins.get_unchecked(bi) };
+                            unsafe { *w.dense.bins.get_unchecked_mut(bi) = DenseBin::EMPTY };
                             if has_sess && bi == sess_last_bin + 1 && bin.min_ts - sess_max <= GAP_MS_U32 {
                                 sess_max = bin.max_ts;
                                 sess_last_bin = bi;
                                 sess_nev += bin.count;
-                                sess_rev += bin.rev;
                                 if bin.purch_head != u32::MAX {
-                                    add_bin_purchases(
+                                    sess_rev += add_bin_purchases(
                                         &w.dense.purch_nodes, bin.purch_head,
                                         &mut w.cat_sum, &mut w.cat_touched,
                                     );
@@ -2480,7 +2825,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                                     emit_session(
                                         &mut w.camp,
                                         &mut w.assists,
-                                        &w.cl_buf[..cl_end],
+                                        &w.cl_buf[..cl_end + usize::from(cl_len > 0)],
                                         cl_len > 0,
                                         organic,
                                         &mut cj,
@@ -2522,13 +2867,14 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                                 sess_max = bin.max_ts;
                                 sess_last_bin = bi;
                                 sess_nev = bin.count;
-                                sess_rev = bin.rev;
-                                if bin.purch_head != u32::MAX {
+                                sess_rev = if bin.purch_head != u32::MAX {
                                     add_bin_purchases(
                                         &w.dense.purch_nodes, bin.purch_head,
                                         &mut w.cat_sum, &mut w.cat_touched,
-                                    );
-                                }
+                                    )
+                                } else {
+                                    0
+                                };
                             }
                         }
                     }
@@ -2536,7 +2882,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                         emit_session(
                             &mut w.camp,
                             &mut w.assists,
-                            &w.cl_buf[..cl_end],
+                            &w.cl_buf[..cl_end + usize::from(cl_len > 0)],
                             cl_len > 0,
                             organic,
                             &mut cj,
@@ -2612,7 +2958,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                         emit_session(
                             &mut w.camp,
                             &mut w.assists,
-                            &w.cl_buf[..cl_end],
+                            &w.cl_buf[..cl_end + usize::from(cl_len > 0)],
                             cl_len > 0,
                             organic,
                             &mut cj,
@@ -2642,6 +2988,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
                 );
 
                 if cl_len > 0 {
+                    unsafe { *w.cl_buf.get_unchecked_mut(cl_end) = saved_cl };
                     w.assists.count(&mut w.camp, &w.cl_buf[cl_st..cl_end]);
                 }
                 ev_st = ev_en;
@@ -2656,6 +3003,7 @@ fn group_fused<K: Key, P: GroupProfile, const PREHASHED: bool>(
             drop(std::mem::take(&mut w.ev_buf));
             drop(std::mem::take(&mut w.ev_tmp));
             drop(std::mem::take(&mut w.cl_buf));
+            drop(std::mem::take(&mut w.cl_tmp));
             drop(std::mem::take(&mut w.cl_raw));
             drop(std::mem::take(&mut w.pid));
             drop(std::mem::take(&mut w.ev_flat));
@@ -3043,9 +3391,9 @@ impl<K: Key> Links<K> {
         }
     }
 
-    fn canonical_pairs<'a>(
+    fn solve_uf<'a>(
         pairs: &[Vec<(K, K)>], threads: usize, scratch: &mut Scratch<'a>,
-    ) -> Vec<CanonicalPart<'a, K>> {
+    ) -> Option<(usize, Vec<u32>, ArenaVec<'a, K>, ArenaVec<'a, AtomicU32>)> {
         let mut off = vec![0usize; pairs.len() + 1];
         for (i, v) in pairs.iter().enumerate() {
             off[i + 1] = off[i] + v.len();
@@ -3053,7 +3401,7 @@ impl<K: Key> Links<K> {
         let nl = off[pairs.len()];
         if nl == 0 {
             eprintln!("[ingest] links=0 linked_ids=0");
-            return Vec::new();
+            return None;
         }
         let off = &off;
 
@@ -3172,9 +3520,18 @@ impl<K: Key> Links<K> {
             }
         });
         drop(ep);
+        Some((nl, base, keys, parent))
+    }
 
+    fn canonical_pairs<'a>(
+        pairs: &[Vec<(K, K)>], threads: usize, scratch: &mut Scratch<'a>,
+    ) -> Vec<CanonicalPart<'a, K>> {
+        let Some((nl, base, keys, parent)) = Self::solve_uf(pairs, threads, scratch) else {
+            return Vec::new();
+        };
+        let nn = base[LP] as usize;
         // 5. Collect only keys whose canonical key differs, preserving raw partitions.
-        let base_ref = &base;
+        let (base_ref, parent_ref, keys_ref) = (&base, &parent, &keys);
         let canon_space = Mutex::new(scratch);
         let canon_space_ref = &canon_space;
         let canon_parts: Vec<CanonicalPart<'_, K>> = par::run(threads, LP, |_| Vec::new(), move |res, p| {
@@ -3199,6 +3556,115 @@ impl<K: Key> Links<K> {
         eprintln!("[ingest] links={nl} linked_ids={nn} mapped={total_mapped}");
         canon_parts
     }
+}
+
+impl Links<u64> {
+    /// Fused Step 5: collect `(raw_mixed, canon_mixed)` directly into `BucketLinks`
+    /// in one lock-free pass over union-find roots (zero redundant hashes or intermediate Vecs).
+    fn into_bucket_links(
+        pairs: &[Vec<(u64, u64)>], p2_bits: u32, threads: usize, scratch: &mut Scratch<'_>,
+    ) -> BucketLinks {
+        let Some((nl, base, keys, parent)) = Self::solve_uf(pairs, threads, scratch) else {
+            return BucketLinks { has_links: false, pairs: Vec::new(), offsets: Vec::new() };
+        };
+        let nn = base[LP] as usize;
+        let p2 = 1usize << p2_bits;
+        debug_assert!(p2_bits >= LP_BITS);
+        let sub_bits = p2_bits - LP_BITS;
+        let sub = 1usize << sub_bits;
+        let shift = 64 - p2_bits;
+
+        let mut tmp = scratch.buffer::<(u64, u64)>(nn);
+        let tmp_ptr = SyncPtr(tmp.as_mut_ptr());
+        let mut counts = vec![0usize; p2];
+        let mut part_len = [0usize; LP];
+        {
+            let (base_ref, parent_ref, keys_ref) = (&base, &parent, &keys);
+            let cnt_ptr = SyncPtr(counts.as_mut_ptr());
+            let plen_ptr = SyncPtr(part_len.as_mut_ptr());
+            par::run(threads, LP, |_| (), move |_, p| {
+                let (s, e) = (base_ref[p] as usize, base_ref[p + 1] as usize);
+                let mut w = s;
+                if sub == 1 {
+                    for i in s..e {
+                        let r = uf_find(parent_ref, i as u32) as usize;
+                        let c = unsafe { *keys_ref.get_unchecked(r) };
+                        let k = unsafe { *keys_ref.get_unchecked(i) };
+                        if c != k {
+                            unsafe { tmp_ptr.write(w, (k.h(), c.h())) };
+                            w += 1;
+                        }
+                    }
+                    let len = w - s;
+                    unsafe {
+                        cnt_ptr.write(p, len);
+                        plen_ptr.write(p, len);
+                    }
+                } else {
+                    let base_q = p << sub_bits;
+                    let mut local = [0usize; 16];
+                    for i in s..e {
+                        let r = uf_find(parent_ref, i as u32) as usize;
+                        let c = unsafe { *keys_ref.get_unchecked(r) };
+                        let k = unsafe { *keys_ref.get_unchecked(i) };
+                        if c != k {
+                            let rh = k.h();
+                            local[((rh >> shift) as usize) - base_q] += 1;
+                            unsafe { tmp_ptr.write(w, (rh, c.h())) };
+                            w += 1;
+                        }
+                    }
+                    unsafe { plen_ptr.write(p, w - s) };
+                    for sub_i in 0..sub {
+                        unsafe { cnt_ptr.write(base_q + sub_i, local[sub_i]) };
+                    }
+                }
+            });
+        }
+        drop(parent);
+        drop(keys);
+
+        let mut offsets = Vec::with_capacity(p2 + 1);
+        let mut acc = 0usize;
+        for &c in &counts {
+            offsets.push(acc);
+            acc += c;
+        }
+        offsets.push(acc);
+        eprintln!("[ingest] links={nl} linked_ids={nn} mapped={acc}");
+        if acc == 0 {
+            return BucketLinks { has_links: false, pairs: Vec::new(), offsets: Vec::new() };
+        }
+        let mut out_pairs = Vec::with_capacity(acc);
+        let pairs_ptr = SyncPtr(out_pairs.as_mut_ptr());
+        let (base_ref, off_ref, plen_ref) = (&base, &offsets, &part_len);
+        par::run(threads, LP, |_| (), move |_, p| {
+            let len = plen_ref[p];
+            if len == 0 {
+                return;
+            }
+            let src = unsafe { tmp_ptr.slice(base_ref[p] as usize, len) };
+            if sub == 1 {
+                unsafe { pairs_ptr.copy_from(off_ref[p], src) };
+            } else {
+                let base_q = p << sub_bits;
+                let mut cur = [0usize; 16];
+                for sub_i in 0..sub {
+                    cur[sub_i] = off_ref[base_q + sub_i];
+                }
+                for &(rh, ch) in src.iter() {
+                    let sub_i = ((rh >> shift) as usize) - base_q;
+                    unsafe { pairs_ptr.write(cur[sub_i], (rh, ch)) };
+                    cur[sub_i] += 1;
+                }
+            }
+        });
+        unsafe { out_pairs.set_len(acc) };
+        BucketLinks { has_links: true, pairs: out_pairs, offsets }
+    }
+}
+
+impl<K: Key> Links<K> {
 
     fn from_pairs(canon_parts: &[CanonicalPart<'_, K>], threads: usize) -> Self {
         let Some(max_cnt) = canon_parts.iter().map(|x| x.1.len()).max() else {
@@ -3424,7 +3890,7 @@ mod tests {
         // Knuth's 0-1 principle: a comparator network sorts all inputs of length n
         // iff it sorts all 2^n binary sequences of length n.
         let mut tmp = ArenaVec::default();
-        for n in 2..=8usize {
+        for n in 2..=16usize {
             for mask in 0..(1u32 << n) {
                 let mut a: Vec<CompactEv> = (0..n)
                     .map(|i| CompactEv::new((mask >> i) & 1, 0))
@@ -3448,7 +3914,8 @@ mod tests {
             }
         }
         let mut scratch = Scratch::default();
-        let canon_parts = Links::canonical_pairs(&[pairs], 2, &mut scratch);
+        let pairs_slice = [pairs];
+        let canon_parts = Links::canonical_pairs(&pairs_slice, 2, &mut scratch);
         let mut expected = std::collections::HashMap::new();
         for (_, part) in &canon_parts {
             for &(k, c) in part.iter() {
@@ -3456,7 +3923,11 @@ mod tests {
             }
         }
         for p2_bits in [8u32, 9, 10] {
-            let bl = BucketLinks::from_pairs(&canon_parts, p2_bits, 2);
+            let bl_ref = BucketLinks::from_pairs(&canon_parts, p2_bits, 2);
+            let mut s2 = Scratch::default();
+            let bl = Links::into_bucket_links(&pairs_slice, p2_bits, 2, &mut s2);
+            assert_eq!(bl.offsets, bl_ref.offsets);
+            assert_eq!(bl.pairs.len(), bl_ref.pairs.len());
             let mut map = RelocationMap::default();
             let mut seen = 0usize;
             for q in 0..(1usize << p2_bits) {
@@ -3476,6 +3947,39 @@ mod tests {
                 }
             }
             assert_eq!(seen, expected.len());
+        }
+    }
+
+    #[test]
+    fn radix_clicks_matches_std() {
+        let mut rng = 0xD6E8_FEB8_6659_FD93u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut tmp = ArenaVec::default();
+        for &n in &[0usize, 1, 2, 3, 16, 17, 64, 65, 257, 4096] {
+            let mut a: Vec<CompactClick<u64>> = (0..n)
+                .map(|_| {
+                    let ts = if next() % 5 == 0 {
+                        (next() as u32) % 32 // heavy tie pressure
+                    } else {
+                        (next() as u32) % 1_814_400_000
+                    };
+                    let cid = 1 + (next() % 50); // heavy duplicate cid pressure
+                    CompactClick { ts, campaign: (next() as u32) % 2000, cid }
+                })
+                .collect();
+            let mut b = a.clone();
+            let wa = sort_and_dedup_clicks(&mut a, &mut tmp);
+            b.sort_unstable_by(|x, y| (x.ts, x.cid).cmp(&(y.ts, y.cid)));
+            b.dedup_by(|x, y| x.cid == y.cid);
+            assert_eq!(wa, b.len());
+            for i in 0..wa {
+                assert_eq!((a[i].ts, a[i].cid), (b[i].ts, b[i].cid));
+            }
         }
     }
 
@@ -3583,12 +4087,12 @@ mod tests {
                         word &= word - 1;
                         let bi = (wi << 6) + tz;
                         let bin = dense.bins[bi];
+                        dense.bins[bi] = DenseBin::EMPTY;
                         if has_sess && bi == sess_last_bin + 1 && bin.min_ts - sess_max <= GAP_MS_U32 {
                             sess_max = bin.max_ts;
                             sess_last_bin = bi;
                             sess_nev += bin.count;
-                            sess_rev += bin.rev;
-                            add_bin_purchases(&dense.purch_nodes, bin.purch_head, &mut cat_sum, &mut cat_touched);
+                            sess_rev += add_bin_purchases(&dense.purch_nodes, bin.purch_head, &mut cat_sum, &mut cat_touched);
                         } else {
                             if has_sess {
                                 ud_s += 1; ud_e += sess_nev; ud_r += sess_rev as i64;
@@ -3607,8 +4111,7 @@ mod tests {
                             sess_max = bin.max_ts;
                             sess_last_bin = bi;
                             sess_nev = bin.count;
-                            sess_rev = bin.rev;
-                            add_bin_purchases(&dense.purch_nodes, bin.purch_head, &mut cat_sum, &mut cat_touched);
+                            sess_rev = add_bin_purchases(&dense.purch_nodes, bin.purch_head, &mut cat_sum, &mut cat_touched);
                         }
                     }
                 }

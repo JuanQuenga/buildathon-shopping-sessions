@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-pub const PAD: usize = 64;
+pub const PAD: usize = 128;
 const TILE: usize = 16 * 1024;
 const POSITION: u16 = 0x3FFF;
 const CLOSE_QUOTE: u32 = 14;

@@ -45,8 +45,10 @@ fn main() {
             eprintln!("[stage] peak_rss_mb={hwm_mb}");
         }
     }
-    if let Some(ref arena) = _parse_mapping {
-        arena.release_par(threads);
+    if std::env::var("INGEST_RELEASE_PAR").as_deref() != Ok("0") {
+        if let Some(ref arena) = _parse_mapping {
+            arena.release_par(threads);
+        }
     }
     let (user, sys, minflt) = ingest::par::rusage_self();
     let wall = t0.elapsed().as_secs_f64();

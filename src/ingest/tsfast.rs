@@ -40,9 +40,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y + i64::from(m <= 2), m, d)
 }
 
-/// 8 KiB L1-resident direct-mapped cache of valid `YYYY-MM-DDT` prefixes around the dataset window.
+/// Direct-mapped cache of valid `YYYY-MM-DDT` prefixes around the dataset window.
 /// Eliminates calendar validation and `days_from_civil` division for >99% of F1/F2 timestamps,
-/// covering up to 211 days (~7-8 consecutive months, zero collisions across year rollovers).
+/// covering up to 365 consecutive days with zero collisions via ONE BMI2 `pext` instruction
+/// (only the active ~14–21 days = ~336 bytes ever enter L1d cache).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
 struct DateEntry {
@@ -56,17 +57,17 @@ struct DateEntry {
 
 #[repr(C, align(64))]
 pub struct DateTable {
-    entries: [DateEntry; 512],
+    entries: [DateEntry; 2048],
 }
 
 impl DateTable {
-    /// Prepopulate valid dates in `[ws - 14d, we + 14d]` (up to 211 days, zero collisions across
-    /// any 8 consecutive months incl. Dec->Jan rollovers, zero-multiply slot hash). Dates outside
-    /// 1970..2106 or missing from the cache fall back to exact `civil19_sec_cold`.
+    /// Prepopulate valid dates in `[ws - 14d, we + 14d]` (up to 365 days, zero collisions across
+    /// any full year incl. leap years and Dec->Jan rollovers). Dates outside 1970..2106 or missing
+    /// from the cache fall back to exact `civil19_sec_cold`.
     pub fn build(ws_ms: i64, we_ms: i64) -> Self {
-        let mut entries = [DateEntry::default(); 512];
+        let mut entries = [DateEntry::default(); 2048];
         let d0 = ws_ms.div_euclid(DAY_MS) - 14;
-        let d1 = (we_ms.div_euclid(DAY_MS) + 14).min(d0 + 210);
+        let d1 = (we_ms.div_euclid(DAY_MS) + 14).min(d0 + 364);
         for d in d0..=d1 {
             let sec = d * 86_400;
             if sec < 0 || sec > (u32::MAX as i64 - 86_400) {
@@ -90,20 +91,18 @@ impl DateTable {
             buf[10] = b'T';
             let a = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             let ddt = u32::from_le_bytes([buf[8], buf[9], buf[10], 0]);
-            let idx = Self::slot(a, ddt);
+            let idx = unsafe { Self::slot_at(buf.as_ptr()) };
             entries[idx] = DateEntry { a, ddt, day_sec: sec as u32 };
         }
         DateTable { entries }
     }
 
     #[inline(always)]
-    fn slot(a: u64, ddt: u32) -> usize {
-        // Exact `(year * 12 + month) mod 8` across all 12 months and every year rollover:
-        // 12 ≡ 4 (mod 8) => (Y3 & 1) * 4; 10 ≡ 2 (mod 8) => (M0 & 1) * 2; plus (M1 & 7).
-        let m8 = (((a >> 48) + ((a >> 39) & 2) + ((a >> 22) & 4)) & 7) as usize;
-        // Day 01..31 -> 6-bit BCD ((tens & 3) << 4) | (ones & 0x0F): zero multiply, zero collision!
-        let day6 = (((ddt & 3) << 4) | ((ddt >> 8) & 0x0F)) as usize;
-        (m8 << 6) | day6
+    unsafe fn slot_at(p: *const u8) -> usize {
+        // Bytes 5..10 are `M0, M1, '-', D0, D1`. Byte-swapping puts `D1` in the low bits and
+        // `M0, M1` in the high bits, so 14 consecutive days pack into 5 contiguous L1d cache
+        // lines with zero collisions across any 365-day year in two instructions (`bswap`+`pext`).
+        std::arch::x86_64::_pext_u64(ld8(p.add(5)).swap_bytes(), 0x010F_0003_0F00_0000) as usize
     }
 
     /// Parse `YYYY-MM-DDTHH:MM:SS` (19 bytes) -> UTC epoch seconds (before zone), or None.
@@ -111,7 +110,7 @@ impl DateTable {
     unsafe fn civil19_sec(&self, p: *const u8) -> Option<i64> {
         let a = ld8(p); // YYYY-MM-
         let ddt = (std::ptr::read_unaligned(p.add(8) as *const u32)) & 0x00FF_FFFF; // DDT
-        let e = self.entries.get_unchecked(Self::slot(a, ddt));
+        let e = self.entries.get_unchecked(Self::slot_at(p));
         if (e.a == a) & (e.ddt == ddt) {
             return Self::clock_sec(p).map(|sec| sec + e.day_sec as i64);
         }
@@ -167,7 +166,7 @@ impl DateTable {
     pub(super) unsafe fn parse_f1_pair_sec(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
         let prefix = ld8(a);
         let ddt = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
-        let date = self.entries.get_unchecked(Self::slot(prefix, ddt));
+        let date = self.entries.get_unchecked(Self::slot_at(a));
         if (date.a == prefix) & (date.ddt == ddt) {
             if (ld8(b) == prefix) & (b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF == ddt) {
                 let (event, ingest) = Self::clock_pair(a, b)?;
@@ -198,24 +197,31 @@ impl DateTable {
         None
     }
 
+    /// Parse `±HH:MM` timezone suffix of a 25-byte F2 timestamp (`p` points to byte 0 of timestamp,
+    /// `sign` is `*p.add(19)` = `'+'` or `'-'`), returning UTC delta in seconds.
+    #[inline(always)]
+    pub(super) unsafe fn parse_tz_delta_sec(p: *const u8, sign: u8) -> Option<i64> {
+        let o = ld8(p.add(17)); // "SS+HH:MM"
+        const MO: u64 = 0xFFFF_00FF_FF00_0000;
+        if !digits_ok(o, MO) | (((o >> 40) & 0xFF) != b':' as u64) {
+            return None;
+        }
+        let oh = dig(o, 3) * 10 + dig(o, 4);
+        let om = dig(o, 6) * 10 + dig(o, 7);
+        if (oh > 23) | (om > 59) {
+            return None;
+        }
+        let off = oh * 3600 + om * 60;
+        Some(if sign == b'+' { -off } else { off })
+    }
+
     /// Direct 25-byte F2 parser (caller verified exact length 25).
     #[inline(always)]
     pub(super) unsafe fn parse_f2_25(&self, p: *const u8) -> Option<i64> {
         let s = *p.add(19);
         if (s == b'+') | (s == b'-') {
             let base_sec = self.civil19_sec(p)?;
-            let o = ld8(p.add(17)); // "SS+HH:MM"
-            const MO: u64 = 0xFFFF_00FF_FF00_0000;
-            if !digits_ok(o, MO) | (((o >> 40) & 0xFF) != b':' as u64) {
-                return None;
-            }
-            let oh = dig(o, 3) * 10 + dig(o, 4);
-            let om = dig(o, 6) * 10 + dig(o, 7);
-            if (oh > 23) | (om > 59) {
-                return None;
-            }
-            let off = oh * 3600 + om * 60;
-            let delta = if s == b'+' { -off } else { off };
+            let delta = Self::parse_tz_delta_sec(p, s)?;
             return Some((base_sec + delta) * 1000);
         }
         parse_cold(p, 25)
@@ -401,7 +407,7 @@ pub unsafe fn f3(p: *const u8, len: usize) -> Option<i64> {
 #[cfg(test)]
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize) -> Option<i64> {
-    let dt = DateTable { entries: [DateEntry::default(); 512] };
+    let dt = DateTable { entries: [DateEntry::default(); 2048] };
     dt.parse(p, len)
 }
 
@@ -503,7 +509,7 @@ mod tests {
                 buf.resize(64, 0);
                 let a = unsafe { ld8(buf.as_ptr()) };
                 let ddt = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(8) as *const u32) & 0x00FF_FFFF };
-                let e = dt.entries[DateTable::slot(a, ddt)];
+                let e = dt.entries[unsafe { DateTable::slot_at(buf.as_ptr()) }];
                 assert_eq!(e.a, a, "slot collision for {s} in start_day={start_day}");
                 assert_eq!(e.ddt, ddt, "slot collision for {s} in start_day={start_day}");
                 assert_eq!(unsafe { dt.parse(buf.as_ptr(), s.len()) }, ts::parse_ts(s.as_bytes()));

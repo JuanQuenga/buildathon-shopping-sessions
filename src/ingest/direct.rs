@@ -38,29 +38,30 @@ unsafe fn ends(p: *const u8, len: usize, mask: u16, expect: u16) -> bool {
     ends_delim(p, len, mask, expect)
 }
 
-/// 9-byte-first (90%+ common case) / 8-byte ASCII ID parser terminated by `DELIM` (`,` or `\n`).
+/// Branchless 8/9-byte ASCII ID parser terminated by `DELIM` (`,` or `\n`).
+/// Eliminates the 93%/7% length branch mispredict via a single `u32` load at `p + 8`.
 #[inline(always)]
 unsafe fn id_delim<const DELIM: u8>(p: *const u8) -> Option<(u64, *const u8)> {
     let (p, mask, expect, quoted) = open_delim::<DELIM>(p);
     let first = *p;
-    let mut tail = ld8(p.add(1));
-    let len = if ends_delim(p, 9, mask, expect) {
-        9
-    } else if ends_delim(p, 8, mask, expect) {
-        tail &= 0x00FF_FFFF_FFFF_FFFF;
-        8
-    } else {
+    let raw_tail = ld8(p.add(1));
+    let end4 = p.add(8).cast::<u32>().read_unaligned();
+    let is8 = ((end4 as u16) & mask) == expect;
+    let is9 = (((end4 >> 8) as u16) & mask) == expect;
+    if (u8::from(is8) | u8::from(is9)) == 0 {
         return None;
-    };
+    }
+    let tail = if is8 { raw_tail & 0x00FF_FFFF_FFFF_FFFF } else { raw_tail };
     // Accept lanes in 0x30..=0x7f in one test. The first smaller lane
     // sets its high bit on subtraction, even with cross-lane borrows.
     // This rejects ',', '"', '\n', and NUL inside the field.
-    let filled = tail | if len == 8 { 0x3000_0000_0000_0000 } else { 0 };
+    let filled = if is8 { tail | 0x3000_0000_0000_0000 } else { tail };
     if (first.wrapping_sub(0x30) >= 0x50)
         | (((filled.wrapping_sub(0x3030_3030_3030_3030) | filled) & 0x8080_8080_8080_8080) != 0)
     {
         return None;
     }
+    let len = if is8 { 8 } else { 9 };
     let key = (u64::from(first) << 56) | _pext_u64(tail.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F);
     Some((key, p.add(len + 1 + quoted)))
 }
@@ -133,7 +134,7 @@ unsafe fn tail(p: *const u8) -> Option<Tail> {
     if lf == 32 {
         return None;
     }
-    let mask = (1u32 << lf) - 1;
+    let mask = _bzhi_u32(u32::MAX, lf);
     let commas =
         _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8))) as u32 & mask;
     if !commas.is_power_of_two() {
@@ -172,6 +173,24 @@ pub(super) trait EventOutput {
     fn invalid(&mut self, eid: u64, ingest: u32);
 }
 
+/// Single-load check for `Z,` (unquoted) or `Z",` (quoted) at `p + 19`.
+#[inline(always)]
+unsafe fn open_ingest_f1(raw: *const u8) -> Option<(*const u8, *const u8)> {
+    let iq = usize::from(*raw == b'"');
+    let p = raw.add(iq);
+    let w = p.add(19).cast::<u32>().read_unaligned();
+    let imask = if iq == 0 { 0x0000_FFFFu32 } else { 0x00FF_FFFFu32 };
+    let iexp = if iq == 0 {
+        u32::from_le_bytes(*b"Z,\0\0")
+    } else {
+        u32::from_le_bytes(*b"Z\",\0")
+    };
+    if (w & imask) != iexp {
+        return None;
+    }
+    Some((p, p.add(21 + iq)))
+}
+
 /// On success, every field and the terminating LF have been checked before
 /// emitting. At the start of each field at least PAD bytes remain readable.
 #[inline(always)]
@@ -183,12 +202,30 @@ unsafe fn event(
     let (eid, p) = id(p)?;
     let (user, p) = id(p)?;
     let (p, mask, expect, q) = open(p);
-    let (ts_rel, ingest, valid_time, after_ingest) = if (*p.add(19) == b'Z') & ends(p, 20, mask, expect) {
-        let (ingest_p, imask, iexpect, iq) = open(p.add(21 + q));
-        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
+    let (ts_rel, ingest, valid_time, after_ingest) = if ends(p, 13, mask, expect) {
+        let (ingest_p, after) = open_ingest_f1(p.add(14 + q))?;
+        let t = rows.dt.parse_f3_13(p)?;
+        let ing = rows.dt.parse_f1_20_sec(ingest_p)?;
+        if ing as u64 >= u32::MAX as u64 - 1 {
             return None;
         }
-        let (ts_sec, ing) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
+        ((t - rows.ws) as u32, ing, ok, after)
+    } else {
+        let c19 = *p.add(19);
+        let (ts_len, delta_sec) = if c19 == b'Z' {
+            if !ends(p, 20, mask, expect) {
+                return None;
+            }
+            (20usize, 0i64)
+        } else if ((c19 == b'+') | (c19 == b'-')) & ends(p, 25, mask, expect) {
+            (25usize, tsfast::DateTable::parse_tz_delta_sec(p, c19)?)
+        } else {
+            return None;
+        };
+        let (ingest_p, after) = open_ingest_f1(p.add(ts_len + 1 + q))?;
+        let (raw_ts_sec, ing) = rows.dt.parse_f1_pair_sec(p, ingest_p)?;
+        let ts_sec = raw_ts_sec + delta_sec;
         if ing as u64 >= u32::MAX as u64 - 1 {
             return None;
         }
@@ -200,38 +237,13 @@ unsafe fn event(
             let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
             ((t - rows.ws) as u32, ok)
         };
-        (ts_rel, ing, ok, ingest_p.add(21 + iq))
-    } else if ends(p, 13, mask, expect) {
-        let (ingest_p, imask, iexpect, iq) = open(p.add(14 + q));
-        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
-            return None;
-        }
-        let t = rows.dt.parse_f3_13(p)?;
-        let ing = rows.dt.parse_f1_20_sec(ingest_p)?;
-        if ing as u64 >= u32::MAX as u64 - 1 {
-            return None;
-        }
-        let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
-        ((t - rows.ws) as u32, ing, ok, ingest_p.add(21 + iq))
-    } else if ends(p, 25, mask, expect) {
-        let (ingest_p, imask, iexpect, iq) = open(p.add(26 + q));
-        if (*ingest_p.add(19) != b'Z') | !ends(ingest_p, 20, imask, iexpect) {
-            return None;
-        }
-        let t = rows.dt.parse_f2_25(p)?;
-        let ing = rows.dt.parse_f1_20_sec(ingest_p)?;
-        if ing as u64 >= u32::MAX as u64 - 1 {
-            return None;
-        }
-        let ok = (t >= rows.ws) & (t < rows.we) & (ing * 1000 - t <= ts::DAY_MS);
-        ((t - rows.ws) as u32, ing, ok, ingest_p.add(21 + iq))
-    } else {
-        return None;
+        (ts_rel, ing, ok, after)
     };
     let (p, emask, eexpect, eq) = open(after_ingest);
-    let word = p.cast::<u32>().read_unaligned();
+    let ew = ld8(p);
+    let word = ew as u32;
     if ((word == u32::from_le_bytes(*b"view")) | (word == u32::from_le_bytes(*b"cart")))
-        & ends(p, 4, emask, eexpect)
+        & ((((ew >> 32) as u16) & emask) == eexpect)
     {
         let p = p.add(5 + eq);
         let tail = tail(p)?;
@@ -243,7 +255,7 @@ unsafe fn event(
         }
         return Some(p.add(tail.lf + 1));
     }
-    if (ld8(p) == u64::from_le_bytes(*b"purchase")) & ends(p, 8, emask, eexpect) {
+    if (ew == u64::from_le_bytes(*b"purchase")) & ends(p, 8, emask, eexpect) {
         let p = p.add(9 + eq);
         let tail = tail(p)?;
         let (qp, qc) = tail.wrapping()?;
@@ -298,12 +310,13 @@ unsafe fn click(
     let c_commas = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b',' as i8))) as u32;
     let c_quotes = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'"' as i8))) as u32;
     let c_nls = _mm_movemask_epi8(_mm_cmpeq_epi8(cv, _mm_set1_epi8(b'\n' as i8))) as u32;
-    let delim_mask = if cq == 0 { c_commas } else { c_quotes };
+    let cq_mask = (cq as u32).wrapping_neg();
+    let delim_mask = (c_quotes & cq_mask) | (c_commas & !cq_mask);
     if delim_mask == 0 {
         return None;
     }
     let clen = delim_mask.trailing_zeros() as usize;
-    let inside = (1u32 << clen) - 1;
+    let inside = _bzhi_u32(u32::MAX, clen as u32);
     if (((c_commas | c_quotes | c_nls) & inside) != 0)
         | ((cq != 0) & (*cp.add(clen + 1) != b','))
     {
@@ -317,7 +330,7 @@ unsafe fn click(
             .trailing_zeros() as usize;
         if lf < 32 {
             // Ensure no extra comma inside the dropped timestamp field (could be malformed quotes).
-            let m = (1u32 << lf) - 1;
+            let m = _bzhi_u32(u32::MAX, lf as u32);
             let qc = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(tv, _mm256_set1_epi8(b'"' as i8))) as u32) & m;
             let cc = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(tv, _mm256_set1_epi8(b',' as i8))) as u32) & m;
             if (qc == 0) & (cc == 0) {

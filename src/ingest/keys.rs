@@ -34,7 +34,6 @@ pub trait Key: Copy + Eq + Ord + Default + Send + Sync + std::fmt::Debug + 'stat
 }
 
 const MIX_M1: u64 = 0x9E37_79B9_7F4A_7C15;
-const MIX_M2: u64 = 0xBF58_476D_1CE4_E5B9;
 
 const fn inv_odd_u64(x: u64) -> u64 {
     let mut inv = 1u64;
@@ -47,22 +46,19 @@ const fn inv_odd_u64(x: u64) -> u64 {
 }
 
 const MIX_INV1: u64 = inv_odd_u64(MIX_M1);
-const MIX_INV2: u64 = inv_odd_u64(MIX_M2);
 
 #[inline(always)]
 pub fn mix(x: u64) -> u64 {
-    let x = x.wrapping_mul(MIX_M1);
-    let x = (x ^ (x >> 29)).wrapping_mul(MIX_M2);
-    x ^ (x >> 32)
+    let y = (x ^ (x >> 29)).wrapping_mul(MIX_M1);
+    y ^ (y >> 32)
 }
 
 /// Exact inverse of `mix`: `unmix(mix(x)) == x` for all `u64`.
 #[inline(always)]
 pub fn unmix(x: u64) -> u64 {
-    let x = x ^ (x >> 32);
-    let x = x.wrapping_mul(MIX_INV2);
-    let x = x ^ (x >> 29) ^ (x >> 58);
-    x.wrapping_mul(MIX_INV1)
+    let y = x ^ (x >> 32);
+    let z = y.wrapping_mul(MIX_INV1);
+    z ^ (z >> 29) ^ (z >> 58)
 }
 
 impl Key for u128 {

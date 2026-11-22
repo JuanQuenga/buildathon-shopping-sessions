@@ -364,8 +364,9 @@ extern "C" {
     fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
 }
 
-/// Sample the first 256 KiB without waiting for disk I/O. Some filesystems
-/// don't implement RWF_NOWAIT, so an inconclusive probe leaves prefetch enabled.
+/// Sample the first 256 KiB without waiting for disk I/O. If a filesystem does not
+/// implement `RWF_NOWAIT`, fall back to `mincore` on a short mapping so warm container
+/// mounts do not spawn redundant `posix_fadvise` threads.
 pub fn is_file_cached(fd: i32, len: u64) -> Option<bool> {
     const SYS_PREADV2: std::ffi::c_long = 327; // Linux x86-64
     const RWF_NOWAIT: i32 = 0x8;
@@ -378,6 +379,19 @@ pub fn is_file_cached(fd: i32, len: u64) -> Option<bool> {
         Some(true)
     } else if ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(11) {
         Some(false)
+    } else if len > 0 {
+        let map_len = (len as usize).min(SAMPLE);
+        let ptr = unsafe { mmap(std::ptr::null_mut(), map_len, 1, 0x02, fd, 0) };
+        if ptr as isize != -1 && !ptr.is_null() {
+            let mut vec = [0u8; SAMPLE / 4096];
+            let pages = map_len.div_ceil(4096);
+            let rc = unsafe { mincore(ptr, map_len, vec.as_mut_ptr()) };
+            unsafe { munmap(ptr, map_len) };
+            if rc == 0 {
+                return Some(vec[..pages].iter().all(|&b| (b & 1) != 0));
+            }
+        }
+        None
     } else {
         None
     }
@@ -497,6 +511,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mincore(addr: *mut u8, length: usize, vec: *mut u8) -> i32;
     fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
 }
 
@@ -541,7 +556,7 @@ fn huge_alloc_ex(bytes: usize, use_thp: bool) -> (*mut u8, *mut u8, usize) {
         if use_thp && bytes >= HUGE_PAGE_BYTES {
             madvise(a, len, 14); // MADV_HUGEPAGE
         }
-        if std::env::var("INGEST_POPULATE").is_ok() {
+        if std::env::var("INGEST_POPULATE").as_deref() == Ok("serial") {
             madvise(a, len, 23); // MADV_POPULATE_WRITE (5.14+); failure is harmless
         }
     }
@@ -589,7 +604,7 @@ pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     arena: SinkArena,
     cap: usize,
     swcb: Vec<SwcbLine<SWCB>>,
-    pub len: Vec<usize>,
+    pub len: Vec<u32>,
     pub over: Vec<Vec<T>>,
 }
 unsafe impl<T: Copy + Send, const SWCB: usize> Send for Sinks<T, SWCB> {}
@@ -859,12 +874,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     #[inline(always)]
     pub fn push_idx(&mut self, p: usize, x: T) -> usize {
         let pl = Self::per_line();
-        let l = unsafe { *self.len.get_unchecked(p) };
+        let l = unsafe { *self.len.get_unchecked(p) } as usize;
         let slot = l & (pl - 1);
         let line_ptr = unsafe { self.swcb.as_mut_ptr().add(p) as *mut T };
         unsafe { line_ptr.add(slot).write(x) };
         let nl = l + 1;
-        unsafe { *self.len.get_unchecked_mut(p) = nl };
+        unsafe { *self.len.get_unchecked_mut(p) = nl as u32 };
         if (nl & (pl - 1)) == 0 {
             self.flush_full(p, nl, line_ptr);
         }
@@ -907,7 +922,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
     pub fn finish(&mut self) {
         let pl = Self::per_line();
         for p in 0..self.len.len() {
-            let l = self.len[p];
+            let l = self.len[p] as usize;
             let rem = l & (pl - 1);
             if rem != 0 {
                 let base_idx = l - rem;
@@ -926,12 +941,12 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
 
     #[inline]
     pub fn part(&self, p: usize) -> (&[T], &[T]) {
-        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), self.len[p].min(self.cap)) };
+        let a = unsafe { std::slice::from_raw_parts(self.base.add(p * self.cap), (self.len[p] as usize).min(self.cap)) };
         (a, &self.over[p])
     }
 
     pub fn count(&self, p: usize) -> usize {
-        self.len[p].min(self.cap) + self.over[p].len()
+        (self.len[p] as usize).min(self.cap) + self.over[p].len()
     }
 
     /// Raw disjoint mutable access to partition `p` for parallel per-partition
@@ -943,9 +958,9 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         mut keep: impl FnMut(usize, T) -> bool,
     ) {
         let arena_ptr = self.base.add(p * self.cap);
-        let len_ptr = (self.len.as_ptr() as *mut usize).add(p);
+        let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
-        let orig_len = *len_ptr;
+        let orig_len = *len_ptr as usize;
         let arena_len = orig_len.min(self.cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
@@ -972,7 +987,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
             }
         }
         over.truncate(ow);
-        *len_ptr = w + ow;
+        *len_ptr = (w + ow) as u32;
     }
 
     /// Raw disjoint mutable access to partition `p` with a 64-bit dead bitmask
@@ -986,9 +1001,9 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         mut keep: impl FnMut(T) -> bool,
     ) {
         let arena_ptr = self.base.add(p * self.cap);
-        let len_ptr = (self.len.as_ptr() as *mut usize).add(p);
+        let len_ptr = (self.len.as_ptr() as *mut u32).add(p);
         let over_ptr = (self.over.as_ptr() as *mut Vec<T>).add(p);
-        let orig_len = *len_ptr;
+        let orig_len = *len_ptr as usize;
         let arena_len = orig_len.min(self.cap);
         let over = &mut *over_ptr;
         let mut w = 0usize;
@@ -1045,7 +1060,7 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
             odone += n;
         }
         over.truncate(ow);
-        *len_ptr = w + ow;
+        *len_ptr = (w + ow) as u32;
     }
 }
 
