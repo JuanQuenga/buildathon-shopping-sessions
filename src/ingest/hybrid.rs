@@ -49,11 +49,11 @@ const MASK63: u64 = (1u64 << 63) - 1;
 const MIX63_M: u64 = 0x5E37_79B9_7F4A_7C15; // odd, < 2^63, bit 62 = 1
 
 // With p1_total = p2_total = 576 (512 short + 64 long), active SWCB during Events is
-// 576 * (256 + 192) = 252 KiB/worker = 504 KiB/SMT pair (fits Cascade Lake 1 MiB L2 cleanly)
-// with 16 records/flush for both `Tok` (16B) and `RecB12` (12B).
+// 576 * (256 + 384) = 360 KiB/worker = 720 KiB/SMT pair (fits Cascade Lake 1 MiB L2 cleanly),
+// and during Clicks is 576 * 384 = 216 KiB/worker = 432 KiB/SMT pair, halving RecB12 & RecC flushes!
 const SWCB_TOK: usize = 256;
-const SWCB_B: usize = 192;
-const SWCB_CK: usize = 192;
+const SWCB_B: usize = 384;
+const SWCB_CK: usize = 384;
 
 /// 12-byte packed surviving event (-25% parse/reloc arena & DRAM bandwidth vs 16B `RecB`):
 /// bit 31 == 0 => non-purchase event with inline `ts = ts_or_purch` (`cc = 0`);
@@ -498,25 +498,41 @@ impl ArenaBytes {
     }
 }
 
-/// Per-worker L2-resident (32 KiB) direct-mapped cache deduplicating repeated long `user_id`s.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
+struct PackedCacheSlot {
+    hi: u64,
+    lo: u64,
+    off: u32,
+    tag: u8, // 0 = empty; packed33 tags are always >= 0x30
+}
+
+/// Per-worker L2-resident (128 KiB) inline-value cache deduplicating repeated long `user_id`s
+/// with ZERO random arena chases on hit and exact 17-byte equality in the same cache line!
 struct LongUserCache {
-    slots: Vec<(u32, u32)>, // (hash_hi32 | 1, arena_off)
+    slots: Vec<PackedCacheSlot>,
+    verb: Vec<(u32, u32)>, // lazily allocated only for non-hex33 verbatim long user IDs
 }
 
 impl LongUserCache {
     const CAP: usize = 4096;
     const MASK: usize = Self::CAP - 1;
+    const VERB_CAP: usize = 4096;
+    const VERB_MASK: usize = Self::VERB_CAP - 1;
 
     fn new() -> Self {
-        Self { slots: vec![(0, 0); Self::CAP] }
+        Self { slots: vec![PackedCacheSlot::default(); Self::CAP], verb: Vec::new() }
     }
 
     #[allow(dead_code)]
     #[inline(always)]
     fn intern_vec(&mut self, arena: &mut Vec<u8>, s: &[u8], uh: u64) -> Option<u32> {
+        if self.verb.is_empty() {
+            self.verb.resize(Self::VERB_CAP, (0, 0));
+        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::MASK;
-        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::VERB_MASK;
+        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { get_long_bytes(arena, slot.1) } == s {
             return Some(slot.1);
         }
@@ -534,14 +550,13 @@ impl LongUserCache {
         lo: u64,
         uh: u64,
     ) -> Option<u32> {
-        let fp = ((uh >> 32) as u32) | 1;
         let idx = (uh as usize) & Self::MASK;
         let slot = unsafe { self.slots.get_unchecked_mut(idx) };
-        if slot.0 == fp && unsafe { eq_arena_packed(arena.as_slice(), slot.1, tag, hi, lo) } {
-            return Some(slot.1);
+        if (slot.tag == tag) & (slot.hi == hi) & (slot.lo == lo) {
+            return Some(slot.off);
         }
         let off = arena.push_packed33(tag, hi, lo)?;
-        *slot = (fp, off);
+        *slot = PackedCacheSlot { hi, lo, off, tag };
         Some(off)
     }
 
@@ -552,9 +567,12 @@ impl LongUserCache {
                 return self.intern_arena_packed33(arena, tag, hi, lo, uh);
             }
         }
+        if self.verb.is_empty() {
+            self.verb.resize(Self::VERB_CAP, (0, 0));
+        }
         let fp = ((uh >> 32) as u32) | 1;
-        let idx = (uh as usize) & Self::MASK;
-        let slot = unsafe { self.slots.get_unchecked_mut(idx) };
+        let idx = (uh as usize) & Self::VERB_MASK;
+        let slot = unsafe { self.verb.get_unchecked_mut(idx) };
         if slot.0 == fp && unsafe { eq_arena_raw(arena.as_slice(), slot.1, s) } {
             return Some(slot.1);
         }
@@ -600,8 +618,8 @@ fn make_link_long_user(q_all: usize, uh: u64, link_id: u32) -> u64 {
 }
 
 #[inline(always)]
-fn make_long_cid(tid: usize, ch: u64, off: u32) -> u64 {
-    LONG_BIT | ((tid as u64) << 58) | ((ch & 0x03FF_FFFF) << 32) | (off as u64)
+fn make_long_cid(tid: usize, off: u32) -> u64 {
+    LONG_BIT | ((tid as u64) << 58) | (off as u64)
 }
 
 #[inline(always)]
@@ -756,9 +774,6 @@ fn eq_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> bool {
     if ((a & b) as i64) >= 0 {
         return false;
     }
-    if ((a ^ b) & 0x03FF_FFFF_0000_0000) != 0 {
-        return false;
-    }
     let ta = ((a >> 58) & 31) as usize;
     let tb = ((b >> 58) & 31) as usize;
     unsafe {
@@ -771,6 +786,41 @@ fn eq_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> bool {
     }
 }
 
+// Cache-line-aligned table holding all CSV parser LUTs (2 adjacent L1d lines, 0 D1 misses).
+#[repr(C, align(64))]
+struct ParseLuts {
+    vc_mask: [u64; 2],
+    vc_view: [u64; 2],
+    vc_cart: [u64; 2],
+    delim_comma: [u32; 2],
+    delim_lf: [u32; 2],
+    ingest_f1: [u64; 2], // low32 = mask, high32 = expect
+}
+
+static PARSE_LUTS: ParseLuts = ParseLuts {
+    vc_mask: [0x0000_00FF_FFFF_FFFF, 0x00FF_FFFF_FFFF_FFFF],
+    vc_view: [
+        u64::from_le_bytes(*b"view,\0\0\0"),
+        u64::from_le_bytes(*b"\"view\",\0"),
+    ],
+    vc_cart: [
+        u64::from_le_bytes(*b"cart,\0\0\0"),
+        u64::from_le_bytes(*b"\"cart\",\0"),
+    ],
+    delim_comma: [
+        ((b',' as u32) << 16) | 0x00FF,
+        ((u16::from_le_bytes([b'"', b',']) as u32) << 16) | 0xFFFF,
+    ],
+    delim_lf: [
+        ((b'\n' as u32) << 16) | 0x00FF,
+        ((u16::from_le_bytes([b'"', b'\n']) as u32) << 16) | 0xFFFF,
+    ],
+    ingest_f1: [
+        ((u32::from_le_bytes(*b"Z,\0\0") as u64) << 32) | 0x0000_FFFF,
+        ((u32::from_le_bytes(*b"Z\",\0") as u64) << 32) | 0x00FF_FFFF,
+    ],
+};
+
 // ============================================================================
 // Direct variable-width CSV field parsers (branchless 8/9B + AVX2 33B opaque)
 // ============================================================================
@@ -778,11 +828,17 @@ fn eq_cid(a: u64, b: u64, cid_arenas: &[&[u8]]) -> bool {
 #[inline(always)]
 unsafe fn open_delim<const DELIM: u8>(p: *const u8) -> (*const u8, u16, u16, usize) {
     let quoted = usize::from(*p == b'"');
-    let lut: [u32; 2] = [
-        ((DELIM as u32) << 16) | 0x00FF,
-        ((u16::from_le_bytes([b'"', DELIM]) as u32) << 16) | 0xFFFF,
-    ];
-    let me = *lut.get_unchecked(quoted);
+    let me = if DELIM == b',' {
+        *PARSE_LUTS.delim_comma.get_unchecked(quoted)
+    } else if DELIM == b'\n' {
+        *PARSE_LUTS.delim_lf.get_unchecked(quoted)
+    } else {
+        let lut: [u32; 2] = [
+            ((DELIM as u32) << 16) | 0x00FF,
+            ((u16::from_le_bytes([b'"', DELIM]) as u32) << 16) | 0xFFFF,
+        ];
+        *lut.get_unchecked(quoted)
+    };
     (p.add(quoted), me as u16, (me >> 16) as u16, quoted)
 }
 
@@ -827,11 +883,12 @@ unsafe fn encode_eid_short(p: *const u8, len: usize) -> Option<u64> {
 unsafe fn try_encode_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usize)> {
     let w0 = ld8(p);
     let is9 = u64::from(!is8);
+    let is9_mask = is9.wrapping_neg();
     let b8_raw = end4 as u8;
     let bad_w0 = (w0.wrapping_sub(0x3030_3030_3030_3030) | w0) & 0x8080_8080_8080_8080;
-    let bad_b8 = u64::from(b8_raw.wrapping_sub(0x30) >= 0x50) & is9;
+    let bad_b8 = u64::from((b8_raw.wrapping_sub(0x30) | b8_raw) & 0x80) & is9_mask;
     if (bad_w0 | bad_b8) == 0 {
-        let b8 = u64::from(b8_raw) & is9.wrapping_neg();
+        let b8 = u64::from(b8_raw) & is9_mask;
         let key = (_pext_u64(w0.swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F) << 7) | b8;
         Some((key, 8 + is9 as usize))
     } else {
@@ -845,11 +902,12 @@ unsafe fn try_encode_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usiz
 unsafe fn try_encode_eid_89(p: *const u8, end4: u32, is8: bool) -> Option<(u64, usize)> {
     let w0 = ld8(p);
     let is9 = u64::from(!is8);
+    let is9_mask = is9.wrapping_neg();
     let b8_raw = end4 as u8;
     let bad_w0 = (w0.wrapping_sub(0x3030_3030_3030_3030) | w0) & 0x8080_8080_8080_8080;
-    let bad_b8 = u64::from(b8_raw.wrapping_sub(0x30) >= 0x50) & is9;
+    let bad_b8 = u64::from((b8_raw.wrapping_sub(0x30) | b8_raw) & 0x80) & is9_mask;
     if (bad_w0 | bad_b8) == 0 {
-        let b8 = u64::from(b8_raw) & is9.wrapping_neg();
+        let b8 = u64::from(b8_raw) & is9_mask;
         let key = (b8 << 56) | _pext_u64(w0, 0x7F7F_7F7F_7F7F_7F7F);
         Some((key, 8 + is9 as usize))
     } else {
@@ -1014,12 +1072,11 @@ unsafe fn parse_cid_33_cold(
         return None;
     }
     let s = std::slice::from_raw_parts(p, 33);
-    let ch = hash_long(s);
     let Some(off) = st.long_cids.push_bytes(s) else {
         flag.set(Need::Slow);
         return None;
     };
-    Some((make_long_cid(st.tid, ch, off), p.add(34 + quoted)))
+    Some((make_long_cid(st.tid, off), p.add(34 + quoted)))
 }
 
 #[inline(always)]
@@ -1111,12 +1168,11 @@ unsafe fn parse_cid_delim<const DELIM: u8>(
         let b0 = *p;
         if b0.wrapping_sub(0x30) < 0x50 {
             if let Some((tag, hi, lo)) = try_pack_hex33(p) {
-                let ch = hash_packed_33(tag, hi, lo);
                 let Some(off) = st.long_cids.push_packed33(tag, hi, lo) else {
                     flag.set(Need::Slow);
                     return None;
                 };
-                return Some((make_long_cid(st.tid, ch, off), p.add(34 + quoted)));
+                return Some((make_long_cid(st.tid, off), p.add(34 + quoted)));
             }
         }
         return parse_cid_33_cold(p, quoted, st, flag);
@@ -1153,21 +1209,21 @@ unsafe fn tail(p: *const u8) -> Option<Tail> {
 
 impl Tail {
     /// Branchlessly validate optional CSV wrapping quotes on `(product_id, price)` for
-    /// `view`/`cart` in 11 bit-ops (zero `tzcnt(commas)` / variable shifts); returns `Some(product_nonempty)`.
+    /// `view`/`cart` in 10 bit/cmov ops; returns `Some(product_nonempty)`.
     #[inline(always)]
     fn wrapping_view_cart(&self) -> Option<bool> {
         let q = self.quotes;
         let c = self.commas;
         let c_next = c << 1;
         let lf_prev = self.lf_bit >> 1;
-        let first_mask = (q & 1).wrapping_neg();
-        let last_mask = u32::from((q & c_next) != 0).wrapping_neg();
-        let exp = ((1 | (c >> 1)) & first_mask) | ((c_next | lf_prev) & last_mask);
-        let bad = (q ^ exp) | (first_mask & c & 3) | (last_mask & (c_next & lf_prev));
+        let q0 = (q & 1) != 0;
+        let f_exp = std::hint::select_unpredictable(q0, 1 | (c >> 1), 0);
+        let l_exp = std::hint::select_unpredictable((q & c_next) != 0, c_next | lf_prev, 0);
+        let bad = (q ^ (f_exp | l_exp)) | ((q & 1) & (c >> 1)) | ((q & c_next) & lf_prev);
         if bad != 0 {
             return None;
         }
-        Some((c & (1 | (first_mask & 4))) == 0)
+        Some(c != std::hint::select_unpredictable(q0, 4, 1))
     }
 
     /// Branchlessly validate optional CSV wrapping quotes on `(product_id, price)` for
@@ -1196,13 +1252,8 @@ unsafe fn open_ingest_f1(raw: *const u8) -> Option<(*const u8, *const u8)> {
     let iq = usize::from(*raw == b'"');
     let p = raw.add(iq);
     let w = p.add(19).cast::<u32>().read_unaligned();
-    let mask = std::hint::select_unpredictable(iq != 0, 0x00FF_FFFFu32, 0x0000_FFFFu32);
-    let expect = std::hint::select_unpredictable(
-        iq != 0,
-        u32::from_le_bytes(*b"Z\",\0"),
-        u32::from_le_bytes(*b"Z,\0\0"),
-    );
-    if (w & mask) != expect {
+    let me = *PARSE_LUTS.ingest_f1.get_unchecked(iq);
+    if (w & (me as u32)) != ((me >> 32) as u32) {
         return None;
     }
     Some((p, p.add(21 + iq)))
@@ -1274,7 +1325,7 @@ impl ShortRelocMap {
             self.mask = 0;
             return;
         }
-        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
+        let cap = pairs.len().next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, RelocBucket::default());
         self.mask = cap - 1;
@@ -1365,7 +1416,7 @@ impl LongRelocMap {
             self.wide_hash = false;
             return;
         }
-        let cap = ((pairs.len() + 1) / 2).next_power_of_two().max(4);
+        let cap = pairs.len().next_power_of_two().max(4);
         self.buckets.clear();
         self.buckets.resize(cap, LongRelocBucket::default());
         self.mask = cap - 1;
@@ -1454,17 +1505,35 @@ impl LongRelocMap {
     }
 }
 
+#[inline(always)]
 fn uf_find(p: &[AtomicU32], mut x: u32) -> u32 {
     loop {
-        let px = p[x as usize].load(Ordering::Relaxed);
+        let px = unsafe { p.get_unchecked(x as usize) }.load(Ordering::Relaxed);
         if px == x {
             return x;
         }
-        let gp = p[px as usize].load(Ordering::Relaxed);
+        let gp = unsafe { p.get_unchecked(px as usize) }.load(Ordering::Relaxed);
         if gp != px {
-            let _ = p[x as usize].compare_exchange_weak(px, gp, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = unsafe { p.get_unchecked(x as usize) }.compare_exchange_weak(
+                px,
+                gp,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
         x = gp;
+    }
+}
+
+/// Read-only root lookup after union-find completes: zero `lock cmpxchg` / cache-line bouncing!
+#[inline(always)]
+fn uf_find_ro(p: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let px = unsafe { p.get_unchecked(x as usize) }.load(Ordering::Relaxed);
+        if px == x {
+            return x;
+        }
+        x = px;
     }
 }
 
@@ -1509,7 +1578,10 @@ fn uf_union_min_hybrid(p: &[AtomicU32], keys: &[u64], link_store: &LinkLongStore
         } else {
             (b, a)
         };
-        if p[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        if unsafe { p.get_unchecked(hi as usize) }
+            .compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
     }
@@ -1928,7 +2000,9 @@ fn build_bucket_links_hybrid(
                 let p_hi = (p as u32) << 23;
                 let mut tmp33 = [0u8; 33];
 
-                for s in scattered_ref.iter() {
+                let nw = scattered_ref.len();
+                for step in 0..nw {
+                    let s = &scattered_ref[(step + *wid as usize) % nw];
                     for &(k, e) in &s.flat[s.pos[p]..s.pos[p + 1]] {
                         let id = if is_short(k) {
                             let (id, ins) = short_m.insert(k, k_len);
@@ -2225,7 +2299,7 @@ fn build_bucket_links_hybrid(
             let mut lw = ls;
 
             for i in s..e {
-                let r = uf_find(parent_ref, i as u32) as usize;
+                let r = uf_find_ro(parent_ref, i as u32) as usize;
                 let c = unsafe { *keys_ref.get_unchecked(r) };
                 let k = unsafe { *keys_ref.get_unchecked(i) };
                 if c != k {
@@ -2494,12 +2568,11 @@ impl ParseStateH {
         if let Some(k) = unsafe { u64::enc(s.as_ptr(), s.len()) } {
             Some(k)
         } else {
-            let ch = hash_long(s);
             let Some(off) = self.long_cids.push_bytes(s) else {
                 flag.set(Need::Slow);
                 return None;
             };
-            Some(make_long_cid(self.tid, ch, off))
+            Some(make_long_cid(self.tid, off))
         }
     }
 
@@ -2679,22 +2752,13 @@ unsafe fn event_hybrid<const WS_WHOLE_SEC: bool, const SHORT_WIN: bool>(
         };
         (ts_rel, ing, ok, after)
     };
-    // Direct 2-entry LUT for `view,` / `"view",` / `cart,` / `"cart",` (zero `open()` overhead!).
-    const MASK_VC: [u64; 2] = [0x0000_00FF_FFFF_FFFF, 0x00FF_FFFF_FFFF_FFFF];
-    const EXP_VIEW: [u64; 2] = [
-        u64::from_le_bytes(*b"view,\0\0\0"),
-        u64::from_le_bytes(*b"\"view\",\0"),
-    ];
-    const EXP_CART: [u64; 2] = [
-        u64::from_le_bytes(*b"cart,\0\0\0"),
-        u64::from_le_bytes(*b"\"cart\",\0"),
-    ];
+    // Direct 2-entry L1d-shared LUT for `view,` / `"view",` / `cart,` / `"cart",`.
     let eq = usize::from(*after_ingest == b'"');
     let ew_raw = ld8(after_ingest);
-    let masked = ew_raw & *MASK_VC.get_unchecked(eq);
+    let masked = ew_raw & *PARSE_LUTS.vc_mask.get_unchecked(eq);
     let (valid, ts_or_purch, next_p) = if any_zero_u64(
-        masked ^ *EXP_VIEW.get_unchecked(eq),
-        masked ^ *EXP_CART.get_unchecked(eq),
+        masked ^ *PARSE_LUTS.vc_view.get_unchecked(eq),
+        masked ^ *PARSE_LUTS.vc_cart.get_unchecked(eq),
     ) {
         let p = after_ingest.add(5 + eq + eq);
         let tail = tail(p)?;
@@ -3861,6 +3925,24 @@ unsafe fn extract_packed_long(
     }
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn eq_long_entry_slow(
+    entry: &LongGroupEntry,
+    tag: u64,
+    worker_arenas: &[&[u8]],
+    link_store: &LinkLongStore,
+) -> bool {
+    if entry.ptag != 0 && (tag & LINK_LONG_BIT) != 0 {
+        if (entry.tag & LINK_LONG_BIT) != 0 {
+            return false;
+        }
+        let (pt, h, l) = link_store.get_packed(tag as u32);
+        return (pt == entry.ptag) & (h == entry.hi) & (l == entry.lo);
+    }
+    eq_long_user_tags(entry.tag, tag, worker_arenas, link_store)
+}
+
 #[inline(always)]
 unsafe fn eq_long_entry(
     entry: &LongGroupEntry,
@@ -3871,14 +3953,7 @@ unsafe fn eq_long_entry(
     if entry.tag == tag {
         return true;
     }
-    if entry.ptag != 0 {
-        if (tag & LINK_LONG_BIT) != 0 {
-            if (entry.tag & LINK_LONG_BIT) != 0 {
-                return false;
-            }
-            let (pt, h, l) = link_store.get_packed(tag as u32);
-            return (pt == entry.ptag) & (h == entry.hi) & (l == entry.lo);
-        }
+    if (entry.ptag != 0) & ((tag & LINK_LONG_BIT) == 0) {
         let tb = ((tag >> 57) & 31) as usize;
         return eq_arena_packed(
             worker_arenas.get_unchecked(tb),
@@ -3888,7 +3963,7 @@ unsafe fn eq_long_entry(
             entry.lo,
         );
     }
-    eq_long_user_tags(entry.tag, tag, worker_arenas, link_store)
+    eq_long_entry_slow(entry, tag, worker_arenas, link_store)
 }
 
 struct LongGroupMap {
@@ -5190,7 +5265,7 @@ fn group_fused_hybrid<P: GroupProfile>(
     } else {
         0
     };
-    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(17);
+    let dense_min = env_usize("INGEST_DENSE_MIN").unwrap_or(8);
     let lookups = ctx.lookups.get();
     let ncamp = lookups.campaigns.len();
     let organic = ncamp as u32;
@@ -5420,32 +5495,32 @@ pub(super) fn run_to_output(
     let short_eid_pct = 100usize.saturating_sub(sample.long_eid_pct);
     let short_user_pct = 100usize.saturating_sub(sample.long_user_pct);
     let cap_tok_s = if short_eid_pct > 0 {
-        (est_ev * short_eid_pct / 100 / p1_short * 110 / 100 / workers).max(16) + 16
+        (est_ev * short_eid_pct / 100 / p1_short * 107 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_tok_l = if sample.long_eid_pct > 0 {
-        (est_ev * sample.long_eid_pct / 100 / p1_long * 115 / 100 / workers).max(16) + 16
+        (est_ev * sample.long_eid_pct / 100 / p1_long * 112 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_b_s = if short_user_pct > 0 {
-        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 110 / 100 / workers).max(16) + 32
+        (est_ev * short_user_pct / 100 / p2_short * 96 / 100 * 107 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_b_l = if sample.long_user_pct > 0 {
-        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 118 / 100 / workers).max(16) + 32
+        (est_ev * sample.long_user_pct / 100 / p2_long * 96 / 100 * 114 / 100 / workers).max(16) + 16
     } else {
         16
     };
     let cap_ck_s = if short_user_pct > 0 {
-        (est_ck * short_user_pct / 100 / p2_short * 110 / 100 / workers).max(16) + 32
+        (est_ck * short_user_pct / 100 / p2_short * 107 / 100 / workers).max(16) + 32
     } else {
         16
     };
     let cap_ck_l = if sample.long_user_pct > 0 {
-        (est_ck * sample.long_user_pct / 100 / p2_long * 118 / 100 / workers).max(16) + 32
+        (est_ck * sample.long_user_pct / 100 / p2_long * 114 / 100 / workers).max(16) + 16
     } else {
         16
     };
@@ -5979,9 +6054,8 @@ mod tests {
         for i in 0..40usize {
             if i % 3 == 0 {
                 let s = format!("k{i:032x}");
-                let h = hash_long(s.as_bytes());
                 let off = push_long_bytes(&mut arena, s.as_bytes()).unwrap();
-                cids.push(make_long_cid(0, h, off));
+                cids.push(make_long_cid(0, off));
             } else {
                 let s = format!("k{i:07}");
                 cids.push(u64::enc_slice(s.as_bytes()).unwrap());

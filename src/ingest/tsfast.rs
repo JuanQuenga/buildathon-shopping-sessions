@@ -61,11 +61,21 @@ pub struct DateTable {
 }
 
 impl DateTable {
+    fn empty() -> Self {
+        let mut entries = [DateEntry::default(); 2048];
+        // Set byte 5's LSB to the opposite of slot bit 10 (`p[5] & 1`), making it mathematically
+        // impossible for any 11-byte input to false-match an unpopulated slot via 16B SIMD XOR.
+        for (idx, e) in entries.iter_mut().enumerate() {
+            e.a = (((idx >> 10) ^ 1) as u64) << 40;
+        }
+        DateTable { entries }
+    }
+
     /// Prepopulate valid dates in `[ws - 14d, we + 14d]` (up to 365 days, zero collisions across
     /// any full year incl. leap years and Dec->Jan rollovers). Dates outside 1970..2106 or missing
     /// from the cache fall back to exact `civil19_sec_cold`.
     pub fn build(ws_ms: i64, we_ms: i64) -> Self {
-        let mut entries = [DateEntry::default(); 2048];
+        let mut dt = Self::empty();
         let d0 = ws_ms.div_euclid(DAY_MS) - 14;
         let d1 = (we_ms.div_euclid(DAY_MS) + 14).min(d0 + 364);
         for d in d0..=d1 {
@@ -92,9 +102,9 @@ impl DateTable {
             let a = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             let ddt = u32::from_le_bytes([buf[8], buf[9], buf[10], 0]);
             let idx = unsafe { Self::slot_at(buf.as_ptr()) };
-            entries[idx] = DateEntry { a, ddt, day_sec: sec as u32 };
+            dt.entries[idx] = DateEntry { a, ddt, day_sec: sec as u32 };
         }
-        DateTable { entries }
+        dt
     }
 
     #[inline(always)]
@@ -108,11 +118,14 @@ impl DateTable {
     /// Parse `YYYY-MM-DDTHH:MM:SS` (19 bytes) -> UTC epoch seconds (before zone), or None.
     #[inline(always)]
     unsafe fn civil19_sec(&self, p: *const u8) -> Option<i64> {
-        let a = ld8(p); // YYYY-MM-
-        let ddt = (std::ptr::read_unaligned(p.add(8) as *const u32)) & 0x00FF_FFFF; // DDT
+        use std::arch::x86_64::*;
         let e = self.entries.get_unchecked(Self::slot_at(p));
-        if (e.a == a) & (e.ddt == ddt) {
-            return Self::clock_sec(p).map(|sec| sec + e.day_sec as i64);
+        let ev = _mm_load_si128((e as *const DateEntry).cast::<__m128i>());
+        let pv = _mm_loadu_si128(p.cast::<__m128i>());
+        let mask11 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0);
+        if _mm_testz_si128(_mm_xor_si128(ev, pv), mask11) != 0 {
+            let day_sec = (_mm_extract_epi32::<3>(ev) as u32) as i64;
+            return Self::clock_sec(p).map(|sec| sec + day_sec);
         }
         civil19_sec_cold(p)
     }
@@ -158,23 +171,28 @@ impl DateTable {
             return None;
         }
         let both = _mm_madd_epi16(times, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
-        let seconds = _mm_hadd_epi32(both, both);
-        Some((_mm_cvtsi128_si32(seconds) as i64, _mm_extract_epi32::<1>(seconds) as i64))
+        let sum = _mm_add_epi32(both, _mm_srli_si128::<4>(both));
+        Some((_mm_cvtsi128_si32(sum) as i64, _mm_extract_epi32::<2>(sum) as i64))
     }
 
     /// Both fields have an independently checked F1 terminator and delimiter.
     /// Returns `(event_epoch_sec, ingest_epoch_sec)` without multiplying by 1000.
     #[inline(always)]
     pub(super) unsafe fn parse_f1_pair_sec(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
-        let pa = ld8(a);
-        let da = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
+        use std::arch::x86_64::*;
         let ea = self.entries.get_unchecked(Self::slot_at(a));
-        let pb = ld8(b);
-        let db = b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
         let eb = self.entries.get_unchecked(Self::slot_at(b));
-        if (ea.a == pa) & (ea.ddt == da) & (eb.a == pb) & (eb.ddt == db) {
+        let eav = _mm_load_si128((ea as *const DateEntry).cast::<__m128i>());
+        let ebv = _mm_load_si128((eb as *const DateEntry).cast::<__m128i>());
+        let av = _mm_loadu_si128(a.cast::<__m128i>());
+        let bv = _mm_loadu_si128(b.cast::<__m128i>());
+        let diff = _mm_or_si128(_mm_xor_si128(eav, av), _mm_xor_si128(ebv, bv));
+        let mask11 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0);
+        if _mm_testz_si128(diff, mask11) != 0 {
             let (event, ingest) = Self::clock_pair(a, b)?;
-            return Some((ea.day_sec as i64 + event, eb.day_sec as i64 + ingest));
+            let da_sec = (_mm_extract_epi32::<3>(eav) as u32) as i64;
+            let db_sec = (_mm_extract_epi32::<3>(ebv) as u32) as i64;
+            return Some((da_sec + event, db_sec + ingest));
         }
         self.parse_f1_pair_sec_cold(a, b)
     }
@@ -404,7 +422,7 @@ pub unsafe fn f3(p: *const u8, len: usize) -> Option<i64> {
 #[cfg(test)]
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize) -> Option<i64> {
-    let dt = DateTable { entries: [DateEntry::default(); 2048] };
+    let dt = DateTable::empty();
     dt.parse(p, len)
 }
 

@@ -163,7 +163,7 @@ pub fn plan(files: &[FileInfo], size: u64) -> Vec<Chunk> {
 /// gets a synthetic LF), followed by >= PAD zero bytes. Skips the header for the
 /// chunk at offset 0. Returns (lo, hi).
 pub fn read_chunk(file: &File, flen: u64, c: Chunk, buf: &mut Vec<u8>) -> (usize, usize) {
-    const EXTRA: u64 = 4096;
+    const EXTRA: u64 = 512;
     let rs = if c.start == 0 { 0 } else { c.start - 1 };
     let mut want = (c.end + EXTRA).min(flen) - rs;
     loop {

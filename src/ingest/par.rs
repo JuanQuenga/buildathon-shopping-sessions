@@ -625,7 +625,7 @@ pub struct Sinks<T: Copy, const SWCB: usize = 128> {
     n_short: usize,
     cap_short: usize,
     cap_long: usize,
-    long_base: usize,
+    long_adj: usize, // long_base.wrapping_sub(n_short * cap_long) — zero branch, zero memory load!
     swcb: Vec<SwcbLine<SWCB>>,
     pub len: Vec<u32>,
     pub over: Vec<Vec<T>>,
@@ -677,7 +677,7 @@ impl SinkArena {
     /// Falls back silently to demand paging on older kernels (EINVAL).
     pub(super) fn populate_write(&self) {
         const MADV_POPULATE_WRITE: i32 = 23;
-        const CHUNK: usize = 4 << 20;
+        const CHUNK: usize = 16 << 20;
         let lo = (self.base as usize).next_multiple_of(4096);
         let hi = (self.base as usize + self.bytes) & !4095;
         let mut off = lo;
@@ -890,11 +890,10 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
 
     #[inline(always)]
     fn part_off_cap(&self, p: usize) -> (usize, usize) {
-        if p < self.n_short {
-            (p * self.cap_short, self.cap_short)
-        } else {
-            (self.long_base + (p - self.n_short) * self.cap_long, self.cap_long)
-        }
+        let is_long = p >= self.n_short;
+        let base = std::hint::select_unpredictable(is_long, self.long_adj, 0);
+        let cap = std::hint::select_unpredictable(is_long, self.cap_long, self.cap_short);
+        (base.wrapping_add(p.wrapping_mul(cap)), cap)
     }
 
     pub(super) fn in_arena_split(
@@ -908,13 +907,14 @@ impl<T: Copy, const SWCB: usize> Sinks<T, SWCB> {
         let cs = Self::aligned_cap(cap_short);
         let cl = Self::aligned_cap(cap_long);
         let parts = n_short + n_long;
+        let long_base = n_short * cs;
         Sinks {
             base: arena.base.cast(),
             arena,
             n_short,
             cap_short: cs,
             cap_long: cl,
-            long_base: n_short * cs,
+            long_adj: long_base.wrapping_sub(n_short.wrapping_mul(cl)),
             swcb: vec![SwcbLine([0u8; SWCB]); parts],
             len: vec![0; parts],
             over: (0..parts).map(|_| Vec::new()).collect(),
