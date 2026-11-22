@@ -2,7 +2,25 @@
 
 ## Please submit
 
-- **Tag**: `candidate-15b` (branch `exp/c15-engine`) — **Hybrid inline-64 + side-arena single-pass exact engine for `shopping-sessions-5` opaque variable-width IDs (`2.22×` faster local wall `1.161 -> 0.524 s`, `-52.5%` user CPU `6.31 -> 3.00 s` vs `candidate-15a` on `seed20-20m-v5`)**.
+- **Tag**: `candidate-15c` (branch `exp/c15-engine`) — **Disjoint short/long unified `Sinks`, unified 2 MiB THP `ArenaBytes` for long IDs, zero-branch fused ID parsers, 4-way SSE2 `LongRelocMap`, branchless click sorting networks, and 37B Snappy user-ID fast path (`-59.6 ms` / `-11.3%` local wall `0.5258 -> 0.4662 s`, best `0.4564 s`, `-985k/M` branch mispredicts vs `candidate-15b`)**.
+  - **What `candidate-15c` changes vs `candidate-15b` (`05343d7`, `0.7965 s` official on `shopping-sessions-5`)**:
+    1. **Disjoint pure-short / pure-long partition spaces inside unified `Sinks` (`SWCB=128/128/192`)**: `tok_sinks` holds `p1_short` pure-short (`1024`) + `p1_long` pure-long (`128`) = `1152` partitions (single-barrier dedup); `b_sinks`, `ck_sinks`, `reloc_b`, `reloc_c` hold `p2_short` pure-short (`512`) + `p2_long` pure-long (`64`) = `576` partitions. Eliminates ALL `is_short` branches in `relocate` (`56.6 -> 43.3 ms`) and `group+agg` (`112.5 -> 102.4 ms`), and lets pure-short `group+agg` use single-array `GroupMap<u64, true>`.
+    2. **Unified 2 MiB THP `ArenaBytes` for `long_eids`, `long_users`, `long_cids`** (`<= 512 MiB` per kind, seamless heap spillover with `MADV_DONTNEED` release on extreme 100%-long-ID 60M datasets): eliminates `Vec` doubling `memcpy`s, moves ~160 MiB of long IDs into 2 MiB THP on the clean scorer VM, and rejoins `tok` + `long_eids` via `SinkArena::merge` right after `dedup` for zero-fault `relocate` + `group_scratch` reuse.
+    3. **Fused register-only direct ID parsers + branchless `try_encode_89` + `tsfast` dual-date SSE2 `clock_pair`**: eliminates `match eid`/`match user`/`match cid` and `if is8` branches (`parse`: `270 -> 243 ms`, `-27 ms`), keeps `SWCB=128/128/192` + `LongUserCache::CAP=4096` L2-hot on 2-way SMT, and uses SSE2 `clock_pair` even when F2 timezones cross midnight (`tsfast.rs Bcm`: `60.4k -> 17.7k`).
+    4. **Zero-`hash_long` link scatter + 4-way SSE2 `LongRelocMap` + branchless `canon_q_of`**: embeds `fp25 = uh >> 39` directly in parse handles so `ep_part` needs zero arena derefs; 32B-aligned 4-way SSE2 `LongRelocBucket` accelerates pure-long relocation.
+    5. **Branchless click sorting networks (`n <= 12`) + 3-pass radix sort (`> 256`) + `n_sess == 1` `FusedAssists` fast path + `DENSE_MIN = 24` + 37B Snappy `user_id` fast path (`parquet.rs` threshold `32 -> 64`)**: cuts `sort_and_dedup_clicks_var` mispredicts by `-80%`, fixes pure-long row-group fallback to slow generic `snappy()`, and packs `cl_pid`/`cl_flat` cleanly.
+  - **Same-glibc Bookworm 2.36 interleaved 3-round A/B (`seed20-20m-v5`, `CPUSET=0-3,8-11`, `NCPU=8`, `INGEST_SINK_THP=0`)**:
+    - `candidate-15b` (`0.7965 s` official): `0.5303 / 0.5122 / 0.5258 s` (med **`0.5258 s`**, `user=2.924 s`; `parse 270 ms`, `relocate 56.6 ms`, `group+agg 112.5 ms`)
+    - **`candidate-15c`**: **`0.4662 / 0.4760 / 0.4564 s` (med `0.4662 s`, `-59.6 ms` / `-11.3%` faster wall!, `user=2.789 s` `-135 ms`; `parse 243 ms` `-27 ms`, `relocate 43.3 ms` `-13.3 ms`, `group+agg 102.4 ms` `-10.1 ms`)**.
+  - **Cascade Lake Cachegrind (`dev-v5` 1M, `--branch-sim=yes`, `I1=32K, D1=32K, LL=6M`)**:
+    - `candidate-15b`: `Ir=974.4M`, `D1m=10.30M`, `LL(6M)=2.36M`, `Bcm=6.70M` (`5.5%`)
+    - **`candidate-15c`**: **`Ir=936.9M` (-37.5M, -3.9%)**, **`D1m=10.27M`**, **`LL(6M)=2.24M` (-5.1%)**, **`Bcm=5.71M` (-985k = -14.7% = -19.7M fewer mispredicts on 20M!)**.
+  - **Explicit official scorer prediction BEFORE submission**: **`0.69–0.73 s`** on `shopping-sessions-5` (vs `candidate-15b`'s `0.7965 s`, `-65 to -105 ms` from `-60 ms` local wall + `-19.7M` branch mispredicts + ~160 MiB moved to 2 MiB THP).
+  - **Verification**: 40/40 release unit tests (0 warnings), 36/36 official fixtures, 32/32 adversarial suites, `dev-v5` exact `MATCH` (`hybrid` + `INGEST_GENERIC=1`), `seed20-20m-v5` exact `MATCH`, all four 60M datasets exact `MATCH` (`seed60-60m` 2.82 GiB, `seed60-5kcat` 2.96 GiB, `seed60-90d` 2.96 GiB, `seed60-longids` `< 8.5 GiB` verified), and clean `git archive` Docker build verified `MATCH` on `dev-v5` and `seed20-20m-v5`.
+
+### Previous submission (`candidate-15b`)
+
+- **Tag**: `candidate-15b` (branch `exp/c15-engine`, official **`0.7965 s`** on `shopping-sessions-5`, Rank #4 at submission) — **Hybrid inline-64 + side-arena single-pass exact engine for `shopping-sessions-5` opaque variable-width IDs (`2.22×` faster local wall `1.161 -> 0.524 s`, `-52.5%` user CPU `6.31 -> 3.00 s` vs `candidate-15a` on `seed20-20m-v5`)**.
   - **Why**: `shopping-sessions-5` gives 1/8 distinct `user_id`/`event_id`/`click_id` values a 32-char hex suffix (33 bytes total) and mandates treating IDs as opaque variable-width byte strings. `candidate-15a` (`ba527a9597`, `1.9110 s` official on `shopping-sessions-5`, Rank #13) rejected 33B IDs in `u64`/`u128` and fell back to `generic.rs` (`ev-dedup 417 ms`, `505k` faults, 0% THP).
   - **What `candidate-15b` adds (`src/ingest/hybrid.rs`, wired in `src/ingest/fast.rs`)**:
     1. **100% opaque variable-width ID representation (`1..∞` bytes, arbitrary UTF-8/NUL)**: keeps short IDs (`1..=9` non-NUL ASCII, 87.5% on v5) inline in `u64` with bit 63 == 0 (`mix63`/`unmix63` exact bijection on `[0, 2^63)`), and stores long/non-ASCII IDs verbatim in length-prefixed per-worker byte arenas (`long_eids`, `long_users` with 4096-slot direct-mapped dedup cache, `long_cids`) and a read-only `LinkLongStore`, referenced via tagged `u64` handles (bit 63 == 1) with 20/25/26-bit embedded hash fingerprints.
@@ -54,6 +72,7 @@
 
 | Tag | Commit | Official wall (hidden ~20M) | Rank | Notes |
 | --- | --- | ---: | --- | --- |
+| `candidate-15b` | `05343d7` | **0.7965 s** (`v5`) | **4 at sub (`v5`)** | Hybrid inline-64 + side-arena engine (`2.40×` faster than `15a` on `v5`, receipt `BB-6674A5CC`) |
 | `candidate-15a` | `ba527a9` (`33de581`) | **1.9110 s** (`v5`) | **13 (`v5`)** | Re-scored on `shopping-sessions-5` (33B opaque IDs); fell back to `generic.rs` |
 | `candidate-12a` | `bf812eb` (`c34c244`) | **0.7205 s** | **26 (NEW BEST)** | Accepted exact output; **−99.0 ms vs 11b** from 1-variable `group+agg` rework (−35k faults, −120 MB RSS, −106 ms group sys) → proves scorer heavily charges fresh memory / minor faults (~1.1–2.8 µs/fault) |
 | `candidate-11b` | `ea17016` (`7bd0941`) | **0.8195 s** | NEW BEST (leader 0.31 s) | Accepted exact output; direct specialized events/clicks parsers + co-partitioned L2 Links + zero-fault `tok→reloc` arena reuse (−55.7 ms vs c8) |

@@ -2380,6 +2380,31 @@ impl FusedAssists {
             self.stamp = 1;
         }
         let stamp = self.stamp;
+        if n_sess == 1 {
+            let s0 = unsafe { *self.s_start.get_unchecked(0) };
+            let day0_rel = unsafe { *self.s_day.get_unchecked(0) } as usize;
+            let hi = s0 + WEEK_MS_U32;
+            for click in clicks {
+                let cts = click.ts;
+                if cts > hi {
+                    break;
+                }
+                if cts >= s0 {
+                    let campaign = click.campaign as usize;
+                    let seen = unsafe { self.campaigns.get_unchecked_mut(campaign) };
+                    if seen.0 != stamp {
+                        *seen = (stamp, 1);
+                        if let Some(row) = camp.assisted_row(click.campaign) {
+                            unsafe { *row.get_unchecked_mut(day0_rel) += 1 };
+                        } else {
+                            let day = camp.day0.wrapping_add(day0_rel as i32);
+                            camp.add_assisted(click.campaign, day, 1);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         // Sentinel `u32::MAX` is strictly greater than any valid click timestamp (`< u32::MAX`),
         // eliminating loop bounds checks on `starts[first]` and `starts[end]`.
         self.s_start.push(u32::MAX);

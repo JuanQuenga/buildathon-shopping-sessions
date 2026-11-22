@@ -265,7 +265,7 @@ impl FileBuilder {
         const HEADER_SPACE: usize = 64;
         debug_assert_eq!(self.buf, PAR1);
         self.buf.resize(HEADER_SPACE, 0);
-        if plain.len() <= self.num_rows * 32 {
+        if plain.len() <= self.num_rows * 64 {
             snappy_user_ids(plain, &mut self.buf);
         } else {
             snappy(plain, &mut self.buf);
@@ -829,6 +829,21 @@ fn snappy_user_ids(input: &[u8], out: &mut Vec<u8>) {
                 && read_u64(&input[pos + len - 8..]) == last
             {
                 pos += len;
+            }
+        } else if len == 37 {
+            let a = read_u64(record);
+            let b = read_u64(&record[8..]);
+            let c = read_u64(&record[16..]);
+            let d = read_u64(&record[24..]);
+            let e = read_u64(&record[29..]);
+            while pos + 37 <= input.len()
+                && read_u64(&input[pos..]) == a
+                && read_u64(&input[pos + 8..]) == b
+                && read_u64(&input[pos + 16..]) == c
+                && read_u64(&input[pos + 24..]) == d
+                && read_u64(&input[pos + 29..]) == e
+            {
+                pos += 37;
             }
         } else if len <= u16::MAX as usize {
             while input[pos..].starts_with(record) {

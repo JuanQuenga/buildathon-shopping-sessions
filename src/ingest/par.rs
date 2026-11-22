@@ -671,6 +671,16 @@ impl SinkArena {
         self.bytes
     }
 
+    pub(super) fn base_ptr(&self) -> *mut u8 {
+        self.base
+    }
+
+    pub(super) fn merge(a: Self, b: Self) -> Self {
+        assert!(Arc::ptr_eq(&a.mapping, &b.mapping));
+        assert_eq!(unsafe { a.base.add(a.bytes) }, b.base);
+        Self { base: a.base, bytes: a.bytes + b.bytes, mapping: a.mapping }
+    }
+
     pub(crate) fn release_par(&self, threads: usize) {
         if Arc::strong_count(&self.mapping) == 1 {
             release_pages_par(self.mapping.raw, self.mapping.len, threads);

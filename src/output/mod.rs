@@ -44,7 +44,7 @@ impl UserCols {
         let cap = rows.min(MAX_ROWS);
         UserCols {
             n: 0,
-            ids: Vec::with_capacity(cap * 14),
+            ids: Vec::with_capacity(cap * 18),
             day: Vec::with_capacity(cap),
             sessions: Vec::with_capacity(cap),
             events: Vec::with_capacity(cap),

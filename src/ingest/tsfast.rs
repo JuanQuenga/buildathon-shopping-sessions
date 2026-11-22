@@ -164,19 +164,22 @@ impl DateTable {
     /// Returns `(event_epoch_sec, ingest_epoch_sec)` without multiplying by 1000.
     #[inline(always)]
     pub(super) unsafe fn parse_f1_pair_sec(&self, a: *const u8, b: *const u8) -> Option<(i64, i64)> {
-        let prefix = ld8(a);
-        let ddt = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
-        let date = self.entries.get_unchecked(Self::slot_at(a));
-        if (date.a == prefix) & (date.ddt == ddt) {
-            if (ld8(b) == prefix) & (b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF == ddt) {
-                let (event, ingest) = Self::clock_pair(a, b)?;
-                let day = date.day_sec as i64;
-                return Some((day + event, day + ingest));
-            }
-            let event = date.day_sec as i64 + Self::clock_sec(a)?;
-            return Some((event, self.civil19_sec(b)?));
+        let pa = ld8(a);
+        let da = a.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
+        let ea = self.entries.get_unchecked(Self::slot_at(a));
+        let pb = ld8(b);
+        let db = b.add(8).cast::<u32>().read_unaligned() & 0x00FF_FFFF;
+        let eb = self.entries.get_unchecked(Self::slot_at(b));
+        if (ea.a == pa) & (ea.ddt == da) & (eb.a == pb) & (eb.ddt == db) {
+            let (event, ingest) = Self::clock_pair(a, b)?;
+            return Some((ea.day_sec as i64 + event, eb.day_sec as i64 + ingest));
         }
-        Some((civil19_sec_cold(a)?, self.civil19_sec(b)?))
+        let a_sec = if (ea.a == pa) & (ea.ddt == da) {
+            ea.day_sec as i64 + Self::clock_sec(a)?
+        } else {
+            civil19_sec_cold(a)?
+        };
+        Some((a_sec, self.civil19_sec(b)?))
     }
 
     /// Direct 13-digit F3 parser (caller verified exact length 13).
